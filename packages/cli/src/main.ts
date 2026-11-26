@@ -2942,7 +2942,10 @@ async function passthrough(a: Args): Promise<number> {
 
   if (REMOVALS.has(a.cmd) && isLockPm(det.pm)) return checkedRemoval({ cwd, det: { pm: det.pm, why: det.why }, names: args.filter((x) => x !== "--") });
 
-  const dirFlag = det.pm === "pnpm" ? own.find((x) => /^(?:--dir|--workspace-dir|-C)(?:=|$)|^-C./.test(x)) : undefined;
+  // what pnpm reads as its own options: a named script's and pnpm test's arguments go to the script, and so do pnpm run's after the script name
+  const firstOperand = own.findIndex((x) => !x.startsWith("-"));
+  const pnpmOwned = script || a.cmd === "test" ? [] : a.cmd === "run" && firstOperand !== -1 ? own.slice(0, firstOperand) : own;
+  const dirFlag = det.pm === "pnpm" ? pnpmOwned.find((x) => /^(?:--dir|--workspace-dir|-C)(?:=|$)|^-C./.test(x)) : undefined;
   const pnpmConfig = dirFlag !== undefined ? `${dirFlag} points pnpm at a folder apm did not check` : det.pm === "pnpm" ? pnpmConfigRefusal({ cwd, env: process.env }) : null;
 
   if (pnpmConfig !== null) {
