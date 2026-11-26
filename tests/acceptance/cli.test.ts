@@ -107,6 +107,47 @@ describe("apm: runtime detection and pass-through", () => {
     expect(dig(doc, "packages", 0, "warnings", 0, "kind")).toBe("low-score");
   });
 
+  test("apm add --json when the registry answers 414: the error names only the registry's origin", async () => {
+    const tooLong = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("", { status: 414 }) });
+
+    try {
+      const sb = makeSandbox(reg, alice);
+      const app = bunProject({}, alice);
+      const r = await apm(["add", "nice-dep", "--json"], { cwd: app, env: { ...sb.env, APM_REGISTRY: `${tooLong.url.href}SECRET_PATH_TOKEN/?key=SECRET_QUERY_KEY` } });
+
+      expect(r.code, r.out).toBe(1);
+      expect(r.out).toContain("HTTP 414");
+      expect(r.out).not.toContain("SECRET_");
+      expect(r.out).not.toContain("nothing was installed; nothing was installed");
+    } finally {
+      tooLong.stop(true);
+    }
+  });
+
+  test("apm add --json when the registry cannot be reached: exit 1 and the documented shape, nothing installed", async () => {
+    const gone = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
+    const url = gone.url.href;
+
+    gone.stop(true);
+    const sb = makeSandbox(reg, alice);
+    const app = bunProject({}, alice);
+    // a registry URL can carry a credential in its path or query: the message names only its origin
+    const withSecret = `${url}SECRET_PATH_TOKEN/?key=SECRET_QUERY_KEY`;
+    const r = await apm(["add", "nice-dep", "--json"], { cwd: app, env: { ...sb.env, APM_REGISTRY: withSecret } });
+
+    expect(r.code, r.out).toBe(1);
+    expect(r.out).not.toContain("SECRET_");
+    const body: unknown = JSON.parse(r.stdout);
+
+    // reference/cli.mdx: { ok, pm, error, packages, installed }, installed null when apm stopped before the check
+    expect(dig(body, "ok")).toBe(false);
+    expect(dig(body, "pm")).toBe("bun");
+    expect(String(dig(body, "error"))).toContain(url);
+    expect(dig(body, "packages")).toEqual([]);
+    expect(dig(body, "installed")).toBeNull();
+    expect(existsSync(join(app, "node_modules", "nice-dep"))).toBe(false);
+  });
+
   test("--pm overrides detection", async () => {
     const sb = makeSandbox(reg, alice);
     const app = bunProject({}, alice);
@@ -280,6 +321,43 @@ describe("apm: publish", () => {
     expect(r.code, r.out).toBe(0);
     expect(r.out).toContain("index.js");
     expect(readdirSync(d).filter((f) => f.endsWith(".tgz"))).toEqual([]);
+  });
+
+  test("apm publish --bump on a prerelease gives the version npm version would: its release", async () => {
+    const sb = makeSandbox(reg, alice);
+
+    // npm 11.21.1's `npm version <kind>`: 1.2.0-beta.1 minor -> 1.2.0, 2.0.0-beta.1 major -> 2.0.0, 1.2.3-beta.1 minor -> 1.3.0
+    const cases = [
+      ["1.2.0-beta.1", "minor", "1.2.0"],
+      ["2.0.0-beta.1", "major", "2.0.0"],
+      ["1.2.3-beta.1", "minor", "1.3.0"],
+      ["1.2.3-beta.1", "patch", "1.2.3"],
+    ] as const;
+
+    for (const [from, kind, to] of cases) {
+      const d = writePackage(work, { name: `pre-bump-${kind}-${from.replace(/\W/g, "")}`, version: from }, reg, alice);
+      const r = await apm(["publish", "--bump", kind, "--dry-run"], { cwd: d, env: sb.env });
+
+      expect(r.code, r.out).toBe(0);
+      expect(r.out).toContain(`version ${from} → ${to}`);
+    }
+  });
+
+  test("apm publish --bump <version> refuses a version that is not semver, and leaves package.json alone", async () => {
+    const sb = makeSandbox(reg, alice);
+    const d = writePackage(work, { name: "bad-bump", version: "1.0.0" }, reg, alice);
+    const before = readFileSync(join(d, "package.json"), "utf8");
+
+    // a prefix that looks like a version, and a numeric prerelease part with a leading zero (not semver 2.0)
+    for (const bad of ["1.2.3garbage", "1.2.3-01"]) {
+      const r = await apm(["publish", "--bump", bad], { cwd: d, env: sb.env });
+
+      expect(r.code, r.out).toBe(2);
+      expect(readFileSync(join(d, "package.json"), "utf8")).toBe(before);
+    }
+
+    const { status } = await getJson(`${reg.url}bad-bump`);
+    expect(status).toBe(404);
   });
 
   test("apm publish works in a project that only has npm", async () => {

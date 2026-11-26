@@ -2,7 +2,7 @@
 // registry apm checked, credentials never reach a registry a repo picked or the scripts a package runs,
 // audit says what it could not see, and --json always prints one document.
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -292,6 +292,21 @@ describe("finding 9: apm login only saves a well-formed token", () => {
     expect(readFileSync(join(sb.home, ".npmrc"), "utf8")).toBe(before);
     expect(r.code, r.out).not.toBe(0);
   });
+
+  test("apm login saves to a user config whose folder does not exist yet, as npm does: created, the file 0600", async () => {
+    // npm 11.21.1 `npm config set //host/:_authToken=x --location=user` creates the folder and writes the file 0600
+    const sb = makeSandbox(reg);
+    const userconfig = join(sb.home, ".config", "npm", "npmrc");
+    const env = { ...sb.env, npm_config_userconfig: userconfig };
+    const r = await apm(["login", "--username", "xdg-user", "--password-stdin"], { cwd: sb.home, env, stdin: "a-long-enough-password\n" });
+
+    expect(r.code, r.out).toBe(0);
+    expect(statSync(userconfig).mode & 0o777).toBe(0o600);
+    const who = await apm(["whoami"], { cwd: sb.home, env: { ...env, APM_TOKEN: "" } });
+
+    expect(who.code, who.out).toBe(0);
+    expect(who.out).toContain("xdg-user");
+  });
 });
 
 describe("finding 10: --force advice is accurate and never skips the dependency check", () => {
@@ -405,5 +420,35 @@ describe("finding 12: apm audit does not match on malformed advisory ranges", ()
     expect(findings).not.toContain("hard-nice");
     expect(findings).toContain("hard-store@1.0.0");
     expect(JSON.stringify(dig(body, "unchecked"))).toContain("garbage range");
+  });
+
+  test("a registry that cannot answer: apm audit still prints its report, with every installed version unchecked", async () => {
+    const down = standIn(() => Response.json({ error: "upstream unavailable" }, { status: 503 }));
+    const sb = makeSandbox(reg, alice);
+    const app = writeConsumer(work, reg, alice);
+
+    for (const name of ["hard-nice", "hard-store"]) {
+      mkdirSync(join(app, "node_modules", name), { recursive: true });
+      writeFileSync(join(app, "node_modules", name, "package.json"), JSON.stringify({ name, version: "1.0.0" }));
+    }
+
+    const env = { ...sb.env, APM_REGISTRY: down.url };
+    const r = await apm(["audit", "--json"], { cwd: app, env });
+    const human = await apm(["audit"], { cwd: app, env });
+
+    await down.stop();
+    expect(r.code, r.out).toBe(1);
+    const body = oneJson(r.stdout);
+
+    // the shape reference/cli.mdx documents: { ok, checked, findings, unchecked }
+    expect(dig(body, "ok")).toBe(false);
+    expect(dig(body, "checked")).toBe(2);
+    expect(dig(body, "findings")).toEqual([]);
+    const unchecked = JSON.stringify(dig(body, "unchecked"));
+
+    expect(unchecked).toContain("hard-nice@1.0.0");
+    expect(unchecked).toContain("hard-store@1.0.0");
+    expect(human.code, human.out).toBe(1);
+    expect(human.out).toContain("could not be checked, so this audit is not a pass");
   });
 });

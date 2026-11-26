@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSyn
 import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join, relative } from "node:path";
 import { z } from "zod";
-import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isValidPackageName, missingEntries, readTarball, SCORE_FLOOR, type FileLike } from "@apm/core";
+import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isValidPackageName, isValidVersion, missingEntries, readTarball, SCORE_FLOOR, type FileLike } from "@apm/core";
 import { Api, ApiError, AuditResponse, NameResponse, RATE_LIMIT_RETRY, ResolveFail, ResolveOk, ResolvePending, ScoreResponse, Tree, encodeName, parseSpec, tagsWithoutLatest, type Capability, type DistTag, type InstallWarning, type Report } from "./api.ts";
 import { installedPackages, isValidRange, type Found, type Installed } from "./audit.ts";
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
@@ -486,7 +486,7 @@ async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext)
 
     return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, forceable: false, source: "none", unchecked: [], tree: [], warnings: [], projectPeers: [], tags: [] };
   }
-  if (r.status === 414) throw new ApiError(r.status, `resolve failed for ${name}: the request was too long for ${api.cfg.registry} (HTTP 414). apm sends the project's direct dependencies with it; nothing was installed`, r.body);
+  if (r.status === 414) throw new ApiError(r.status, `resolve failed for ${name}: the request was too long for ${displayRegistry(api.cfg.registry) ?? "the registry"} (HTTP 414). apm sends the project's direct dependencies with it; nothing was installed`, r.body);
 
   if (r.status === 400) throw new ApiError(r.status, `resolve failed for ${name}: ${errorOf(r.body, r.status)}`, r.body);
 
@@ -1997,7 +1997,17 @@ async function cmdAdd(a: Args): Promise<number> {
   const ctx = resolveContext({ pm: det.pm, cwd, project: true });
 
   if (ctx.leftOut !== null) say(dim(`apm: ${ctx.leftOut}, so it goes without them; the check of the computed lockfile reads every package`));
-  for (const spec of specs) results.push(await resolveSpec(api, spec, a, ctx));
+  try {
+    for (const spec of specs) results.push(await resolveSpec(api, spec, a, ctx));
+  } catch (e) {
+    // the registry could not be asked (down, refused, a timeout): nothing was installed, and --json keeps its shape
+    const why = e instanceof ApiError ? e.message : `could not reach ${displayRegistry(cfg.registry) ?? "the registry"} (${e instanceof Error ? e.message : String(e)})`;
+
+    fail(`apm add: ${why.endsWith("nothing was installed") ? why : `${why}; nothing was installed`}`);
+    emitJson({ ok: false, det, results: [], error: lastError });
+
+    return 1;
+  }
   for (const r of results) printResolved(r);
   const blocked = results.filter((r) => r.blocked !== null || r.version === null);
 
@@ -2368,14 +2378,26 @@ async function cmdAudit(): Promise<number> {
   }
   const query: Record<string, string[]> = {};
   for (const [n, vs] of installed) query[n] = [...vs];
-  const audit = installed.size > 0 ? await api.post("-/apm/v1/audit", query, AuditResponse) : { advisories: {}, unavailable: [] };
+  // a registry that cannot answer leaves every advisory unknown: each version is unchecked, and the report still prints
+  let advisoriesFailed: string | null = null;
+  let audit: z.infer<typeof AuditResponse> = { advisories: {}, unavailable: [] };
+
+  if (installed.size > 0) {
+    try {
+      audit = await api.post("-/apm/v1/audit", query, AuditResponse);
+    } catch (e) {
+      advisoriesFailed = e instanceof Error ? e.message : String(e);
+      audit = { advisories: {}, unavailable: [...installed.keys()] };
+    }
+  }
+
   const { graph } = nodeModulesGraph(disk);
   const verdict = await checkGraph({ api, packages: graph.packages, local: graph.local, noIntegrity: [], waitMs: pendingWaitMs(), progress: (line) => say(dim(line)), policy: DEFAULT_CHECK });
   const findings: { id: string; severity: string; text: string }[] = verdict.blocked.map((b) => ({ id: idOf(b), severity: "critical", text: b.reason }));
   // checks that could not run: an audit with any of these is not a pass
   const unchecked: { id: string; reason: string }[] = [
     ...unreadable,
-    ...audit.unavailable.flatMap((name) => [...(installed.get(name) ?? [])].map((v) => ({ id: `${name}@${v}`, reason: "advisories could not be fetched from the upstream registry" }))),
+    ...audit.unavailable.flatMap((name) => [...(installed.get(name) ?? [])].map((v) => ({ id: `${name}@${v}`, reason: advisoriesFailed === null ? "advisories could not be fetched from the upstream registry" : `the registry did not answer the advisory check (${advisoriesFailed})` }))),
   ];
 
   for (const w of verdict.warnings) {
@@ -2585,15 +2607,20 @@ async function cmdWhoami(): Promise<number> {
 }
 
 // ---------- publish ----------
-function bump(version: string, kind: string): string {
-  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(version);
+/**
+ * The version `npm version <kind>` gives (semver's inc): a prerelease is bumped to its own release when that release is
+ * of the kind asked for (1.2.0-beta.1 minor -> 1.2.0, 2.0.0-beta.1 major -> 2.0.0), else past it. An exact version must
+ * be semver. null when `kind` is neither.
+ */
+function bump(version: string, kind: string): string | null {
+  const m = /^(\d+)\.(\d+)\.(\d+)(-[^+]*)?/.exec(version);
   if (!m) throw new Error(`cannot bump version ${version}`);
   const [maj, min, pat] = [Number(m[1]), Number(m[2]), Number(m[3])];
-  if (kind === "major") return `${maj + 1}.0.0`;
-  if (kind === "minor") return `${maj}.${min + 1}.0`;
-  if (kind === "patch") return version.includes("-") ? `${maj}.${min}.${pat}` : `${maj}.${min}.${pat + 1}`;
-  if (/^\d+\.\d+\.\d+/.test(kind)) return kind;
-  throw new Error("--bump takes patch, minor, major or an exact version");
+  const pre = m[4] !== undefined;
+  if (kind === "major") return pre && min === 0 && pat === 0 ? `${maj}.0.0` : `${maj + 1}.0.0`;
+  if (kind === "minor") return pre && pat === 0 ? `${maj}.${min}.0` : `${maj}.${min + 1}.0`;
+  if (kind === "patch") return pre ? `${maj}.${min}.${pat}` : `${maj}.${min}.${pat + 1}`;
+  return isValidVersion(kind) ? kind : null;
 }
 
 function walkFiles(root: string, limit = 5000): FileLike[] {
@@ -2646,7 +2673,15 @@ async function cmdPublish(a: Args): Promise<number> {
   if (refuseOverrides(scopeOverrides({ cwd, env: env(), registry: cfg.registry, scopes }), cfg.registry, "publish")) return 1;
   const bumpKind = flag(a, "bump");
   const dry = has(a, "dry-run");
-  const version = bumpKind ? bump(pj.version, bumpKind) : pj.version;
+  const bumped = bumpKind ? bump(pj.version, bumpKind) : pj.version;
+
+  if (bumped === null) {
+    warn(`usage: apm publish --bump patch|minor|major|<version>: ${bumpKind} is none of them (an exact version must be semver, like 1.2.3 or 2.0.0-rc.1)`);
+
+    return 2;
+  }
+
+  const version = bumped;
   const id = `${pj.name}@${version}`;
 
   // 1. Without a "files" allowlist, what ships depends on the package manager (npm ships .env.production,
