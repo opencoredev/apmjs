@@ -1,5 +1,5 @@
 // A project's registry setting in a file git ignores: it works on this machine only, so a clone or CI installs from npm.
-import { existsSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { z } from "zod";
 import { withoutSecrets } from "./child.ts";
@@ -12,19 +12,49 @@ const YarnrcRegistry = z.object({ npmRegistryServer: z.string().optional() }).lo
 
 const PackageManagerField = z.object({ packageManager: z.string().optional() }).loose();
 
+const YarnPath = z.object({ yarnPath: z.string().optional() }).loose();
+
+/** A config file larger than this is not read: a real one is a few lines, and this check only ever adds a warning. */
+const MAX_CONFIG_BYTES = 256 * 1024;
+
+/** A small file's text; null when it is missing, too large or unreadable. */
+function smallText(path: string): string | null {
+  try {
+    return statSync(path).size <= MAX_CONFIG_BYTES ? readFileSync(path, "utf8") : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Whether the project at `root` runs yarn 2 or later, the yarn that reads .yarnrc.yml (yarn 1 does not), without running
  * yarn: `packageManager` names yarn 2 or later, or yarn.lock is yarn 2's format (it starts with a __metadata entry).
  */
 function yarnBerry(root: string): boolean {
   try {
-    const pm = PackageManagerField.safeParse(JSON.parse(readFileSync(join(root, "package.json"), "utf8"))).data?.packageManager ?? "";
+    const pm = PackageManagerField.safeParse(JSON.parse(smallText(join(root, "package.json")) ?? "{}")).data?.packageManager ?? "";
 
     if (/^yarn@(?:[2-9]|\d{2,})\./.test(pm)) return true;
 
-    return existsSync(join(root, "yarn.lock")) && /^__metadata:/m.test(readFileSync(join(root, "yarn.lock"), "utf8"));
+    if (YarnPath.safeParse(Bun.YAML.parse(smallText(join(root, ".yarnrc.yml")) ?? "")).data?.yarnPath !== undefined) return true;
+
+    return /^__metadata:/m.test(headText(join(root, "yarn.lock")));
   } catch {
     return false;
+  }
+}
+
+/** The first few kilobytes of a file (yarn 2's lockfile names its format at the top), or "" when there is none. */
+function headText(path: string): string {
+  if (!existsSync(path)) return "";
+  const fd = openSync(path, "r");
+
+  try {
+    const buf = Buffer.alloc(4096);
+
+    return buf.subarray(0, readSync(fd, buf, 0, buf.length, 0)).toString("utf8");
+  } finally {
+    closeSync(fd);
   }
 }
 
@@ -52,7 +82,9 @@ const GIT_BUDGET_MS = 2_000;
 /** The registry the package manager's own config file at `path` sets (bunfig.toml or .yarnrc.yml); null when none or unreadable. */
 function nativeRegistry(path: string): string | null {
   try {
-    const text = readFileSync(path, "utf8");
+    const text = smallText(path);
+
+    if (text === null) return null;
 
     if (path.endsWith("bunfig.toml")) return BunfigRegistry.safeParse(Bun.TOML.parse(text)).data?.install?.registry ?? null;
 

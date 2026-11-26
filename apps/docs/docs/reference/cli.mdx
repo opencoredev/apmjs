@@ -13,7 +13,7 @@ Install it with `curl -fsSL https://apmjs.dev/install | sh`. The script checks t
 
 | Flag | Meaning |
 | --- | --- |
-| `--pm bun\|npm\|pnpm\|yarn` | The package manager to run. Default: found from the lockfile, then `packageManager` in `package.json`, then a `bunfig.toml` (bun). A project with none of them, such as one made by `npm init -y`, gets npm (bun only when npm is not installed); outside any project, bun if it is installed, else npm. |
+| `--pm bun\|npm\|pnpm\|yarn` | The package manager to run. Default: found from the lockfile, then `packageManager` in `package.json`, then a `bunfig.toml` (bun). A project with none of them, such as one made by `npm init -y`, gets npm (when npm is not installed, pass `--pm bun`); outside any project, bun if it is installed, else npm. |
 | `--json` | Print exactly one JSON document on stdout. Human output goes to stderr. Applies to `add`, `install` with packages, `explain`, `search`, `score`, `name`, `audit`, `yank`, `unyank`, `revoke`, `restore`, `incident`, `publish`, `login` and `whoami`. |
 | `--otp <code>` | A six-digit code from your authenticator app, for commands that need a fresh second factor. |
 | `--help`, `-h` | Print the command list. After one of apm's own commands (`apm publish --help`), anywhere in its arguments, print that command's usage and flags and run nothing. `apm ci --help`, `apm remove --help`, `apm help ci` and `apm help remove` print apm's help for those. After a command apm passes on, it goes to the package manager (`apm run --help`) or, after a script name, to the script (`apm run dev --help`). |

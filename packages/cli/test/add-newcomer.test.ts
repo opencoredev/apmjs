@@ -310,6 +310,12 @@ describe("apm add for a newcomer", () => {
 
     git(["init", "-q"], classic);
     expect((await apm(["add", "good", "--pm", "yarn"], { cwd: classic })).text).not.toContain("git ignores");
+
+    // a yarnPath in .yarnrc.yml is yarn 2 or later, lockfile or not
+    const berry = folder("gi/yarn-path", { "package.json": manifest, ".yarnrc.yml": `yarnPath: .yarn/releases/yarn-4.5.0.cjs\nnpmRegistryServer: "${registry}"\n`, ".gitignore": ".yarnrc.yml\n" });
+
+    git(["init", "-q"], berry);
+    expect((await apm(["add", "good", "--pm", "yarn"], { cwd: berry })).text).toContain("apm: git ignores .yarnrc.yml,");
   });
 
   test("a bun workspace member's own gitignored bunfig.toml is named", async () => {
