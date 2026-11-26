@@ -134,7 +134,24 @@ export function packageJsonLd(p: PackageMeta & { license: string | null; reposit
   };
 }
 
-export type JsonLdDocument = ReturnType<typeof websiteJsonLd> | ReturnType<typeof packageJsonLd>;
+/** The home page's Organization JSON-LD: who runs apm, its logo and where else it lives. */
+export function organizationJsonLd() {
+  return {
+    "@context": "https://schema.org",
+    "@type": "Organization",
+    name: SITE_NAME,
+    alternateName: "apmjs",
+    url: `${SITE_URL}/`,
+    logo: `${SITE_URL}/apple-icon.png`,
+    sameAs: ["https://github.com/opencoredev/apmjs"],
+  };
+}
+
+export type JsonLdDocument =
+  | ReturnType<typeof websiteJsonLd>
+  | ReturnType<typeof packageJsonLd>
+  | ReturnType<typeof organizationJsonLd>
+;
 
 /** JSON-LD as a script body: `<` escaped so publisher text can't close the script element. */
 export function jsonLdText(data: JsonLdDocument): string {
