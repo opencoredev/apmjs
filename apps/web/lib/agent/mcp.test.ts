@@ -263,13 +263,70 @@ describe("structured answers agree with the text", () => {
     expect(r.text).toContain("apm add left-pad\nbun add left-pad@1.3.0\nnpm install left-pad@1.3.0\npnpm add left-pad@1.3.0");
   });
 
-  test("check_name: a free bare name is free on npm and needs a scope on apm", async () => {
+  test("check_name: a free bare name is free on npm and needs a scope on apm, so it is not available", async () => {
     const r = await call("check_name", { name: "fresh-name" }, {
       names: { query: "fresh-name", valid: true, taken: false, source: null, unknown: false, available: true, owners: [], latest: null, description: null, conflicts: [], lookalikes: [], similar: [], scope: null, suggestions: [] },
     });
 
-    expect(r.text).toContain("fresh-name is not taken, needs a scope. New packages on apm go under your GitHub login, like @you/fresh-name.");
-    expect(r.structured.available).toBe(true);
+    const line = "fresh-name is not taken, needs a scope. New packages on apm go under your GitHub login, like @you/fresh-name.";
+
+    expect(r.text).toContain(line);
+    expect(r.structured.available).toBe(false);
+    expect(r.structured.reason).toBe(line);
     expect(r.structured.publishable).toEqual({ kind: "needs-scope", suggestion: "@you/fresh-name" });
+  });
+
+  test("check_name: a free name under a scope is not available, whatever scope the caller claims", async () => {
+    const names = { query: "@sindresorhus/h638-probe", valid: true, taken: false, source: null, unknown: false, available: true, owners: [], latest: null, description: null, conflicts: [], lookalikes: [], similar: [], scope: null, suggestions: [] };
+    const anonymous = await call("check_name", { name: "@sindresorhus/h638-probe" }, { names });
+    const claimed = await call("check_name", { name: "@sindresorhus/h638-probe", scope: "sindresorhus" }, { names: { ...names, scope: "sindresorhus" } });
+
+    for (const r of [anonymous, claimed]) {
+      expect(r.text).toContain("@sindresorhus/h638-probe is free; only the owner of @sindresorhus (a GitHub login) can publish it.");
+      expect(r.structured.available).toBe(false);
+      expect(r.structured.reason).toBe("@sindresorhus/h638-probe is free; only the owner of @sindresorhus (a GitHub login) can publish it.");
+      expect(r.structured.publishable).toEqual({ kind: "scoped", scope: "@sindresorhus" });
+    }
+  });
+
+  test("check_name: a taken name is not available and says why", async () => {
+    const r = await call("check_name", { name: "left-pad" }, {
+      names: { query: "left-pad", valid: true, taken: true, source: "npm", unknown: false, available: false, owners: ["stevemao"], latest: null, description: null, conflicts: [], lookalikes: [], similar: [], scope: null, suggestions: [] },
+    });
+
+    expect(r.structured.available).toBe(false);
+    expect(r.structured.reason).toBe("left-pad is taken by `stevemao`.");
+  });
+
+  test("check_name: a free bare name follows the registry's name policy", async () => {
+    const names = { query: "open-lib", valid: true, taken: false, source: null, unknown: false, available: true, owners: [], latest: null, description: null, conflicts: [], lookalikes: [], similar: [], scope: null, suggestions: [] };
+    const open = await call("check_name", { name: "open-lib" }, { names, namePolicy: "open" });
+    const unread = await call("check_name", { name: "open-lib" }, { names, namePolicy: null });
+
+    expect(open.text.split("\n")[0]).toBe("open-lib is available.");
+    expect(open.structured.available).toBe(true);
+    expect(open.structured.reason).toBeNull();
+    expect(open.structured.publishable).toEqual({ kind: "open" });
+    expect(unread.structured.available).toBe(false);
+    expect(unread.structured.reason).toBe(unread.text.split("\n")[0]);
+    expect(unread.structured.reason).toContain("could not read this registry's rules for new names");
+  });
+
+  test("check_name: every name it cannot offer says why, in the text's first line", async () => {
+    const base = { valid: true, taken: false, source: null, unknown: false, available: false, owners: [], latest: null, description: null, conflicts: [], lookalikes: [], similar: [], scope: null, suggestions: [] };
+
+    const cases = [
+      { query: "registry-refuses", ...base, valid: false },
+      { query: "npm-down", ...base, unknown: true },
+      { query: "expresss", ...base, conflicts: [{ name: "express", reason: "too close to express" }] },
+    ];
+
+    for (const names of cases) {
+      const r = await call("check_name", { name: names.query }, { names, namePolicy: "open" });
+
+      expect(r.structured.available).toBe(false);
+      expect(r.structured.reason).toBe(r.text.split("\n")[0]);
+      expect(r.structured.publishable).toEqual({ kind: "not-free" });
+    }
   });
 });

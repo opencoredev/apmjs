@@ -2,6 +2,7 @@
 // as one port. lib/agent/registry-source.ts reads the real registry; the unit tests pass a stand-in.
 import { z } from "zod";
 import type { ExcerptAnswer } from "../file-excerpt";
+import type { NamePolicy } from "../publish-name";
 import type { Json } from "./json";
 import type { Facts, Fetched, PackageInfo, Signal } from "../registry";
 import type { ReviewAnswer } from "../review-schema";
@@ -217,6 +218,8 @@ export type AgentSource = {
   search: (input: { query: string }) => Promise<SearchAnswer | null>;
   /** The name check; `scope` is the npm scope (without @) the alternatives are checked under. */
   names: (input: { name: string; scope: string | null }) => Promise<NameReport | null>;
+  /** The registry's rule for new bare names (GET /-/apm/v1/auth/config), null when it could not be read. */
+  namePolicy: () => Promise<NamePolicy | null>;
   /** Lines of a file; a revoked version's answer is unavailable with status 410, a line past the end 416. */
   excerpt: (input: { name: string; version: string; path: string; line: number; context: number }) => Promise<Fetched<ExcerptAnswer>>;
 };

@@ -89,7 +89,7 @@ One version's score. Without a version, `latest`.
 
 ### `GET /-/apm/v1/names?q=<name>`
 
-Name check, as `apm name` shows it: `{ query, valid, taken, available, owners, latest, conflicts, similar, suggestions }`. Optional `user` says whose scope to check against; it defaults to the caller.
+Name check, the data `apm name` reads: `{ query, valid, taken, available, owners, latest, conflicts, similar, suggestions }`. Optional `user` says whose scope to check against; it defaults to the caller. Here `available` means the name is free: valid, not taken on npm or apm, and not blocked as a look-alike. It does not say whether you may publish it, which also depends on the registry's name policy (`namePolicy` in `GET /-/apm/v1/auth/config`) and on who owns the scope. `apm name --json` and the MCP `check_name` tool answer that question in their own `available`, with `reason` saying why when it is `false`.
 
 ### `POST /-/apm/v1/scan`
 
