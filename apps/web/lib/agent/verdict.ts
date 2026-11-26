@@ -718,7 +718,7 @@ function decide(input: ExplainInput): Decided {
   if (report === null) {
     const never = ownWarning?.kind === "unscorable" && ownWarning.unscorable !== undefined;
     const state = ownWarning?.kind === "pending" ? `apm has not scored ${id} yet: it is still being analysed` : never ? `apm cannot score ${id}` : `apm has not scored ${id}`;
-    const next = never ? "Nothing was decided, and asking again will not change that: a person has to decide." : "Nothing was decided; ask again in a minute.";
+    const next = never ? "Nothing was decided, and asking again will not change that: a person has to decide." : ownWarning?.kind === "pending" ? "Nothing was decided; scoring is usually ready within about 5 minutes, so ask again in a few minutes." : "Nothing was decided; ask again after about 1, 2 and 4 minutes.";
 
     return { ...known, verdict: "unknown", summary: `${state}, so nothing has read its code and apm cannot say whether to install it. ${next}`, reasons: ownWarning ? [`The registry said: ${quoted(ownWarning.text)}`] : [], commands: null };
   }
