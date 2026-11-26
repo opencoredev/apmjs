@@ -941,7 +941,7 @@
       "expect": {
         "verdict": "unknown",
         "commands": false,
-        "summary": "apm has not scored x@1.0.0, so nothing has read its code and apm cannot say whether to install it. Nothing was decided; ask again in a minute.",
+        "summary": "apm has not scored x@1.0.0, so nothing has read its code and apm cannot say whether to install it. Nothing was decided; ask again after about 1, 2 and 4 minutes.",
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
@@ -1880,7 +1880,7 @@
       "expect": {
         "verdict": "unknown",
         "commands": false,
-        "summary": "apm has not scored x@1.0.0, so nothing has read its code and apm cannot say whether to install it. Nothing was decided; ask again in a minute.",
+        "summary": "apm has not scored x@1.0.0, so nothing has read its code and apm cannot say whether to install it. Nothing was decided; ask again after about 1, 2 and 4 minutes.",
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"

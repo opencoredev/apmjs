@@ -74,7 +74,7 @@ describe("packageMarkdown", () => {
     const out = packageMarkdown({ pkg: pkg({ score: null }), version: "1.3.0", status: ACTIVE, policy: INSTALLS, facts: pkg().facts, score: null, unscorable: null, review: { kind: "missing" }, install: { kind: "default", version: "1.3.0" }, registry: REGISTRY });
 
     expect(out).toContain("- Score: not scored yet");
-    expect(out).toContain("Not scored yet.");
+    expect(out).toContain("Not scored yet. apm scores a version when it first reads its tarball, usually within about 5 minutes; ask again after about 1, 2 and 4 minutes.");
     expect(out).toContain("- Code capabilities: unknown until the version is scored");
     expect(out).toContain("AI review is not available for this version on this registry.");
   });
@@ -103,7 +103,7 @@ describe("packageMarkdown", () => {
     expect(out).toContain("- Score: none: apm cannot score this version");
     expect(out).toContain(`apm cannot score this version. The registry's reason: \`${TOO_LARGE}\`. Installs through apm still work, and apm add warns about it; strict mode and the ~safe view refuse it.`);
     expect(out).toContain("- Code capabilities: unknown: apm cannot score this version");
-    expect(out).not.toContain("ask again in a few minutes");
+    expect(out).not.toMatch(/ask again|try again/);
     expect(out).not.toContain("not scored yet");
   });
 
@@ -118,7 +118,7 @@ describe("packageMarkdown", () => {
     const out = packageMarkdown(loaded.view);
 
     expect(out).toContain(`The registry's reason: \`${text}\``);
-    expect(out).not.toContain("ask again in a few minutes");
+    expect(out).not.toMatch(/ask again|try again/);
     const r = await handleMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "check_package", arguments: { name: "left-pad", version: "1.0.0" } } }, source);
 
     expect(JSON.stringify(r)).toContain(`"unscorable":{"reason":"too-large","text":${JSON.stringify(text)}}`);

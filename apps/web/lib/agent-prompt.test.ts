@@ -25,10 +25,11 @@ describe("packagePrompt", () => {
 
     expect(p).toContain("Do not install without a verdict.");
     expect(p).toContain("show me the summary and reasons, wait for my approval, then run that command.");
-    expect(p).toContain("If the verdict has no command for this project's package manager, stop and tell me. Do not write your own command or switch package managers.");
-    expect(p).toContain("If the request fails or is rate-limited, wait a minute and try once more.");
+    expect(p).toContain("If an install or review-first verdict has no command for this project's package manager, stop and tell me. Do not write your own command or switch package managers.");
+    expect(p).toContain("If the request fails or is rate-limited and gives no verdict, wait a minute and try once more.");
+    expect(p).toContain("an MCP result marked as an error still carries the verdict: read it");
     // a cold version is usually scored within about 5 minutes: spaced retries before handing back, none for one that never will be
-    expect(p).toContain("If it answers unknown, unless it says asking again will not help, ask again about 1, 2 and 4 minutes after the first ask");
+    expect(p).toContain("unless it says asking again will not help, ask again about 1, 2 and 4 minutes after the first ask");
     expect(p).toContain("unknown after those retries: do not install.");
   });
 
@@ -74,7 +75,7 @@ describe("setupPrompt", () => {
     expect(INSTRUCTIONS_LINE).toContain("On install, run the command it gives for this project's package manager, then tell me its notes, if any.");
     expect(INSTRUCTIONS_LINE).toContain("On review-first, show me the reasons and run that command only after I approve.");
     expect(INSTRUCTIONS_LINE).toContain("On unknown, unless it says asking again will not help, ask again about 1, 2 and 4 minutes after the first ask (apm usually scores a new version within about 5 minutes); if it is still unknown, do not install; tell me why.");
-    expect(INSTRUCTIONS_LINE).toContain("On anything else, or if it gives no command for this project's package manager, do not install; tell me why.");
+    expect(INSTRUCTIONS_LINE).toContain("On any other verdict, or if an install or review-first answer gives no command for this project's package manager, do not install; tell me why.");
     expect(readFileSync(join(import.meta.dir, "../../../docs/AGENTS.md"), "utf8")).toContain(INSTRUCTIONS_LINE);
 
     // the /docs page renders this same constant

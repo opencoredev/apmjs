@@ -76,7 +76,7 @@ function AgentsSection() {
       <Code wrap>{INSTRUCTIONS_LINE}</Code>
       <Text>
         Before adding a dependency, the agent asks for the verdict and gets install, review-first, do-not-install, not-found or unknown, with the reasons, the command to run and notes on
-        what apm did not finish. review-first means a person should look: a real risk signal, or an analysis apm could not finish. A version apm has no score for is unknown, and the agent asks again after about 1, 2 and 4 minutes while apm scores it; the rest of apm&apos;s own work not yet done is a note. The same
+        what apm did not finish. review-first means a person should look: a real risk signal, or an analysis apm could not finish. A version apm has no score for is unknown: while apm scores it, the agent asks again after about 1, 2 and 4 minutes, and if it is still unknown it tells you why and does not install; the rest of apm&apos;s own work not yet done is a note. The same
         answers come as JSON over HTTP and from the CLI with <code className="font-mono text-[15px] text-foreground">--json</code>:
       </Text>
       <Code>{`curl ${siteUrl("/api/explain?package=zod@^4")}   # the install verdict as JSON
