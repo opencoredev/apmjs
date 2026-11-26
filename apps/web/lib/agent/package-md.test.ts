@@ -103,7 +103,7 @@ describe("packageMarkdown", () => {
     expect(out).toContain("- Score: none: apm cannot score this version");
     expect(out).toContain(`apm cannot score this version. The registry's reason: \`${TOO_LARGE}\`. Installs through apm still work, and apm add warns about it; strict mode and the ~safe view refuse it.`);
     expect(out).toContain("- Code capabilities: unknown: apm cannot score this version");
-    expect(out).not.toContain("ask again in a minute");
+    expect(out).not.toContain("ask again in a few minutes");
     expect(out).not.toContain("not scored yet");
   });
 
@@ -118,7 +118,7 @@ describe("packageMarkdown", () => {
     const out = packageMarkdown(loaded.view);
 
     expect(out).toContain(`The registry's reason: \`${text}\``);
-    expect(out).not.toContain("ask again in a minute");
+    expect(out).not.toContain("ask again in a few minutes");
     const r = await handleMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "check_package", arguments: { name: "left-pad", version: "1.0.0" } } }, source);
 
     expect(JSON.stringify(r)).toContain(`"unscorable":{"reason":"too-large","text":${JSON.stringify(text)}}`);

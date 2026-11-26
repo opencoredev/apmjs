@@ -2041,7 +2041,7 @@
       "expect": {
         "verdict": "unknown",
         "commands": false,
-        "summary": "apm has not scored x@1.0.0 yet: it is still being analysed, so nothing has read its code and apm cannot say whether to install it. Nothing was decided; ask again in a minute.",
+        "summary": "apm has not scored x@1.0.0 yet: it is still being analysed, so nothing has read its code and apm cannot say whether to install it. Nothing was decided; scoring is usually ready within about 5 minutes, so ask again in a few minutes.",
         "coverage": {
           "aiReview": "not-selected",
           "dependencies": "complete"
@@ -2286,7 +2286,7 @@
       "expect": {
         "verdict": "unknown",
         "commands": false,
-        "summary": "apm has not scored x@1.0.0 yet: it is still being analysed, so nothing has read its code and apm cannot say whether to install it. Nothing was decided; ask again in a minute.",
+        "summary": "apm has not scored x@1.0.0 yet: it is still being analysed, so nothing has read its code and apm cannot say whether to install it. Nothing was decided; scoring is usually ready within about 5 minutes, so ask again in a few minutes.",
         "coverage": {
           "aiReview": "not-selected",
           "dependencies": "complete"

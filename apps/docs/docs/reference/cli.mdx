@@ -218,7 +218,7 @@ The first form signs you in through the browser with a device code and saves a l
 apm explain <package>[@range] [--strict] [--json]
 ```
 
-Prints apm's install verdict (`install`, `review-first`, `do-not-install`, `not-found` or `unknown`) with reasons, evidence, notes and exact install commands. Exit codes: `0` for `install`, `1` for `do-not-install` and `not-found`, `2` for wrong usage, `3` for `review-first`, and `4` for `unknown`. A version apm has no score for is `unknown` with no install command (unless something in its tree is confirmed malicious, which is `do-not-install`): while it is still being analysed, ask again in a minute.
+Prints apm's install verdict (`install`, `review-first`, `do-not-install`, `not-found` or `unknown`) with reasons, evidence, notes and exact install commands. Exit codes: `0` for `install`, `1` for `do-not-install` and `not-found`, `2` for wrong usage, `3` for `review-first`, and `4` for `unknown`. A version apm has no score for is `unknown` with no install command (unless something in its tree is confirmed malicious, which is `do-not-install`): while it is still being analysed, ask again about 1, 2 and 4 minutes after the first ask (scoring is usually ready within about 5 minutes), then hand back to the person.
 
 ## apm search
 

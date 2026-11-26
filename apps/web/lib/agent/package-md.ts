@@ -338,7 +338,7 @@ export function packageMarkdown(input: PackageView): string {
 
   out.push("## Risk signals", "");
 
-  if (!score) out.push(unscorable !== null ? unscorableLine(unscorable) : "Not scored yet. apm scores a version when it first reads its tarball; ask again in a minute.", "");
+  if (!score) out.push(unscorable !== null ? unscorableLine(unscorable) : "Not scored yet. apm scores a version when it first reads its tarball, usually within about 5 minutes; ask again in a few minutes.", "");
   else {
     const lost = score.signals.filter((s) => s.points < 0);
     const notes = score.signals.filter((s) => s.points >= 0);

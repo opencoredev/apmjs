@@ -16,7 +16,7 @@ describe("packagePrompt", () => {
 
     expect(p).toContain("   - install:");
     expect(p).toContain("   - review-first:");
-    expect(p).toContain("   - do-not-install, not-found or unknown: do not install.");
+    expect(p).toContain("   - do-not-install, not-found, or unknown after those retries: do not install.");
   });
 
   // review of af366cc: a review-first package must wait for the person, not be shown and installed in one go
@@ -26,7 +26,10 @@ describe("packagePrompt", () => {
     expect(p).toContain("Do not install without a verdict.");
     expect(p).toContain("show me the summary and reasons, wait for my approval, then run that command.");
     expect(p).toContain("If the verdict has no command for this project's package manager, stop and tell me. Do not write your own command or switch package managers.");
-    expect(p).toContain("If the request fails, is rate-limited or answers unknown, wait a minute and try once more.");
+    expect(p).toContain("If the request fails or is rate-limited, wait a minute and try once more.");
+    // a cold version is usually scored within about 5 minutes: spaced retries before handing back, none for one that never will be
+    expect(p).toContain("If it answers unknown, unless it says asking again will not help, ask again about 1, 2 and 4 minutes after the first ask");
+    expect(p).toContain("unknown after those retries: do not install.");
   });
 
   // the apm CLI is not on a registry yet, so a prompt that needs it stops nearly every agent at "ask me"
@@ -70,6 +73,7 @@ describe("setupPrompt", () => {
   test("the saved rule waits for the person's approval on review-first, and both docs give the same line", () => {
     expect(INSTRUCTIONS_LINE).toContain("On install, run the command it gives for this project's package manager, then tell me its notes, if any.");
     expect(INSTRUCTIONS_LINE).toContain("On review-first, show me the reasons and run that command only after I approve.");
+    expect(INSTRUCTIONS_LINE).toContain("On unknown, unless it says asking again will not help, ask again about 1, 2 and 4 minutes after the first ask (apm usually scores a new version within about 5 minutes); if it is still unknown, do not install; tell me why.");
     expect(INSTRUCTIONS_LINE).toContain("On anything else, or if it gives no command for this project's package manager, do not install; tell me why.");
     expect(readFileSync(join(import.meta.dir, "../../../docs/AGENTS.md"), "utf8")).toContain(INSTRUCTIONS_LINE);
 
