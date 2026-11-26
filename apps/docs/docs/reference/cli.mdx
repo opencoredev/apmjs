@@ -146,13 +146,13 @@ Says whether a name is free, taken, or free but refused (with the reason), plus 
 apm audit [--json]
 ```
 
-Checks every installed version with the same check `apm add` runs after an install, plus the upstream advisories, whatever platform each is built for: nothing installed is skipped. A revoked, yanked or confirmed malicious version is a `critical` finding, a fresh, low-scoring or unscorable one a `warning`. Exits `1` on any finding and also when anything could not be checked.
+Checks every installed version with the same check `apm add` runs after an install, plus the upstream advisories, whatever platform each is built for: nothing installed is skipped. It reads `node_modules`, so a yarn Plug'n'Play install, which has none, is reported as `"checked": 0`. A revoked, yanked or confirmed malicious version is a `critical` finding, a fresh, low-scoring or unscorable one a `warning`. Exits `1` on any finding and also when anything could not be checked.
 
 ```json
 { "ok": false, "checked": 412, "findings": [{ "id": "some-package@1.0.3", "severity": "critical", "text": "..." }], "unchecked": [] }
 ```
 
-Without a login token, each request to the registry queues at most 8 versions that have no score yet. apm sends 200 installed versions per request, and lists the other unscored ones under `unchecked` as `not checked: anonymous scan queues at most 8 unscored packages per request`. With a token (`apm login`, or `APM_TOKEN`), every unscored version is queued. A version still being analysed after `APM_PENDING_WAIT_MS` is listed as `not scored yet`. Either way the audit exits `1`. See [Audit in CI](/guides/ci#audit-in-ci).
+Without a login token, each request to the registry queues at most 8 versions that have no score yet. apm sends 200 installed versions per request, and lists the other unscored ones under `unchecked` as `not checked: anonymous scan queues at most 8 unscored packages per request`. With a token (`apm login`, or `APM_TOKEN`) there is no such cap. A version still being analysed after `APM_PENDING_WAIT_MS` is listed as `not scored yet`. Either way the audit exits `1`. See [Audit in CI](/guides/ci#audit-in-ci).
 
 ## apm publish
 

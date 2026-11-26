@@ -157,7 +157,7 @@ apm asks the registry for the newest version in the range or tag you ask for (`l
         v4/core/compile.js:184: const factory = new F(...constantNames, factoryCode);
 ```
 
-With bun and pnpm, `apm add` writes the exact version it checked to `package.json` (`"zod": "4.6.7"`), where `bun add` and `pnpm add` write a range (`"^4.6.7"`). With npm it writes a range, as `npm install` does.
+`apm add` asks your package manager for the exact version it checked, so with their default settings bun and pnpm write `"zod": "4.6.7"` to `package.json`, where `bun add zod` and `pnpm add zod` write a range (`"^4.6.7"`). npm writes a range either way.
 
 A score informs; it does not block. If the package or one it brings in scores under 40, was not fully analysed, has no score, or could not be looked up, apm prints a warning with the score, the top reasons (file and line) and a link, then installs. Run `apm add --strict` (or set `APM_STRICT=1`) to refuse those instead.
 

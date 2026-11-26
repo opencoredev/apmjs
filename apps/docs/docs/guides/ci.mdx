@@ -12,7 +12,7 @@ You can run apm's checks in CI today. Publishing from CI works too, but every ve
 | Fail the install on revoked or low-scoring versions (by default a low score only warns) | `apm add --strict` or `registry=https://registry.apmjs.dev/~safe/` | Works |
 | Install only versions that pass the cooldown and floor with npm or pnpm | `registry=https://registry.apmjs.dev/~safe/` | Works, but when no version of a package passes, the view lists none (Next.js today; see below) |
 | Run the Bun security scanner automatically on `bun install` | `@apm/bun-scanner` (not on a registry yet; strict mode cannot run from a local path) | Not published yet |
-| Fail the build on revoked versions already in the lockfile | `apm audit` | Works with a login token in `APM_TOKEN`. Without one, it passes only once apm has scored every installed version ([see below](#audit-in-ci)) |
+| Fail the build on revoked versions already installed | `apm audit` | Works with a login token in `APM_TOKEN`. Without one, it passes only once apm has scored every installed version. It reads `node_modules`, so not yarn Plug'n'Play ([see below](#audit-in-ci)) |
 | Upload a version from CI | `apm publish` with a login token | Works; the version is staged and a person approves it |
 | Publish live from CI with no person | OIDC trusted publishing | Does not exist |
 | Attach build provenance | Sigstore provenance | Does not exist |
@@ -29,7 +29,7 @@ The view also hides every version apm has not fully read, so it can withhold all
 
 For Bun, the [Bun scanner](/guides/bun-scanner) is not published on a registry yet (and strict mode refuses local `file:` dependencies, including itself), so use `bunfig.toml` pointed at `https://registry.apmjs.dev/~safe/` and run `apm audit --json` in CI until `@apm/bun-scanner` is published.
 
-The registry setting only reaches CI if the file that holds it is committed. Run `git check-ignore -v .npmrc` (or `bunfig.toml`, `.yarnrc.yml`): if it prints a `.gitignore` rule, CI and your teammates install from npm without any warning. [Move an existing project to apm](/guides/migrate#2-commit-the-file) has the fix.
+The registry setting only reaches CI if the file that holds it is committed. Run `git check-ignore -v .npmrc` (or `bunfig.toml`, `.yarnrc.yml`): if it prints a rule that does not start with `!`, the file is ignored, and CI and your teammates install from npm without any warning. [Move an existing project to apm](/guides/migrate#2-commit-the-file) has the fix.
 
 ## Audit in CI
 
@@ -38,6 +38,8 @@ After the install, audit what was installed. `apm audit` exits non-zero on a rev
 ```bash
 apm audit --json
 ```
+
+`apm audit` checks the packages in `node_modules`, not the lockfile. With yarn 2 and later on its default Plug'n'Play linker there is no `node_modules`, and the audit reports `"checked": 0` and passes. Set `nodeLinker: node-modules` in `.yarnrc.yml` for projects you audit.
 
 ### Without a token
 
@@ -54,26 +56,30 @@ To fail the job only on what was found, and print what could not be checked with
 ```bash
 apm audit --json > audit.json || true
 jq '.unchecked' audit.json
-jq -e '.findings | length == 0' audit.json
+jq -e '(.findings | type == "array") and (.findings | length == 0) and (.checked > 0)' audit.json
 ```
+
+The last line also fails the job when the audit produced no result (for example `{"ok": false, "error": ...}` when the registry cannot be reached) or checked nothing.
 
 ### With a login token
 
-A request with a valid token queues every unscored version and checks up to 2,000 packages at once. There is no separate CI token type yet; use the token `apm login` gives you:
+A request with a valid token has no cap on how many unscored versions it queues, and the registry accepts up to 2,000 packages per request (apm still sends 200 at a time). There is no separate CI token type yet; use the token `apm login` gives you:
 
-1. Run `apm login` on your own machine. It writes the token to your user `.npmrc`, on the `//registry.apmjs.dev/:_authToken=` line.
-2. Copy that token into a CI secret and expose it to the audit step as `APM_TOKEN`. In GitHub Actions:
+1. On your own machine, run `APM_REGISTRY=https://registry.apmjs.dev/ apm login`, open the link it prints, check the code and approve. Setting `APM_REGISTRY` keeps a project `.npmrc` that points at `~safe` from changing which registry the token is saved for. apm writes the token to your user `.npmrc`, on the `//registry.apmjs.dev/:_authToken=` line.
+2. Copy that token into a CI secret and expose it as `APM_TOKEN` to every step that runs apm. In GitHub Actions:
 
    ```yaml
    - name: apm audit
-     run: apm audit --json
      env:
        APM_TOKEN: ${{ secrets.APM_TOKEN }}
+     run: |
+       apm whoami
+       apm audit --json
    ```
 
-3. Add `apm whoami` before the audit if you want the job to stop when the token stops working: it exits 1 with `not logged in`, while a revoked or expired token makes `apm audit` run as anonymous.
+   `apm whoami` stops the job with `not logged in` when the token no longer works. Without it, a revoked or expired token makes `apm audit` run as anonymous.
 
-apm sends `APM_TOKEN` only to the registry it was issued for: `APM_REGISTRY`, else `registry=` in your user `.npmrc`, else `https://registry.apmjs.dev/`. It also keeps `APM_TOKEN` out of the environment of the package manager, install scripts and binaries it runs. If your project `.npmrc` points at the `~safe` view, apm talks to `https://registry.apmjs.dev/~safe/`, holds the token back and prints `APM_TOKEN is for https://registry.apmjs.dev/, so it is not sent to ...`. Set `APM_REGISTRY=https://registry.apmjs.dev/` for the audit step in that case.
+apm sends `APM_TOKEN` only when the registry it talks to is the one the token is bound to: `APM_REGISTRY`, else `registry=` in your user `.npmrc`, else `https://registry.apmjs.dev/` (host, path and protocol must match). It also keeps `APM_TOKEN` out of the environment of the package manager, install scripts and binaries it runs. If your project `.npmrc` points at the `~safe` view, apm talks to `https://registry.apmjs.dev/~safe/`, holds the token back and prints `APM_TOKEN is for https://registry.apmjs.dev/, so it is not sent to ...`. Set `APM_REGISTRY=https://registry.apmjs.dev/` for the audit step in that case.
 
 The token has the powers the warning under [Upload from CI](#upload-from-ci) describes, so treat it like a publish token.
 
