@@ -51,18 +51,19 @@ const VIEWED = {
 
 /**
  * npm's full packument for `native`, as npm sends fsevents@2.3.3 (node-gyp's install script and gypfile), esbuild
- * (a postinstall) and a version with no install script: npm's full document has no hasInstallScript, only its
- * abbreviated one does.
+ * (a postinstall), async-lock@1.1.3 (an empty postinstall, which npm's abbreviated document does not count) and a
+ * version with no install script: npm's full document has no hasInstallScript, only its abbreviated one does.
  */
 const NATIVE = {
   name: "native",
   "dist-tags": { latest: "2.3.3" },
   versions: {
     "1.0.0": { name: "native", version: "1.0.0", scripts: { test: "node test.js" }, dist: dist("native", "1.0.0") },
+    "1.1.0": { name: "native", version: "1.1.0", scripts: { test: "node test.js", postinstall: "" }, dist: dist("native", "1.1.0") },
     "2.0.0": { name: "native", version: "2.0.0", scripts: { postinstall: "node install.js" }, dist: dist("native", "2.0.0") },
     "2.3.3": { name: "native", version: "2.3.3", gypfile: true, scripts: { install: "node-gyp rebuild", test: "node test.js" }, os: ["darwin"], dist: dist("native", "2.3.3") },
   },
-  time: { "1.0.0": "2026-10-01T00:00:00Z", "2.0.0": "2026-10-02T00:00:00Z", "2.3.3": "2026-10-03T00:00:00Z" },
+  time: { "1.0.0": "2026-10-01T00:00:00Z", "1.1.0": "2026-10-01T12:00:00Z", "2.0.0": "2026-10-02T00:00:00Z", "2.3.3": "2026-10-03T00:00:00Z" },
 };
 
 /**
@@ -178,6 +179,7 @@ describe("the npm packument route", () => {
     expect(fullBody.versions["2.3.3"]?.gypfile).toBe(true);
     expect(fullBody.versions["2.0.0"]?.hasInstallScript).toBe(true);
     expect("hasInstallScript" in (fullBody.versions["1.0.0"] ?? {})).toBe(false);
+    expect("hasInstallScript" in (fullBody.versions["1.1.0"] ?? {})).toBe(false);
 
     const abbreviated = await get("/native", "application/vnd.npm.install-v1+json");
 
@@ -187,6 +189,7 @@ describe("the npm packument route", () => {
     expect(abbreviatedBody.versions["2.3.3"]?.hasInstallScript).toBe(true);
     expect(abbreviatedBody.versions["2.0.0"]?.hasInstallScript).toBe(true);
     expect("hasInstallScript" in (abbreviatedBody.versions["1.0.0"] ?? {})).toBe(false);
+    expect("hasInstallScript" in (abbreviatedBody.versions["1.1.0"] ?? {})).toBe(false);
     // npm's abbreviated packument has neither scripts nor gypfile
     expect(Object.values(abbreviatedBody.versions).some((v) => "scripts" in v || "gypfile" in v)).toBe(false);
   });
