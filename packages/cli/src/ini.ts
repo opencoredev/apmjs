@@ -74,29 +74,40 @@ const LINE: Record<SectionSyntax, RegExp> = {
   spaced: /^\[([^\]]*)\]\s*$|^([^=]+)(=(.*))?$/,
 };
 
+/** The lines of an .npmrc as ini splits them: at any run of CR and LF, so a lone CR ends a line too. */
+export function iniLines(source: string): string[] {
+  return source.split(/[\r\n]+/);
+}
+
+/** One line as ini reads it: a section header, a setting (`key[]=` lines name `key`, with `isList`), or nothing. */
+export type IniLine = { kind: "section" } | { kind: "setting"; key: string; isList: boolean; value: IniScalar } | { kind: "none" };
+
+export function readIniLine(line: string, sections: SectionSyntax): IniLine {
+  if (line === "" || /^\s*[;#]/.test(line)) return { kind: "none" };
+  const m = LINE[sections].exec(line);
+
+  if (m === null) return { kind: "none" };
+
+  if (m[1] !== undefined) return { kind: "section" };
+  const keyRaw = unquote(m[2] ?? "");
+  const isList = keyRaw.length > 2 && keyRaw.endsWith("[]");
+  const value: IniScalar = m[3] === undefined ? { kind: "literal", value: true } : literal(unquote(m[4] ?? ""));
+
+  return { kind: "setting", key: isList ? keyRaw.slice(0, -2) : keyRaw, isList, value };
+}
+
 /** The top-level settings of an .npmrc, as ini decodes them. A later plain line for a key replaces an earlier one. */
 export function decodeIni(source: string, sections: SectionSyntax): Map<string, IniValue> {
   const out = new Map<string, IniValue>();
   let inSection = false;
 
-  for (const line of source.split(/[\r\n]+/)) {
-    if (line === "" || /^\s*[;#]/.test(line)) continue;
-    const m = LINE[sections].exec(line);
+  for (const raw of iniLines(source)) {
+    const line = readIniLine(raw, sections);
 
-    if (m === null) continue;
+    if (line.kind === "section") inSection = true;
 
-    if (m[1] !== undefined) {
-      inSection = true;
-      continue;
-    }
-
-    if (inSection) continue;
-    const keyRaw = unquote(m[2] ?? "");
-    const isList = keyRaw.length > 2 && keyRaw.endsWith("[]");
-    const key = isList ? keyRaw.slice(0, -2) : keyRaw;
-
-    if (key === "__proto__") continue;
-    const value: IniScalar = m[3] === undefined ? { kind: "literal", value: true } : literal(unquote(m[4] ?? ""));
+    if (line.kind !== "setting" || inSection || line.key === "__proto__") continue;
+    const { key, isList, value } = line;
     const had = out.get(key);
 
     // a list stays a list: a plain line after `key[]=` lines adds to it, a `key[]=` after a plain line starts one

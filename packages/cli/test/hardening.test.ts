@@ -38,7 +38,7 @@ describe("loadConfig binds APM_TOKEN to its registry", () => {
 
     expect(cfg.registry).toBe("https://attacker.example.test/");
     expect(cfg.token).toBeNull();
-    expect(cfg.withheld).toBe("https://apm.example.test/");
+    expect(cfg.withheld).toEqual({ kind: "other-registry", registry: "https://apm.example.test/" });
   });
 
   test("APM_REGISTRY and the user config registry get it", () => {

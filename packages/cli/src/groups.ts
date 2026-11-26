@@ -123,6 +123,11 @@ function npmSectionSyntax(npmRoot: string | null): SectionSyntax | null {
   return spaced === null ? null : spaced ? "spaced" : "exact";
 }
 
+/** The section syntax of the npm a spawn of `npm` would run with this environment; null when it cannot be found. */
+export function npmIniSections(env: Env): SectionSyntax | null {
+  return npmSectionSyntax(npmRootOf(onPath(env, "npm")));
+}
+
 /**
  * How npm's values reach the list of groups it omits (review of a24c6aa, finding 2). npm 9.3 and later build it from
  * the values as read (`raw`): production=0 is the text "0", which is true, and a list keeps every item, valid or not.

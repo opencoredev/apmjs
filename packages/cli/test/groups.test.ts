@@ -2,9 +2,10 @@
 // read the way it reads them. The table in fixtures/omission-cases.ts is what real npm 9 and pnpm 10 do with each
 // setting (real-layouts.test.ts installs every case with them); here apm's reading is held to it.
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_REGISTRY, loadConfig, saveToken } from "../src/config.ts";
 import { devGroup, omitArgs, releaseOmission } from "../src/groups.ts";
 import { decodeIni, type IniValue, text } from "../src/ini.ts";
 import { npmAnswer, OMISSION_CASES, type OmissionCase } from "./fixtures/omission-cases.ts";
@@ -164,6 +165,151 @@ describe("finding 1 of a24c6aa: section headers read with the grammar of npm's o
 
     expect(Object.fromEntries(decodeIni(src, "spaced"))).toEqual({});
     expect([...decodeIni(src, "exact").keys()]).toEqual(["[sec]", "j"]);
+  });
+
+  test("apm's registry and token from a user .npmrc follow the same grammar (review of PR #9)", () => {
+    const user = "[custom] \nregistry=https://r.example/\n//r.example/:_authToken=apm_tokentokentokentoken\n";
+
+    const config = (path: string | undefined) => {
+      const p = project({ user });
+
+      return loadConfig(p.root, path === undefined ? { HOME: p.env.HOME } : { HOME: p.env.HOME, PATH: path });
+    };
+
+    // Debian's npm 9.2 reads `[custom] ` as a key, so both lines below it are top-level, as npm itself uses them
+    expect(config(NPM92_DEBIAN)).toMatchObject({ registry: "https://r.example/", token: "apm_tokentokentokentoken" });
+    // npm 11 opens a section there and reads neither
+    expect(config(NPM11)).toMatchObject({ registry: DEFAULT_REGISTRY, token: null });
+    // no npm to ask: the settings are kept
+    expect(config(undefined)).toMatchObject({ registry: "https://r.example/", token: "apm_tokentokentokentoken" });
+  });
+
+  test("a rotated token is the only one either grammar reads, whatever way the old one was written (review of e5d8c47)", () => {
+    const key = "//registry.apmjs.dev/:_authToken";
+    const OLD = "apm_oldoldoldoldoldold01";
+    const NEW = "apm_newnewnewnewnewnew01";
+
+    const cases = [
+      `${key} = ${OLD}\n`,
+      `  "${key}" =${OLD}\n`,
+      `${key}[]=${OLD}\n`,
+      // Debian's npm 9.2 reads `[custom] ` as a key, so a token after it is top-level there and, being later, wins
+      `[custom] \n${key} = ${OLD}\n`,
+      `[custom] \n${key}=${OLD}\n`,
+      `${key}=${OLD}\n[custom] \n${key} =${OLD}\nregistry=https://registry.apmjs.dev/\n`,
+      `a=1\r${key}=${OLD}\r`,
+    ];
+
+    const rotate = (user: string) => {
+      const p = project({ user });
+      const rc = join(p.env.HOME, ".npmrc");
+      const result = saveToken(rc, "https://registry.apmjs.dev/", NEW);
+
+      return { p, result, after: readFileSync(rc, "utf8") };
+    };
+
+    for (const user of cases) {
+      const { p, result, after } = rotate(user);
+
+      expect(result).toEqual({ kind: "saved" });
+
+      for (const sections of ["exact", "spaced"] as const) expect(decodeIni(after, sections).get(key)).toEqual({ kind: "one", item: text(NEW) });
+      expect(after).not.toContain(OLD);
+
+      for (const path of [NPM92_DEBIAN, NPM11]) expect(loadConfig(p.root, { HOME: p.env.HOME, PATH: path }).token).toBe(NEW);
+    }
+
+    // a copy under a header both grammars open is no npm's top-level auth, so it stays as it was (review of 5b75caa)
+    expect(rotate(`${key}=${OLD}\n[real]\n${key}=${OLD}\n`).after).toBe(`${key}=${NEW}\n[real]\n${key}=${OLD}\n`);
+  });
+
+  test("a rotation is refused, and the file left alone, when a top-level key has ${VAR} in it (review of 5b75caa)", () => {
+    const user = (s: string) => `registry=https://registry.apmjs.dev/\n${s}`;
+
+    // npm expands the name before it sets it, so ${HOST}:_authToken can be the very key being rotated
+    // the line reported is the one an editor shows, blank lines and CRLF endings counted (review of 9e3693b)
+    const cases = [
+      [user("${HOST}:_authToken=apm_oldoldoldoldoldold01\n"), 2],
+      [user("[custom] \n${HOST}:_authToken = apm_oldoldoldoldoldold01\n"), 3],
+      [user("\n\n# note\n\n${HOST}:_authToken=apm_oldoldoldoldoldold01\n"), 6],
+      [user("\r\n\r\n${HOST}:_authToken=apm_oldoldoldoldoldold01\r\n").replace("\n", "\r\n"), 4],
+    ] as const;
+
+    for (const [src, line] of cases) {
+      const p = project({ user: src });
+      const rc = join(p.env.HOME, ".npmrc");
+
+      expect(saveToken(rc, "https://registry.apmjs.dev/", "apm_newnewnewnewnewnew01")).toMatchObject({ kind: "refused", line });
+      expect(readFileSync(rc, "utf8")).toBe(src);
+    }
+
+    // under a header both grammars open it is not top-level to any npm, and the rotation goes ahead
+    const p = project({ user: user("[real]\n${HOST}:_authToken=apm_oldoldoldoldoldold01\n") });
+
+    expect(saveToken(join(p.env.HOME, ".npmrc"), "https://registry.apmjs.dev/", "apm_newnewnewnewnewnew01")).toEqual({ kind: "saved" });
+  });
+
+  test("APM_TOKEN is withheld, whatever npm is on PATH, when the grammars read the user registry differently (review of 5b75caa)", () => {
+    const user = "[custom] \nregistry=https://r.example/\n";
+
+    const env = (path: string | undefined, extra: Record<string, string> = {}) => {
+      const p = project({ user });
+
+      const base = { HOME: p.env.HOME, APM_TOKEN: "apm_envenvenvenvenvenv01", ...extra };
+
+      return loadConfig(p.root, path === undefined ? base : { ...base, PATH: path });
+    };
+
+    for (const path of [NPM92_DEBIAN, NPM11, undefined]) {
+      expect(env(path)).toMatchObject({ token: null, withheld: { kind: "ambiguous", exact: "https://r.example/", spaced: DEFAULT_REGISTRY } });
+      // naming the registry settles it
+      expect(env(path, { APM_REGISTRY: "https://r.example/" })).toMatchObject({ registry: "https://r.example/", token: "apm_envenvenvenvenvenv01", withheld: null });
+    }
+  });
+
+  test("the warning that APM_TOKEN was withheld names registries by origin only, never a credential in the URL", async () => {
+    // a refused port: whoami fails at once, after the warning
+    const p = project({ user: "[custom] \nregistry=http://127.0.0.1:9/SECRET_PATH_TOKEN/?key=SECRET_QUERY_KEY\n" });
+
+    const proc = Bun.spawn([process.execPath, join(import.meta.dir, "..", "src", "main.ts"), "whoami"], {
+      cwd: p.root,
+      env: { HOME: p.env.HOME, APM_TOKEN: "apm_envenvenvenvenvenv01", NO_COLOR: "1", PATH: "/usr/bin:/bin" },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+
+    expect(err).toContain("APM_TOKEN is not sent");
+    expect(err).toContain("http://127.0.0.1:9/");
+    expect(out + err).not.toContain("SECRET_");
+  });
+
+  test("the login refusal for a ${VAR} key names the registry by origin only", async () => {
+    const stub = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => Response.json({ token: "apm_newnewnewnewnewnew01" }, { status: 201 }) });
+
+    try {
+      const src = `registry=${stub.url.href}SECRET_PATH_TOKEN/?key=SECRET_QUERY_KEY\n\${HOST}:_authToken=apm_oldoldoldoldoldold01\n`;
+      const p = project({ user: src });
+
+      const proc = Bun.spawn([process.execPath, join(import.meta.dir, "..", "src", "main.ts"), "login", "--username", "me", "--password-stdin"], {
+        cwd: p.root,
+        env: { HOME: p.env.HOME, NO_COLOR: "1", PATH: "/usr/bin:/bin" },
+        stdin: new TextEncoder().encode("a-long-enough-password\n"),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+
+      expect(code, out + err).toBe(1);
+      expect(err).toContain("sets a key with");
+      expect(out + err).not.toContain("SECRET_");
+      expect(readFileSync(join(p.env.HOME, ".npmrc"), "utf8")).toBe(src);
+    } finally {
+      stub.stop(true);
+    }
   });
 });
 

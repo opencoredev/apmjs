@@ -3,11 +3,21 @@ import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { npmIniSections } from "./groups.ts";
+import { decodeIni, readIniLine, type SectionSyntax } from "./ini.ts";
 
 export const DEFAULT_REGISTRY = "https://registry.apmjs.dev/";
 
-/** `withheld` names the registry APM_TOKEN belongs to when apm talks to a different one and so sends no token. */
-export type Config = { registry: string; token: string | null; userconfig: string; withheld: string | null };
+/** The user .npmrc names APM_TOKEN's registry one way to npm 9.2's section grammar (`exact`) and another to npm 11's. */
+export type AmbiguousTokenRegistry = { kind: "ambiguous"; exact: string; spaced: string };
+
+/**
+ * `withheld` says why APM_TOKEN is not sent: the registry it belongs to when apm talks to a different one, or that the
+ * user .npmrc does not name that registry the same way to every npm.
+ */
+export type Withheld = { kind: "other-registry"; registry: string } | AmbiguousTokenRegistry;
+
+export type Config = { registry: string; token: string | null; userconfig: string; withheld: Withheld | null };
 
 function withSlash(u: string): string {
   return u.endsWith("/") ? u : `${u}/`;
@@ -26,9 +36,25 @@ export function parseNpmrc(text: string): Map<string, string> {
   return out;
 }
 
-function readNpmrc(path: string): Map<string, string> {
+/**
+ * How the npm on PATH reads a `[section] ` header with trailing space: a section from ini 4.1 (npm 11), a bare key to
+ * Debian's npm 9.2 (ini 3), so the settings below it stay top-level there. When no npm is found, the exact reading,
+ * which keeps those settings, so a token npm may use is not dropped.
+ */
+function npmrcSections(env: Record<string, string | undefined>): SectionSyntax {
+  return npmIniSections(env) ?? "exact";
+}
+
+/** An .npmrc's top-level text settings as npm reads them (ini.ts): quotes removed, `; comments` dropped, sections skipped. */
+function readNpmrc(path: string, sections: SectionSyntax): Map<string, string> {
   try {
-    return existsSync(path) ? parseNpmrc(readFileSync(path, "utf8")) : new Map();
+    const out = new Map<string, string>();
+
+    if (!existsSync(path)) return out;
+
+    for (const [key, value] of decodeIni(readFileSync(path, "utf8"), sections)) if (value.kind === "one" && value.item.kind === "text") out.set(key, value.item.text);
+
+    return out;
   } catch {
     return new Map();
   }
@@ -70,10 +96,16 @@ export function sameRegistry(a: string, b: string): boolean {
 /**
  * The registry APM_TOKEN is issued for: APM_REGISTRY, else `registry=` in the user .npmrc, else the default.
  * A project .npmrc and npm_config_registry never count: both can come from a cloned repo
- * (`npm run` exports project config as npm_config_* variables).
+ * (`npm run` exports project config as npm_config_* variables). The binding never depends on which npm is on PATH: when
+ * the two section grammars read the user .npmrc's registry differently, it is ambiguous and the token is withheld.
  */
-export function tokenRegistry(env: Record<string, string | undefined>): string {
-  return withSlash(env.APM_REGISTRY ?? readNpmrc(userconfigPath(env)).get("registry") ?? DEFAULT_REGISTRY);
+export function tokenRegistry(env: Record<string, string | undefined>): { kind: "bound"; registry: string } | AmbiguousTokenRegistry {
+  if (env.APM_REGISTRY !== undefined) return { kind: "bound", registry: withSlash(env.APM_REGISTRY) };
+  const read = (sections: SectionSyntax): string => withSlash(readNpmrc(userconfigPath(env), sections).get("registry") ?? DEFAULT_REGISTRY);
+  const exact = read("exact");
+  const spaced = read("spaced");
+
+  return exact === spaced || sameRegistry(exact, spaced) ? { kind: "bound", registry: exact } : { kind: "ambiguous", exact, spaced };
 }
 
 export function loadConfig(cwd: string, env: Record<string, string | undefined>): Config {
@@ -81,16 +113,17 @@ export function loadConfig(cwd: string, env: Record<string, string | undefined>)
   const userDirs = new Set<string>([homedir(), dirname(userconfig)]);
 
   if (env.HOME) userDirs.add(env.HOME);
-  const files = [...projectNpmrcs(cwd, userDirs), userconfig].map(readNpmrc);
+  const sections = npmrcSections(env);
+  const files = [...projectNpmrcs(cwd, userDirs), userconfig].map((f) => readNpmrc(f, sections));
   const registry = withSlash(env.APM_REGISTRY ?? env.npm_config_registry ?? env.NPM_CONFIG_REGISTRY ?? files.find((f) => f.has("registry"))?.get("registry") ?? DEFAULT_REGISTRY);
   const envToken = env.APM_TOKEN || null;
 
   if (envToken) {
     const bound = tokenRegistry(env);
 
-    if (sameRegistry(bound, registry)) return { registry, token: envToken, userconfig, withheld: null };
+    if (bound.kind === "bound" && sameRegistry(bound.registry, registry)) return { registry, token: envToken, userconfig, withheld: null };
 
-    return { registry, token: fileToken(files, registry, env), userconfig, withheld: bound };
+    return { registry, token: fileToken(files, registry, env), userconfig, withheld: bound.kind === "bound" ? { kind: "other-registry", registry: bound.registry } : bound };
   }
 
   return { registry, token: fileToken(files, registry, env), userconfig, withheld: null };
@@ -129,19 +162,46 @@ export function isApmToken(token: string): boolean {
   return /^apm_[A-Za-z0-9_-]{16,256}$/.test(token);
 }
 
+/** A rotation either saved the token or left the file alone, naming the 1-based line it could not rule out. */
+export type SaveTokenResult = { kind: "saved" } | { kind: "refused"; path: string; line: number };
+
 /**
  * Writes (or replaces) the auth line for `registry` in the user .npmrc, which npm, pnpm and bun all read.
  * The file holds a token, so it ends up 0600 whatever its mode was, and it is replaced atomically: a temp
  * file in the same directory, made private before the token is written, then renamed over the original.
  */
-export function saveToken(userconfig: string, registry: string, token: string): void {
+export function saveToken(userconfig: string, registry: string, token: string): SaveTokenResult {
   const key = `${authKey(registry)}:_authToken`;
   // a symlinked .npmrc (dotfiles repos) keeps its link: write next to the real file
   const target = existsSync(userconfig) ? realpathSync(userconfig) : userconfig;
-  const lines = existsSync(target) ? readFileSync(target, "utf8").split(/\r?\n/) : [];
-  const kept = lines.filter((l) => !l.trim().startsWith(`${key}=`) && l.trim() !== "");
-  kept.push(`${key}=${token}`);
+  // split as an editor numbers lines, so a refusal names the line to edit; the blank lines ini merges are skipped below
+  const lines = existsSync(target) ? readFileSync(target, "utf8").split(/\r\n|\r|\n/) : [];
+  // Every line that sets this key at the top level goes, read the way ini reads it (`key = x`, `"key"=x`, `key[]=x`).
+  // Which npm reads the file later is not known here, so the top level runs to the first header both grammars open,
+  // an exact one: under Debian's npm 9.2 (ini 3) a `[section] ` line is a key, and an old token after it would win over
+  // the new one or turn it into a list (review of e5d8c47). Copies under an exact header are no npm's auth and stay.
+  // npm expands `${VAR}` in a key before it sets it, so a top-level key with one in it may be this token too: that
+  // is not guessed at, and the file is left for the user to edit (review of 5b75caa).
+  const kept: string[] = [];
+  let topLevel = true;
+
+  for (const [i, l] of lines.entries()) {
+    const line = readIniLine(l, "exact");
+
+    if (line.kind === "section") topLevel = false;
+
+    if (topLevel && line.kind === "setting" && line.key.includes("${")) return { kind: "refused", path: target, line: i + 1 };
+
+    if (l.trim() === "" || (topLevel && line.kind === "setting" && line.key === key)) continue;
+    kept.push(l);
+  }
+
+  // the token goes above the first line either grammar reads as a header, where both read it as top-level
+  const section = kept.findIndex((l) => readIniLine(l, "spaced").kind === "section");
+
+  kept.splice(section < 0 ? kept.length : section, 0, `${key}=${token}`);
   const tmp = join(dirname(target), `.npmrc.${randomBytes(6).toString("hex")}.tmp`);
+
   try {
     writeFileSync(tmp, "", { mode: 0o600, flag: "wx" });
     chmodSync(tmp, 0o600);
@@ -151,5 +211,8 @@ export function saveToken(userconfig: string, registry: string, token: string): 
     rmSync(tmp, { force: true });
     throw e;
   }
+
   chmodSync(target, 0o600);
+
+  return { kind: "saved" };
 }
