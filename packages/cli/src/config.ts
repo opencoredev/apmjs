@@ -99,7 +99,9 @@ export function loadConfig(cwd: string, env: Record<string, string | undefined>)
   const bound = tokenRegistry(env);
   // a registry a repo chose gets `${VAR}` filled in only from ~/.npmrc: a repo's own .npmrc would otherwise name any secret
   const expandFrom = sameRegistry(bound, registry) ? null : join(env.HOME ?? homedir(), ".npmrc");
-  const file = fileToken(files, registry, env, expandFrom);
+  const found = fileToken(files, registry, env, expandFrom);
+  // token keys carry no protocol: a repo's plain-http twin of the user's https registry would get its token in cleartext
+  const file = expandFrom !== null && plainHttpRemote(registry) ? { ...found, token: null } : found;
 
   if (envToken) {
     if (sameRegistry(bound, registry)) return { registry, token: envToken, userconfig, withheld: null, unexpanded: null };
@@ -109,6 +111,17 @@ export function loadConfig(cwd: string, env: Record<string, string | undefined>)
   }
 
   return { registry, token: file.token, userconfig, withheld: null, unexpanded: file.unexpanded };
+}
+
+/** Plain http to anything but this machine (a local test registry may use http). */
+function plainHttpRemote(registry: string): boolean {
+  try {
+    const u = new URL(registry);
+
+    return u.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(u.hostname);
+  } catch {
+    return false;
+  }
 }
 
 /**

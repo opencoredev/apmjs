@@ -55,6 +55,21 @@ describe("loadConfig binds APM_TOKEN to its registry", () => {
 
     expect(cfg.token).toBeNull();
   });
+
+  test("a repo that picks the plain-http twin of a registry does not get the user's token for it (review of #36)", () => {
+    const home = dir();
+    const project = dir();
+
+    writeFileSync(join(home, ".npmrc"), "//registry.apmjs.dev/:_authToken=apm_secretsecretsecret\n");
+    writeFileSync(join(project, ".npmrc"), "registry=http://registry.apmjs.dev/\n");
+    expect(loadConfig(project, { HOME: home }).token).toBeNull();
+    expect(loadConfig(project, { HOME: home, npm_config_registry: "http://registry.apmjs.dev/" }).token).toBeNull();
+    // the https registry, and plain http on this machine (a local test registry), still get it
+    expect(loadConfig(dir(), { HOME: home }).token).toBe("apm_secretsecretsecret");
+    writeFileSync(join(home, ".npmrc"), "//127.0.0.1:4873/:_authToken=apm_secretsecretsecret\n");
+    writeFileSync(join(project, ".npmrc"), "registry=http://127.0.0.1:4873/\n");
+    expect(loadConfig(project, { HOME: home }).token).toBe("apm_secretsecretsecret");
+  });
 });
 
 describe("isApmToken", () => {
