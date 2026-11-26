@@ -34,6 +34,7 @@ describe("routeLabel", () => {
       ["POST", "/-/apm/v1/login/device", "POST login device"],
       ["POST", "/-/apm/v1/login/device/token", "POST login device token"],
       ["POST", "/-/apm/v1/account/tokens/revoke", "POST tokens revoke"],
+      ["POST", "/-/apm/v1/account/passkeys/remove", "POST passkey remove"],
       ["POST", "/-/apm/v1/factor/passkey-challenge", "POST factor passkey-challenge"],
       ["POST", "/-/apm/v1/factor/confirm", "POST factor confirm"],
       ["POST", "/-/apm/v1/verify", "POST verify"],

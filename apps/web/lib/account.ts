@@ -29,6 +29,18 @@ export const AuthConfig = z.object({
 
 export type AuthConfig = z.infer<typeof AuthConfig>;
 
+/** One of the account's passkeys: `provider` is the password manager or platform it lives in, when its AAGUID says. */
+export const PasskeyItem = z.object({
+  id: z.string(),
+  name: z.string().nullable(),
+  provider: z.string().nullable(),
+  createdAt: z.string().nullable(),
+  /** Null until the passkey signs in or confirms something: the registry began recording uses when this list shipped. */
+  lastUsedAt: z.string().nullable(),
+});
+
+export type PasskeyItem = z.infer<typeof PasskeyItem>;
+
 export const Account = z.object({
   scope: z.string().nullable(),
   scopeTaken: z.string().nullable().default(null),
@@ -40,6 +52,8 @@ export const Account = z.object({
   image: z.string().nullable(),
   linked: z.array(z.object({ provider: z.string(), accountId: z.string() })),
   security: z.object({ totp: z.boolean(), passkeys: z.number() }),
+  /** The passkeys `security.passkeys` counts; an older registry sends none. */
+  passkeys: z.array(PasskeyItem).default([]),
   canPublish: z.boolean(),
   tokens: z.array(
     z.object({ id: z.string(), label: z.string(), scope: z.string(), createdAt: z.string(), expiresAt: z.string().nullable(), revokedAt: z.string().nullable() }),
@@ -199,8 +213,56 @@ export type SessionAction =
   | { kind: "review-decision"; name: string; version: string; digest: string; decision: "confirm" | "dismiss"; note: string }
   | ({ kind: "evidence-dismiss" | "evidence-restore"; reason: string } & EvidenceKey)
   | { kind: "account"; change: "link-social" | "two-factor/enable" | "two-factor/disable" | "passkey/verify-registration" }
+  | { kind: "passkey-remove"; id: string }
   | { kind: "review-unlock" }
   | { kind: "review-switch"; hold: boolean };
+
+/** The name a passkey had by default before it was named for its browser and system ("apm 11/15/2026"). */
+const DATED_NAME = /^apm \d{1,4}[/.-]\d{1,2}[/.-]\d{1,4}$/;
+
+/** What a passkey is called in the list: its password manager or platform, else the name it was added with. */
+export function passkeyTitle(p: PasskeyItem): string {
+  return p.provider ?? p.name ?? "Passkey";
+}
+
+/** The name it was added with, when it says more than the title and the date already do. */
+export function passkeySubtitle(p: PasskeyItem): string | null {
+  if (p.name === null || p.name === passkeyTitle(p) || DATED_NAME.test(p.name)) return null;
+
+  return p.name;
+}
+
+/** Whether removing one passkey leaves a way in: GitHub or Vercel is linked, or another passkey stays. */
+export function canRemovePasskey(a: Account): boolean {
+  return a.linked.length > 0 || a.passkeys.length > 1;
+}
+
+const BROWSERS: readonly (readonly [RegExp, string])[] = [
+  [/Edg(A|iOS)?\//, "Edge"],
+  [/(Firefox|FxiOS)\//, "Firefox"],
+  [/(Chrome|CriOS)\//, "Chrome"],
+  [/Safari\//, "Safari"],
+];
+
+// iOS and Android first: their user agents also say "Mac OS X" and "Linux"
+const SYSTEMS: readonly (readonly [RegExp, string])[] = [
+  [/iPhone|iPad|iPod/, "iOS"],
+  [/Android/, "Android"],
+  [/Windows/, "Windows"],
+  [/Macintosh|Mac OS X/, "macOS"],
+  [/CrOS/, "ChromeOS"],
+  [/Linux/, "Linux"],
+];
+
+/** A new passkey's name, from the browser and system adding it ("Chrome on macOS"), so two passkeys can be told apart. */
+export function deviceName(userAgent: string): string {
+  const browser = BROWSERS.find(([re]) => re.test(userAgent))?.[1];
+  const system = SYSTEMS.find(([re]) => re.test(userAgent))?.[1];
+
+  if (browser && system) return `${browser} on ${system}`;
+
+  return browser ?? system ?? "Passkey";
+}
 
 /** The WebAuthn request options the registry makes (PublicKeyCredentialRequestOptionsJSON), as the browser library takes them. */
 const RequestOptions = z.object({

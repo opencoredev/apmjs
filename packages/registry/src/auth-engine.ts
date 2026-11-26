@@ -17,6 +17,8 @@ export { hashPassword, symmetricDecrypt, symmetricEncrypt, verifyPassword } from
 
 export { generateAuthenticationOptions, verifyAuthenticationResponse } from "@simplewebauthn/server";
 
+export { getAuthenticatorName } from "@better-auth/passkey";
+
 export { Pool };
 
 const GITHUB: GitHubEndpoints = {
@@ -28,6 +30,9 @@ const GITHUB: GitHubEndpoints = {
 
 const GitHubUser = z.object({ id: z.number(), login: z.string(), name: z.string().nullish(), email: z.string().nullish(), avatar_url: z.string().nullish() });
 const GitHubEmails = z.array(z.object({ email: z.string(), primary: z.boolean(), verified: z.boolean() }));
+
+/** The part of a passkey sign-in's body that names the passkey that answered. */
+const PasskeySignIn = z.object({ response: z.object({ id: z.string().min(1).max(1024) }) });
 
 export function buildBetterAuth(input: {
   pool: Pool;
@@ -72,6 +77,15 @@ export function buildBetterAuth(input: {
       session: {
         create: {
           after: async (session, ctx) => {
+            try {
+              // the account page's "last used" for the passkey that signed in; never able to fail the sign-in
+              const signIn = signInMethod(ctx) === "passkey" ? PasskeySignIn.safeParse(ctx?.body) : null;
+
+              if (signIn?.success) await record(store.notePasskeyUse({ authUserId: session.userId, credentialID: signIn.data.response.id, at: now() }));
+            } catch {
+              // a lost "last used" never reaches the person signing in
+            }
+
             try {
               const method = signInMethod(ctx);
 

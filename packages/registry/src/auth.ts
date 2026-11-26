@@ -12,7 +12,7 @@ import type { BetterAuthInstance } from "./auth-engine.ts";
 import type { AccountEvents } from "./account-events.ts";
 import { z } from "zod";
 import { Clock } from "./clock.ts";
-import { Store, type Linked, type User } from "./db.ts";
+import { Store, type Linked, type PasskeySummary, type User } from "./db.ts";
 import { AuthError, type StoreError } from "./errors.ts";
 import { CONNECT_TIMEOUT, STATEMENT_TIMEOUT_MS } from "./db-health.ts";
 import { isAccountChange, sessionActionKey } from "./actions.ts";
@@ -68,6 +68,9 @@ export type Confirmed = { kind: "ok"; id: ConfirmationId; expiresAt: number } | 
 
 export type SignedIn = { authUserId: string; sessionToken: string; signedInAt: number };
 
+/** One of the account's passkeys as the account page shows it: `provider` is the password manager or platform its AAGUID names. */
+export type PasskeyView = PasskeySummary & { provider: string | null };
+
 export type DevicePoll = { kind: "pending" } | { kind: "slow_down" } | { kind: "denied" } | { kind: "expired" } | { kind: "approved"; authUserId: string };
 
 export type DeviceStart = { deviceCode: string; userCode: string; expiresIn: number; interval: number };
@@ -85,6 +88,8 @@ export type AuthApi = {
   readonly profileOf: (authUserId: string) => Fx<{ name: string; email: string; image: string | null } | null>;
   readonly linked: (authUserId: string) => Fx<Linked[]>;
   readonly factors: (authUserId: string) => Fx<{ totp: boolean; passkeys: number }>;
+  /** The account's passkeys, oldest first, named by their authenticator where its AAGUID is a known one. */
+  readonly passkeys: (authUserId: string) => Fx<PasskeyView[]>;
   /** Checks a code. Every TOTP and recovery-code check takes from one budget; a TOTP step is accepted once. */
   readonly checkCode: (input: { authUserId: string; proof: CodeProof }) => Fx<CodeCheck>;
   /** A WebAuthn challenge for one action (its canonical key) from this session, with the account's passkeys allowed. */
@@ -411,6 +416,7 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
 
             if (verified.kind === "refused") return { kind: "bad" } satisfies ProofCheck;
             yield* store.setPasskeyCounter({ id: key.id, counter: verified.counter });
+            yield* store.notePasskeyUse({ authUserId: session.authUserId, credentialID: key.credentialID, at: yield* clock.now });
 
             return { kind: "ok" } satisfies ProofCheck;
           });
@@ -532,6 +538,12 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
           profileOf: (authUserId) => store.authProfile(authUserId),
           linked: (authUserId) => store.accountsOf(authUserId),
           factors: (authUserId) => store.authFactors(authUserId),
+          passkeys: (authUserId) =>
+            Effect.gen(function* () {
+              const engine = yield* loadAuthEngine;
+
+              return (yield* store.passkeyList(authUserId)).map((p) => ({ ...p, provider: engine.getAuthenticatorName(p.aaguid ?? undefined) ?? null }));
+            }),
           checkCode,
           passkeyChallenge,
           confirm,

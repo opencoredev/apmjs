@@ -144,6 +144,8 @@ export const SessionAction = z.discriminatedUnion("kind", [
   EvidenceKey.extend({ kind: z.literal("evidence-dismiss"), reason: DismissReason }),
   EvidenceKey.extend({ kind: z.literal("evidence-restore"), reason: RestoreReason }),
   z.object({ kind: z.literal("account"), change: z.enum(ACCOUNT_CHANGES) }),
+  /** Removing one of the account's passkeys, by its id: a check made to remove one passkey never removes another. */
+  z.object({ kind: z.literal("passkey-remove"), id: z.string().min(1).max(64) }),
   /** Opening the review queue's decision window: one factor, then confirm and dismiss for a few minutes (review.ts). */
   z.object({ kind: z.literal("review-unlock") }),
   /** Turning "AI flags hold installs" on or off. Never covered by the decision window. */
@@ -166,6 +168,8 @@ export function sessionActionKey(a: SessionAction): string {
       return JSON.stringify([a.kind, a.name, a.version, a.digest, a.scorer, a.signal, a.file, a.line, a.reason]);
     case "account":
       return JSON.stringify([a.kind, a.change]);
+    case "passkey-remove":
+      return JSON.stringify([a.kind, a.id]);
     case "review-unlock":
       return JSON.stringify([a.kind]);
     case "review-switch":

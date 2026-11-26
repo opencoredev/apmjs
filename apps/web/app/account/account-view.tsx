@@ -13,14 +13,19 @@ import {
   authClient,
   authPost,
   call,
+  canRemovePasskey,
   commandFromLink,
+  deviceName,
   commandText,
   linkProvider,
   passkeyConfirmation,
+  passkeySubtitle,
+  passkeyTitle,
   PROVIDER_LABEL,
   proofHeaders,
   type FactorProof,
   type LiveAction,
+  type PasskeyItem,
   type SessionAction,
 } from "@/lib/account";
 import { cn } from "@/lib/utils";
@@ -360,7 +365,7 @@ function AddPasskey({ account, config, onDone }: { account: Account; config: Aut
   const [asking, setAsking] = useState(false);
 
   async function add(proof: FactorProof | null): Promise<string | null> {
-    const r = await authClient().passkey.addPasskey({ name: `apm ${new Date().toLocaleDateString()}`, fetchOptions: { headers: proofHeaders(proof) } });
+    const r = await authClient().passkey.addPasskey({ name: deviceName(navigator.userAgent), fetchOptions: { headers: proofHeaders(proof) } });
 
     if (r?.error) return r.error.message ?? "The passkey was not added.";
     setAsking(false);
@@ -391,6 +396,102 @@ function AddPasskey({ account, config, onDone }: { account: Account; config: Aut
     <div className="flex flex-col gap-2">
       <p className="text-sm text-muted-foreground">Confirm it&apos;s you before adding another passkey.</p>
       <FactorPrompt account={account} config={config} action="Add passkey" confirms={{ kind: "account", change: "passkey/verify-registration" }} busyLabel="Adding…" run={(p) => add(p)} />
+    </div>
+  );
+}
+
+function day(iso: string): string {
+  return new Date(iso).toLocaleDateString(undefined, { dateStyle: "medium" });
+}
+
+/** Confirms removing one passkey with a fresh factor made for exactly that removal; the passkey itself can answer. */
+function RemovePasskey({ account, config, passkey, onCancel, onDone }: { account: Account; config: AuthConfig; passkey: PasskeyItem; onCancel: () => void; onDone: (note: string) => void }) {
+  const last = account.passkeys.length === 1;
+
+  return (
+    <div className="flex flex-col gap-3 rounded-xl bg-surface p-4">
+      <p className="text-sm leading-6 text-muted-foreground">
+        Remove <span className="font-medium text-foreground">{passkeyTitle(passkey)}</span>
+        {passkey.createdAt && ` (added ${day(passkey.createdAt)})`}? You can&apos;t sign in or confirm changes with it after this.{" "}
+        {last && !account.security.totp && "With no passkey and no 2FA, you can't approve publishes until you add one again."}
+      </p>
+      <FactorPrompt
+        account={account}
+        config={config}
+        action="Remove"
+        confirms={{ kind: "passkey-remove", id: passkey.id }}
+        busyLabel="Removing…"
+        run={async (proof) => {
+          if (proof.kind === "recovery") return "Use a code from your app or your passkey for this.";
+
+          const r = await call("account/passkeys/remove", z.object({ ok: z.boolean() }), {
+            method: "POST",
+            body: { id: passkey.id, ...(proof.kind === "totp" ? { code: proof.code } : { confirmation: proof.id }) },
+          });
+
+          if (r.kind === "signed-out") return "Sign in again.";
+
+          if (r.kind === "error") return r.message;
+          onDone(`Passkey removed. Delete it from ${passkey.provider ?? "your password manager or device"} too, or it will keep offering it here.`);
+
+          return null;
+        }}
+      />
+      <Button variant="ghost" className="-ml-2.5 self-start text-muted-foreground" onClick={onCancel}>
+        Keep it
+      </Button>
+    </div>
+  );
+}
+
+/** Every passkey the count includes, with when it was added and last used, and a Remove that never takes the last way in. Exported for the rendering test. */
+export function PasskeyList({ account, config, onDone }: { account: Account; config: AuthConfig; onDone: (note: string) => void }) {
+  const [removing, setRemoving] = useState<string | null>(null);
+
+  if (account.passkeys.length === 0) return null;
+  const removable = canRemovePasskey(account);
+
+  return (
+    <div className="flex flex-col gap-2">
+      <ul className="flex flex-col divide-y rounded-xl border">
+        {account.passkeys.map((p) => {
+          const subtitle = passkeySubtitle(p);
+
+          return (
+            <li key={p.id} className="flex flex-col gap-3 px-4 py-3">
+              <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+                <div className="flex min-w-0 flex-col gap-0.5">
+                  <span className="text-[15px] font-medium">
+                    {passkeyTitle(p)}
+                    {subtitle && <span className="font-normal text-muted-foreground"> · {subtitle}</span>}
+                  </span>
+                  <span className="text-sm text-muted-foreground">
+                    {p.createdAt ? `Added ${day(p.createdAt)}` : "Added before dates were kept"} · {p.lastUsedAt ? `Last used ${day(p.lastUsedAt)}` : "No use recorded yet"}
+                  </span>
+                </div>
+                {removing !== p.id && (
+                  <Button variant="outline" disabled={!removable || removing !== null} onClick={() => setRemoving(p.id)}>
+                    Remove
+                  </Button>
+                )}
+              </div>
+              {removing === p.id && (
+                <RemovePasskey
+                  account={account}
+                  config={config}
+                  passkey={p}
+                  onCancel={() => setRemoving(null)}
+                  onDone={(note) => {
+                    setRemoving(null);
+                    onDone(note);
+                  }}
+                />
+              )}
+            </li>
+          );
+        })}
+      </ul>
+      {!removable && <p className="text-sm text-muted-foreground">This passkey is your only way to sign in. Link GitHub or add another passkey before you remove it.</p>}
     </div>
   );
 }
@@ -610,6 +711,14 @@ export function AccountView() {
               <span className="text-[15px] font-medium">Passkeys</span>
               <Status on={a.security.passkeys > 0}>{a.security.passkeys === 0 ? "None" : `${a.security.passkeys} set up`}</Status>
             </div>
+            <PasskeyList
+              account={a}
+              config={config}
+              onDone={(m) => {
+                setNote(m);
+                void load();
+              }}
+            />
             <AddPasskey
               account={a}
               config={config}
