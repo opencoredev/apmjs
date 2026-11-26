@@ -297,4 +297,36 @@ describe("structured answers agree with the text", () => {
     expect(r.structured.available).toBe(false);
     expect(r.structured.reason).toBe("left-pad is taken by `stevemao`.");
   });
+
+  test("check_name: a free bare name follows the registry's name policy", async () => {
+    const names = { query: "open-lib", valid: true, taken: false, source: null, unknown: false, available: true, owners: [], latest: null, description: null, conflicts: [], lookalikes: [], similar: [], scope: null, suggestions: [] };
+    const open = await call("check_name", { name: "open-lib" }, { names, namePolicy: "open" });
+    const unread = await call("check_name", { name: "open-lib" }, { names, namePolicy: null });
+
+    expect(open.text.split("\n")[0]).toBe("open-lib is available.");
+    expect(open.structured.available).toBe(true);
+    expect(open.structured.reason).toBeNull();
+    expect(open.structured.publishable).toEqual({ kind: "open" });
+    expect(unread.structured.available).toBe(false);
+    expect(unread.structured.reason).toBe(unread.text.split("\n")[0]);
+    expect(unread.structured.reason).toContain("could not read this registry's rules for new names");
+  });
+
+  test("check_name: every name it cannot offer says why, in the text's first line", async () => {
+    const base = { valid: true, taken: false, source: null, unknown: false, available: false, owners: [], latest: null, description: null, conflicts: [], lookalikes: [], similar: [], scope: null, suggestions: [] };
+
+    const cases = [
+      { query: "registry-refuses", ...base, valid: false },
+      { query: "npm-down", ...base, unknown: true },
+      { query: "expresss", ...base, conflicts: [{ name: "express", reason: "too close to express" }] },
+    ];
+
+    for (const names of cases) {
+      const r = await call("check_name", { name: names.query }, { names, namePolicy: "open" });
+
+      expect(r.structured.available).toBe(false);
+      expect(r.structured.reason).toBe(r.text.split("\n")[0]);
+      expect(r.structured.publishable).toEqual({ kind: "not-free" });
+    }
+  });
 });

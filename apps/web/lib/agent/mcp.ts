@@ -8,7 +8,7 @@ import { looksLikeExistingPackageName, looksLikePackageName } from "../search-sc
 import { scorerCapabilities, type ScorerCapabilities } from "../capabilities";
 import { installCommand, INSTALL_CLIENTS, type InstallClient } from "../install-note";
 import { notCheckedList } from "../limitations";
-import { publishability, publishabilityText } from "../publish-name";
+import { mayPublish, publishability, publishabilityText } from "../publish-name";
 import { noInstallableReason, type Refusal } from "../refusal";
 import { capabilitiesOf } from "./capabilities";
 import { packageMarkdown, refusalOf, unscorableOf, type PackageView } from "./package-md";
@@ -219,10 +219,10 @@ const checkName: Tool<typeof CheckNameInput> = {
     // the caller's scope is a claim nobody checked: it picks where alternatives are looked up and which scope a bare name
     // is suggested under, but never makes a scoped name "yours"
     const claimed = name.startsWith("@") ? null : bare;
-    const r = await source.names({ name, scope: bare });
+    const [r, policy] = await Promise.all([source.names({ name, scope: bare }), source.namePolicy()]);
 
     if (!r) return unavailable(`the name check for ${name}`);
-    const publishable = publishability({ name, available: r.available && r.valid && !r.taken && !r.unknown, scope: claimed });
+    const publishable = publishability({ name, available: r.available && r.valid && !r.taken && !r.unknown, scope: claimed, policy });
 
     const verdict = !r.valid
       ? `${name} is not a valid package name.`
@@ -245,8 +245,8 @@ const checkName: Tool<typeof CheckNameInput> = {
     else if (!bare) lines.push("Pass scope (your GitHub login) to check names under your own scope; a name under your own scope is always yours.");
 
     // `available` is the text's answer, as in apm name --json: true only when the caller may publish the name here, which
-    // a bare name never is under apm's scoped rule and an unverified caller never confirms for a scoped one
-    const available = publishable.kind === "yours";
+    // a bare name is only under an open name policy and an unverified caller never confirms for a scoped one
+    const available = mayPublish(publishable);
 
     return text(lines.join("\n"), { ...r, available, reason: available ? null : verdict, publishable });
   },

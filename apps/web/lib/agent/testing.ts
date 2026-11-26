@@ -1,5 +1,6 @@
 // A stand-in registry for the agent views' unit tests: real answer shapes, held in memory.
 import type { ExcerptAnswer } from "../file-excerpt";
+import type { NamePolicy } from "../publish-name";
 import type { Fetched, PackageInfo, Signal } from "../registry";
 import type { ReviewAnswer } from "../review-schema";
 import type { SearchAnswer } from "../search-schema";
@@ -74,6 +75,8 @@ export type Fake = Partial<{
   resolve: (name: string, range: string) => ResolveOutcome;
   search: SearchAnswer | null;
   names: NameReport | null;
+  /** The registry's name policy; "scoped" when not given. */
+  namePolicy: NamePolicy | null;
   excerpt: Fetched<ExcerptAnswer>;
   down: boolean;
 }>;
@@ -139,6 +142,9 @@ export function fakeSource(f: Fake = {}): AgentSource & { calls: string[] } {
       calls.push(`names ${name} ${scope ?? "-"}`);
 
       return f.names ?? null;
+    },
+    async namePolicy() {
+      return f.namePolicy === undefined ? "scoped" : f.namePolicy;
     },
     async excerpt(input) {
       calls.push(`excerpt ${input.name}@${input.version} ${input.path}:${input.line}±${input.context}`);

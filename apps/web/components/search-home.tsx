@@ -149,7 +149,7 @@ function viewerOf(state: PartState<"alternatives">): Viewer {
 
 /** What a free name means for this visitor: `viewer` is their GitHub login once the alternatives part says it. */
 function publishableFor(q: string, viewer: PartState<"alternatives">): Publishability {
-  return publishability({ name: q, available: true, scope: viewer.kind === "ok" ? viewer.data.scope : null });
+  return publishability({ name: q, available: true, scope: viewer.kind === "ok" ? viewer.data.scope : null, policy: "scoped" });
 }
 
 function ExactStatus({ q, state, viewer }: { q: string; state: PartState<"exact">; viewer: PartState<"alternatives"> }) {

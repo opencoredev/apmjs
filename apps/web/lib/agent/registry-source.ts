@@ -3,10 +3,12 @@ import "server-only";
 import { z } from "zod";
 import { ExcerptAnswer } from "../file-excerpt";
 import { getExcerpt, getPackage, getRecent, getReview, getVersionInfo, getVersionScore, search, type Fetched } from "../registry";
-import { fetchJson, logUnavailable, readCappedText, REGISTRY_TIMEOUT_MS, withTimeout } from "../registry-fetch";
+import { POLICIES } from "../edge-cache";
+import { fetchCachedJson, fetchJson, logUnavailable, readCappedText, REGISTRY_TIMEOUT_MS, withTimeout } from "../registry-fetch";
 import { registryFetch } from "../registry-transport";
 import { REGISTRY } from "../registry-url";
 import { AlternativesPart, ExactPart, LookalikePart } from "../search-schema";
+import type { NamePolicy } from "../publish-name";
 import { parseJson } from "./json";
 import { EXPLAIN_RESOLVE_WAIT_MS, RESOLVE_TIMEOUT_MS } from "./resolve-budget";
 import { parseResolve, type AgentSource, type NameReport, type ResolveOutcome } from "./source";
@@ -49,6 +51,16 @@ async function names(input: { name: string; scope: string | null }): Promise<Nam
   return r.kind === "ok" ? r.value : null;
 }
 
+const AuthConfig = z.object({ namePolicy: z.enum(["scoped", "open"]) }).loose();
+
+async function namePolicy(): Promise<NamePolicy | null> {
+  const r = await fetchCachedJson({ url: `${REGISTRY}-/apm/v1/auth/config`, schema: AuthConfig, timeoutMs: REGISTRY_TIMEOUT_MS, cache: POLICIES.authConfig });
+
+  if (r.kind === "unavailable") logUnavailable("-/apm/v1/auth/config", r.reason);
+
+  return r.kind === "ok" ? r.value.namePolicy : null;
+}
+
 /** The agent views read version state, the AI review and file excerpts without the edge cache: see AgentSource. */
 export const registrySource: AgentSource = {
   package: getPackage,
@@ -60,6 +72,7 @@ export const registrySource: AgentSource = {
   // description); only one made entirely of npm's packages is served from the cache (lib/registry.ts)
   search: ({ query }) => search(query),
   names,
+  namePolicy,
   // lines of source: read from the registry every time, which alone decides whether a version's source may be shown
   excerpt: (input): Promise<Fetched<ExcerptAnswer>> => getExcerpt(input),
 };
