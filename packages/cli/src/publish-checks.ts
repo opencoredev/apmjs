@@ -2,6 +2,7 @@
 // refuse a publish by. manifestChecks needs only package.json (a valid lowercase name, strict semver, not "private");
 // registryChecks needs what apm read from the registry (a version not published yet, owners, the rule for new names, a
 // name npm has, a reserved or look-alike name). Pure: main.ts reads the registry and prints the result.
+import { z } from "zod";
 import { isScoped, isValidPublishName, isValidVersion, newNameRuleRefusal, POPULAR_NAMES, typoConflicts, type NamePolicy } from "@apm/core";
 
 /** The name rule apm prints for an invalid name (apm name and apm publish --dry-run). */
@@ -14,7 +15,7 @@ export const VALID_NAME_RULE = "a name is lowercase letters, digits and - . _ (a
 export type Existing =
   | { kind: "missing" }
   | { kind: "npm" }
-  | { kind: "local"; owners: readonly string[]; versions: readonly string[] }
+  | { kind: "local"; owners: readonly string[]; versions: readonly string[]; complete: boolean }
   | { kind: "unknown" };
 
 /**
@@ -26,28 +27,55 @@ export type RegistryView = { user: string | null; policy: NamePolicy | null; exi
 /** One finding: the registry or the package manager would refuse the publish, or apm cannot say whether it would. */
 export type PublishCheck = { kind: "refused"; reason: string } | { kind: "unconfirmed"; reason: string };
 
-/** The fields of package.json a publish is refused by. `dropsBuild`: the package manager sends the version without its build metadata (npm). */
-export type PublishTarget = { name: string; version: string; private: boolean; dropsBuild: boolean };
+/**
+ * What the upload does with a version's build metadata (`+ci.7`): "dropped" when npm uploads it (npm sends the version
+ * through semver.clean, the tarball keeps it, and the registry refuses the mismatch); "unknown" for other clients.
+ */
+export type BuildMetadata = "dropped" | "unknown";
+
+/** The fields of a package.json a publish is refused by, as read: anything may be missing or of the wrong type. */
+export type PublishFields = { name: unknown; version: unknown; private: unknown; build: BuildMetadata };
+
+/** manifestChecks' answer: the name and version a publish would carry, or every refusal and warning package.json alone gives. */
+export type ManifestVerdict = { kind: "ok"; name: string; version: string; checks: PublishCheck[] } | { kind: "refused"; checks: PublishCheck[] };
 
 /** The version semver compares: build metadata is ignored, so 1.0.0+a and 1.0.0 are one version to a registry. */
 export const withoutBuild = (version: string): string => version.split("+")[0] ?? version;
 
-/** What package.json alone says would be refused: no registry answer needed. */
-export function manifestChecks(target: PublishTarget): PublishCheck[] {
-  const { name, version } = target;
-  const out: PublishCheck[] = [];
+function nameRefusal(name: string): string | null {
+  if (isValidPublishName(name)) return null;
+  const lower = name.toLowerCase();
 
-  if (target.private) out.push({ kind: "refused", reason: `package.json has "private": true, so package managers refuse to publish it. Remove "private" to publish.` });
+  return isValidPublishName(lower) ? `${name} is not a valid name for a new package: npm names are lowercase. Use ${lower}.` : `${name} is not a valid package name: ${VALID_NAME_RULE}.`;
+}
 
-  if (!isValidPublishName(name)) {
-    const lower = name.toLowerCase();
-    out.push({ kind: "refused", reason: isValidPublishName(lower) ? `${name} is not a valid name for a new package: npm names are lowercase. Use ${lower}.` : `${name} is not a valid package name: ${VALID_NAME_RULE}.` });
-  }
+function versionCheck(version: string, build: BuildMetadata): PublishCheck | null {
+  if (!isValidVersion(version)) return { kind: "refused", reason: `"${version}" is not a version apm accepts: apm takes strict semver only (1.2.3, 1.2.3-beta.1).` };
 
-  if (!isValidVersion(version)) out.push({ kind: "refused", reason: `"${version}" is not a version apm accepts: apm takes strict semver only (1.2.3, 1.2.3-beta.1).` });
-  else if (target.dropsBuild && version.includes("+")) out.push({ kind: "refused", reason: `npm sends ${version} as ${withoutBuild(version)}, without its build metadata, and the registry refuses a publish whose version differs from the tarball's. Drop the "+..." part, or publish with bun or pnpm.` });
+  if (!version.includes("+")) return null;
+  const sent = withoutBuild(version);
 
-  return out;
+  return build === "dropped"
+    ? { kind: "refused", reason: `npm uploads ${version} as ${sent}, without its build metadata, and the registry refuses a publish whose version differs from the tarball's. Drop the "+..." part.` }
+    : { kind: "unconfirmed", reason: `${version} has build metadata; an upload that sends it as ${sent} (as npm does) is refused for not matching the tarball. Drop the "+..." part to be sure.` };
+}
+
+/** What package.json alone says would be refused or is uncertain: no registry answer needed. */
+export function manifestChecks(fields: PublishFields): ManifestVerdict {
+  const name = z.string().safeParse(fields.name);
+  const version = z.string().safeParse(fields.version);
+  const named = name.success ? nameRefusal(name.data) : `package.json has no "name" string, so there is nothing to publish under. Set "name", such as "@your-github-login/my-lib".`;
+  const versioned: PublishCheck | null = version.success ? versionCheck(version.data, fields.build) : { kind: "refused", reason: `package.json has no "version" string. Set "version", such as "1.0.0".` };
+
+  const checks: PublishCheck[] = [
+    ...(fields.private === true || fields.private === "true" ? [{ kind: "refused" as const, reason: `package.json has "private": true, so package managers refuse to publish it. Remove "private" to publish.` }] : []),
+    ...(named === null ? [] : [{ kind: "refused" as const, reason: named }]),
+    ...(versioned === null ? [] : [versioned]),
+  ];
+
+  if (!name.success || !version.success || checks.some((c) => c.kind === "refused")) return { kind: "refused", checks };
+
+  return { kind: "ok", name: name.data, version: version.data, checks };
 }
 
 /** The registry's rules for a first publish of `name`: its rule for new names, then reserved, npm's and look-alike names. */
@@ -98,8 +126,15 @@ function nameChecks(name: string, view: RegistryView): PublishCheck[] {
 /** What the registry would refuse this publish for, by what apm read from it. Run after manifestChecks passes. */
 export function registryChecks(input: { name: string; version: string; view: RegistryView }): PublishCheck[] {
   const { name, version, view } = input;
-  const same = view.existing.kind === "local" ? view.existing.versions.find((v) => withoutBuild(v) === withoutBuild(version)) : undefined;
-  const published: PublishCheck[] = same === undefined ? [] : [{ kind: "refused", reason: `${name}@${same} is already published (or was, and was yanked or revoked). Versions are immutable; bump the version (apm publish --bump patch).` }];
+  const { existing } = view;
+  const same = existing.kind === "local" ? existing.versions.find((v) => withoutBuild(v) === withoutBuild(version)) : undefined;
+
+  const published: PublishCheck[] =
+    same !== undefined
+      ? [{ kind: "refused", reason: `${name}@${same} is already published (or was, and was yanked or revoked). Versions are immutable; bump the version (apm publish --bump patch).` }]
+      : existing.kind === "local" && !existing.complete
+        ? [{ kind: "unconfirmed", reason: `apm read only the newest of ${name}'s many versions, so it cannot confirm ${version} is not an older one already published.` }]
+        : [];
 
   return [...published, ...nameChecks(name, view)];
 }

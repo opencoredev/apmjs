@@ -233,7 +233,7 @@ const checkName: Tool<typeof CheckNameInput> = {
     const free = r.suggestions.filter((s) => s.checked && s.available).map((s) => s.name);
 
     if (free.length > 0) lines.push(`Free${r.scope ? ` under @${r.scope}` : ""}: ${free.join(", ")}`);
-    else if (!bare) lines.push("Pass scope (your GitHub login) to check names under your own scope; a scoped name is always yours.");
+    else if (!bare) lines.push("Pass scope (your GitHub login) to check names under your own scope; a name under your own scope is always yours.");
 
     // `available` stays npm's answer about the name; `publishable` is whether apm lets you publish it
     return text(lines.join("\n"), { ...r, publishable: publishability({ name, available: r.available && r.valid && !r.taken && !r.unknown, scope: bare }) });

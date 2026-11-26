@@ -1,37 +1,48 @@
 // apm publish --dry-run refuses what the registry and the package manager refuse (HOME-564 item 6: a dry run was green
 // for a bare name, an existing version, another account's scope, "1.0", an uppercase name and "private": true).
 import { describe, expect, test } from "bun:test";
-import { manifestChecks, registryChecks, type PublishCheck, type PublishTarget, type RegistryView } from "../src/publish-checks.ts";
+import { manifestChecks, registryChecks, type PublishCheck, type PublishFields, type RegistryView } from "../src/publish-checks.ts";
 
 const missing: RegistryView = { user: "me", policy: "scoped", existing: { kind: "missing" } };
-const mine: RegistryView = { user: "me", policy: "scoped", existing: { kind: "local", owners: ["me"], versions: ["1.0.0"] } };
+const mine: RegistryView = { user: "me", policy: "scoped", existing: { kind: "local", owners: ["me"], versions: ["1.0.0"], complete: true } };
 const ALREADY = "is already published (or was, and was yanked or revoked). Versions are immutable; bump the version (apm publish --bump patch).";
 
 const reasons = (checks: readonly PublishCheck[], kind: PublishCheck["kind"]): string[] => checks.flatMap((c) => (c.kind === kind ? [c.reason] : []));
 const refused = (name: string, view: RegistryView, version = "1.0.0"): string[] => reasons(registryChecks({ name, version, view }), "refused");
 const unconfirmed = (name: string, view: RegistryView, version = "1.0.0"): string[] => reasons(registryChecks({ name, version, view }), "unconfirmed");
-const target = (fields: Partial<PublishTarget>): PublishTarget => ({ name: "@me/lib", version: "1.0.0", private: false, dropsBuild: false, ...fields });
+const fields = (over: Partial<PublishFields>): PublishFields => ({ name: "@me/lib", version: "1.0.0", private: undefined, build: "unknown", ...over });
 
 describe("manifestChecks: what package.json alone says", () => {
-  test("a valid scoped name and strict semver pass, a ~ in the package part included (the publish route takes it)", () => {
-    expect(manifestChecks(target({}))).toEqual([]);
-    expect(manifestChecks(target({ name: "@me/a~b" }))).toEqual([]);
+  test("a valid scoped name and strict semver pass with the name and version to publish, a ~ in the package part included (the publish route takes it)", () => {
+    expect(manifestChecks(fields({}))).toEqual({ kind: "ok", name: "@me/lib", version: "1.0.0", checks: [] });
+    expect(manifestChecks(fields({ name: "@me/a~b" }))).toMatchObject({ kind: "ok", name: "@me/a~b" });
   });
 
   test("a non-semver version, an uppercase or invalid name and private: true are each refused", () => {
-    expect(reasons(manifestChecks(target({ name: "@me/My-Lib", version: "1.0", private: true })), "refused")).toEqual([
+    expect(reasons(manifestChecks(fields({ name: "@me/My-Lib", version: "1.0", private: true })).checks, "refused")).toEqual([
       'package.json has "private": true, so package managers refuse to publish it. Remove "private" to publish.',
       "@me/My-Lib is not a valid name for a new package: npm names are lowercase. Use @me/my-lib.",
       '"1.0" is not a version apm accepts: apm takes strict semver only (1.2.3, 1.2.3-beta.1).',
     ]);
-    expect(reasons(manifestChecks(target({ name: "bad name" })), "refused")[0]).toStartWith("bad name is not a valid package name: a name is lowercase letters");
+    expect(reasons(manifestChecks(fields({ name: "bad name" })).checks, "refused")[0]).toStartWith("bad name is not a valid package name: a name is lowercase letters");
   });
 
-  test("build metadata is refused only for a package manager that drops it from the version it sends (npm)", () => {
-    expect(manifestChecks(target({ version: "1.0.0-rc.1+ci.7" }))).toEqual([]);
-    expect(reasons(manifestChecks(target({ version: "1.0.0-rc.1+ci.7", dropsBuild: true })), "refused")).toEqual([
-      'npm sends 1.0.0-rc.1+ci.7 as 1.0.0-rc.1, without its build metadata, and the registry refuses a publish whose version differs from the tarball\'s. Drop the "+..." part, or publish with bun or pnpm.',
+  test("a missing or non-string name or version is refused, not thrown", () => {
+    expect(manifestChecks(fields({ name: undefined, version: 1, private: true }))).toEqual({
+      kind: "refused",
+      checks: [
+        { kind: "refused", reason: 'package.json has "private": true, so package managers refuse to publish it. Remove "private" to publish.' },
+        { kind: "refused", reason: 'package.json has no "name" string, so there is nothing to publish under. Set "name", such as "@your-github-login/my-lib".' },
+        { kind: "refused", reason: 'package.json has no "version" string. Set "version", such as "1.0.0".' },
+      ],
+    });
+  });
+
+  test("build metadata is refused when npm uploads (npm and yarn projects) and a warning otherwise", () => {
+    expect(reasons(manifestChecks(fields({ version: "1.0.0-rc.1+ci.7", build: "dropped" })).checks, "refused")).toEqual([
+      "npm uploads 1.0.0-rc.1+ci.7 as 1.0.0-rc.1, without its build metadata, and the registry refuses a publish whose version differs from the tarball's. Drop the \"+...\" part.",
     ]);
+    expect(manifestChecks(fields({ version: "1.0.0-rc.1+ci.7" }))).toMatchObject({ kind: "ok", checks: [{ kind: "unconfirmed" }] });
   });
 });
 
@@ -82,6 +93,13 @@ describe("registryChecks: what the registry would refuse", () => {
   test("a version the registry already stores is refused, build metadata ignored", () => {
     expect(refused("@me/lib", mine)).toEqual([`@me/lib@1.0.0 ${ALREADY}`]);
     expect(refused("@me/lib", mine, "1.0.0+build.2")).toEqual([`@me/lib@1.0.0 ${ALREADY}`]);
+    expect(refused("@me/lib", { ...mine, existing: { kind: "local", owners: ["me"], versions: ["1.1.0+ci.1"], complete: true } }, "1.1.0")).toEqual([`@me/lib@1.1.0+ci.1 ${ALREADY}`]);
+  });
+
+  test("a version missing from a list that may be cut short is unconfirmed, not passed", () => {
+    expect(unconfirmed("@me/lib", { ...mine, existing: { kind: "local", owners: ["me"], versions: ["9.0.0"], complete: false } }, "1.0.1")).toEqual([
+      "apm read only the newest of @me/lib's many versions, so it cannot confirm 1.0.1 is not an older one already published.",
+    ]);
   });
 
   test("an owner's new version passes; someone else's package is refused; logged out it is unconfirmed", () => {
@@ -91,7 +109,7 @@ describe("registryChecks: what the registry would refuse", () => {
   });
 
   test("a co-owner under another scope passes, and an unread package is unconfirmed rather than refused", () => {
-    const shared: RegistryView = { user: "octo-cat", policy: "scoped", existing: { kind: "local", owners: ["mona-owner", "octo-cat"], versions: ["1.0.0"] } };
+    const shared: RegistryView = { user: "octo-cat", policy: "scoped", existing: { kind: "local", owners: ["mona-owner", "octo-cat"], versions: ["1.0.0"], complete: true } };
 
     expect(registryChecks({ name: "@mona-owner/shared", version: "1.1.0", view: shared })).toEqual([]);
     expect(registryChecks({ name: "@mona-owner/shared", version: "1.1.0", view: { ...shared, existing: { kind: "unknown" } } })).toEqual([

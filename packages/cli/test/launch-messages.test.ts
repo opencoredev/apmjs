@@ -308,9 +308,21 @@ describe("apm's messages for first-time users", () => {
     expect(r.text).toContain('✗ package.json has "private": true, so package managers refuse to publish it.');
     expect(r.text).toContain("✗ @me/My-Lib is not a valid name for a new package: npm names are lowercase. Use @me/my-lib.");
     expect(r.text).toContain('✗ "1.0" is not a version apm accepts: apm takes strict semver only (1.2.3, 1.2.3-beta.1).');
-    expect(r.text).toContain("dry run: nothing packed or uploaded, and publishing @me/My-Lib@1.0 would be refused");
+    expect(r.text).toContain("dry run: nothing packed or uploaded, and this publish would be refused");
     // the stand-in npm fails at once: no pack ran
     expect(r.text).not.toContain("pack failed");
+
+    // fields that are missing or not strings get their own ✗, not a schema error, with --bump too
+    const loose = folder("dry-loose", { "package.json": JSON.stringify({ version: 1, private: true }) });
+    const bumped = await apm(["publish", "--dry-run", "--bump", "patch", "--pm", "npm", "--json"], { cwd: loose });
+    expect(bumped.code).toBe(1);
+    expect(JSON.parse(bumped.out)).toMatchObject({ ok: false, status: "dry-run", refused: [expect.stringContaining('"private": true'), expect.stringContaining('no "name" string'), expect.stringContaining('no "version" string')] });
+
+    // yarn projects upload through npm, which drops build metadata from the version it sends
+    const build = folder("dry-build", { "package.json": JSON.stringify({ name: "@me/lib", version: "1.2.3-rc.1+ci.7" }), "yarn.lock": "" });
+    const yarn = await apm(["publish", "--dry-run", "--pm", "yarn"], { cwd: build });
+    expect(yarn.code).toBe(1);
+    expect(yarn.text).toContain("✗ npm uploads 1.2.3-rc.1+ci.7 as 1.2.3-rc.1, without its build metadata");
   });
 
   test("C10: a known malicious version leads with the refusal, not its grade", async () => {
