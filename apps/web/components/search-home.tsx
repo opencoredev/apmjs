@@ -24,7 +24,7 @@ import {
 } from "@/lib/search-schema";
 import { normalizeQuery as normalize, packageHref, searchHref as urlFor } from "@/lib/typeahead";
 import { track } from "@/lib/databuddy-client";
-import { NEEDS_SCOPE_STATUS, OWNER_ONLY_STATUS, needsScopeSentence, ownerOnlySentence, publishability, type Publishability } from "@/lib/publish-name";
+import { NEEDS_SCOPE_STATUS, OWNER_ONLY_STATUS, needsScopeSentence, ownerOnlySentence, publishability, type Publishability, type Viewer } from "@/lib/publish-name";
 
 const NAME_CHECK_DEBOUNCE_MS = 250;
 
@@ -130,6 +130,23 @@ function Slot({ label, href, children }: { label: string; href?: string; childre
   );
 }
 
+/** Who is looking, by the alternatives part: it is checked under the visitor's own scope, so it names their login. */
+function viewerOf(state: PartState<"alternatives">): Viewer {
+  switch (state.kind) {
+    case "loading":
+      return { kind: "checking" };
+    case "error":
+      return { kind: "unknown" };
+    case "ok":
+      return state.data.scope === null ? { kind: "signed-out" } : { kind: "signed-in", scope: `@${state.data.scope.toLowerCase()}` };
+    default: {
+      const _exhaustive: never = state;
+
+      return _exhaustive;
+    }
+  }
+}
+
 /** What a free name means for this visitor: `viewer` is their GitHub login once the alternatives part says it. */
 function publishableFor(q: string, viewer: PartState<"alternatives">): Publishability {
   return publishability({ name: q, available: true, scope: viewer.kind === "ok" ? viewer.data.scope : null });
@@ -178,7 +195,7 @@ function ExactSlot({ q, state, viewer }: { q: string; state: PartState<"exact">;
       {data && !data.taken && data.conflicts[0] && <span className="text-sm text-pretty text-muted-foreground">{data.conflicts[0].reason}</span>}
       {publishable.kind === "needs-scope" && <span className="text-sm text-pretty text-muted-foreground">{needsScopeSentence(publishable.suggestion)}</span>}
       {(publishable.kind === "scoped" || publishable.kind === "not-yours") && (
-        <span className="text-sm text-pretty text-muted-foreground">{ownerOnlySentence(publishable.scope, publishable.kind === "not-yours" ? publishable.yours : null)}</span>
+        <span className="text-sm text-pretty text-muted-foreground">{ownerOnlySentence(publishable.scope, viewerOf(viewer))}</span>
       )}
     </Slot>
   );

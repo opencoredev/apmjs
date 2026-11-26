@@ -3,9 +3,13 @@
 import { describe, expect, test } from "bun:test";
 import { publishChecks, type RegistryView } from "../src/publish-checks.ts";
 
+type Input = Parameters<typeof publishChecks>[0];
+
 const missing: RegistryView = { user: "me", policy: "scoped", existing: { kind: "missing" } };
-const refused = (input: Parameters<typeof publishChecks>[0]): string[] => publishChecks(input).flatMap((c) => (c.kind === "refused" ? [c.reason] : []));
-const unconfirmed = (input: Parameters<typeof publishChecks>[0]): string[] => publishChecks(input).flatMap((c) => (c.kind === "unconfirmed" ? [c.reason] : []));
+const mine: RegistryView = { user: "me", policy: "scoped", existing: { kind: "local", owners: ["me"], versions: ["1.0.0"] } };
+const refused = (input: Input): string[] => publishChecks(input).flatMap((c) => (c.kind === "refused" ? [c.reason] : []));
+const unconfirmed = (input: Input): string[] => publishChecks(input).flatMap((c) => (c.kind === "unconfirmed" ? [c.reason] : []));
+const ALREADY = "is already published (or was, and was yanked or revoked). Versions are immutable; bump the version (apm publish --bump patch).";
 
 describe("publishChecks", () => {
   test("a new package under your own scope passes", () => {
@@ -26,29 +30,44 @@ describe("publishChecks", () => {
 
   test("another account's scope is refused; logged out it is unconfirmed, not passed", () => {
     expect(refused({ name: "@sindresorhus/probe", version: "1.0.0", private: false, view: missing })).toEqual(["You cannot publish under @sindresorhus. New packages go under your own scope: @me/probe."]);
-    const out = publishChecks({ name: "@sindresorhus/probe", version: "1.0.0", private: false, view: { ...missing, user: null } });
-
-    expect(out).toEqual([{ kind: "unconfirmed", reason: "apm cannot confirm that @sindresorhus is yours: you are not logged in to this registry. Log in, then run the dry run again." }]);
-  });
-
-  test("a version the registry already has is refused, build metadata ignored", () => {
-    const found: RegistryView = { user: null, policy: "scoped", existing: { kind: "found", versions: ["1.2.0", "1.3.0"], owners: ["azer"] } };
-
-    expect(refused({ name: "left-pad", version: "1.3.0", private: false, view: found })).toContain("left-pad@1.3.0 is already published. Versions are immutable; bump the version (apm publish --bump patch).");
-    expect(refused({ name: "@me/lib", version: "1.0.0+build.2", private: false, view: { ...found, existing: { kind: "found", versions: ["1.0.0"], owners: ["me"] } } })).toEqual([
-      "@me/lib@1.0.0 is already published. Versions are immutable; bump the version (apm publish --bump patch).",
+    expect(publishChecks({ name: "@sindresorhus/probe", version: "1.0.0", private: false, view: { ...missing, user: null } })).toEqual([
+      { kind: "unconfirmed", reason: "apm cannot confirm that @sindresorhus is yours: you are not logged in to this registry. Log in, then run the dry run again." },
     ]);
   });
 
-  test("an owner's new version passes; someone else's package is refused", () => {
-    const mine: RegistryView = { user: "me", policy: "scoped", existing: { kind: "found", versions: ["1.0.0"], owners: ["me"] } };
+  test("a name npm has is refused, even when its npm maintainer has your login", () => {
+    const npm: RegistryView = { ...missing, existing: { kind: "npm" } };
 
-    expect(publishChecks({ name: "@me/lib", version: "1.0.1", private: false, view: mine })).toEqual([]);
-    expect(refused({ name: "@me/lib", version: "1.0.1", private: false, view: { ...mine, user: "you" } })).toEqual(["@me/lib already exists and you is not one of its owners (me); only an owner can publish a new version."]);
+    expect(refused({ name: "left-pad", version: "1.3.0", private: false, view: { ...npm, user: null } })).toEqual([
+      'New packages on apm are scoped to your GitHub login. Publish this as @<your GitHub login>/left-pad (set "name" in package.json). A bare name like "left-pad" always means the npm package, so apm does not hand out bare names.',
+      "left-pad already exists on npm, and apm shares one namespace with it, so it cannot be published over here. Pick another name under your scope.",
+    ]);
+    expect(refused({ name: "@me/on-npm", version: "1.0.0", private: false, view: npm })).toEqual(["@me/on-npm already exists on npm, and apm shares one namespace with it, so it cannot be published over here. Pick another name under your scope."]);
   });
 
-  test("an unread package is unconfirmed, not passed", () => {
-    expect(unconfirmed({ name: "@me/lib", version: "1.0.0", private: false, view: { ...missing, existing: { kind: "unknown" } } })).toEqual(["apm could not read @me/lib from this registry, so it cannot say whether 1.0.0 is already published."]);
+  test("a new look-alike of a popular name is refused", () => {
+    expect(refused({ name: "@me/hono-js", version: "1.0.0", private: false, view: missing })[0]).toContain("is too close to a popular package");
+    expect(refused({ name: "@me/hono", version: "1.0.0", private: false, view: missing })).toEqual([]);
+  });
+
+  test("a version the registry already stores is refused, build metadata ignored", () => {
+    expect(refused({ name: "@me/lib", version: "1.0.0", private: false, view: mine })).toEqual([`@me/lib@1.0.0 ${ALREADY}`]);
+    expect(refused({ name: "@me/lib", version: "1.0.0+build.2", private: false, view: mine })).toEqual([`@me/lib@1.0.0 ${ALREADY}`]);
+  });
+
+  test("an owner's new version passes; someone else's package is refused; logged out it is unconfirmed", () => {
+    expect(publishChecks({ name: "@me/lib", version: "1.0.1", private: false, view: mine })).toEqual([]);
+    expect(refused({ name: "@me/lib", version: "1.0.1", private: false, view: { ...mine, user: "you" } })).toEqual(["@me/lib already exists and you is not one of its owners (me); only an owner can publish a new version."]);
+    expect(unconfirmed({ name: "@me/lib", version: "1.0.1", private: false, view: { ...mine, user: null } })).toEqual(["apm cannot confirm that you own @me/lib: you are not logged in to this registry. Log in, then run the dry run again."]);
+  });
+
+  test("a co-owner under another scope passes, and an unread package is unconfirmed rather than refused", () => {
+    const shared: RegistryView = { user: "octo-cat", policy: "scoped", existing: { kind: "local", owners: ["mona-owner", "octo-cat"], versions: ["1.0.0"] } };
+
+    expect(publishChecks({ name: "@mona-owner/shared", version: "1.1.0", private: false, view: shared })).toEqual([]);
+    expect(publishChecks({ name: "@mona-owner/shared", version: "1.1.0", private: false, view: { ...shared, existing: { kind: "unknown" } } })).toEqual([
+      { kind: "unconfirmed", reason: "apm could not read whether @mona-owner/shared exists on this registry or on npm, so it cannot say whether you may publish it or whether this version is already published." },
+    ]);
   });
 
   test("a non-semver version, an uppercase or invalid name and private: true are refused with no registry answer needed", () => {

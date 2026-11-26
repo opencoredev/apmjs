@@ -18,7 +18,14 @@ describe("publishability", () => {
 
   test("with no visitor known, a free scoped name is its scope owner's", () => {
     expect(publishability({ name: "@sindresorhus/h564-probe", available: true })).toEqual({ kind: "scoped", scope: "@sindresorhus" });
-    expect(ownerOnlySentence("@sindresorhus", null)).toBe("Only the GitHub account sindresorhus can publish under @sindresorhus. Sign in with GitHub to see whether that is you.");
+    expect(ownerOnlySentence("@sindresorhus", { kind: "signed-out" })).toBe("Only the GitHub account sindresorhus can publish under @sindresorhus. Sign in with GitHub to see whether that is you.");
+    expect(ownerOnlySentence("@sindresorhus", { kind: "signed-in", scope: "@leo" })).toBe("Only the GitHub account sindresorhus can publish under @sindresorhus. Yours is @leo.");
+  });
+
+  // a failed lookup of who is asking is not a signed-out answer: it never tells a signed-in publisher to sign in
+  test("when apm could not ask who the visitor is, the sentence says so instead of asking them to sign in", () => {
+    expect(ownerOnlySentence("@sindresorhus", { kind: "unknown" })).toBe("Only the GitHub account sindresorhus can publish under @sindresorhus. apm could not check whether that is you.");
+    expect(ownerOnlySentence("@sindresorhus", { kind: "checking" })).toBe("Only the GitHub account sindresorhus can publish under @sindresorhus.");
   });
 
   test("bare and taken names are unchanged", () => {

@@ -172,6 +172,15 @@ describe("name check alternatives under the GitHub-scope policy", () => {
     expect(existing.code, existing.out).toBe(1);
     expect(existing.out).toContain("✗ @scope-owner/quokka-js@1.0.0 is already published");
 
+    // a yanked version leaves the packument but stays stored, and the registry refuses to publish over it
+    expect((await putPublish(reg, token, { name: "@scope-owner/quokka-js", version: "1.1.0", license: "MIT", main: "index.js" })).status).toBe(201);
+    const yank = await apm(["yank", "@scope-owner/quokka-js@1.1.0", "--reason", "test"], { cwd: sb.home, env: sb.env });
+    expect(yank.code, yank.out).toBe(0);
+    expect(dig((await getJson(`${reg.url}@scope-owner%2fquokka-js`)).body, "versions", "1.1.0")).toBeUndefined();
+    const yanked = await dry("@scope-owner/quokka-js", "1.1.0");
+    expect(yanked.code, yanked.out).toBe(1);
+    expect(yanked.out).toContain("✗ @scope-owner/quokka-js@1.1.0 is already published");
+
     const bare = await dry("quokka-bare", "1.0.0");
     expect(bare.code, bare.out).toBe(1);
     expect(bare.out).toContain("✗ New packages on apm are scoped to your GitHub login. Publish this as @scope-owner/quokka-bare");
@@ -179,6 +188,10 @@ describe("name check alternatives under the GitHub-scope policy", () => {
     const other = await dry("@someone-else/quokka", "1.0.0");
     expect(other.code, other.out).toBe(1);
     expect(other.out).toContain("✗ You cannot publish under @someone-else. New packages go under your own scope: @scope-owner/quokka.");
+
+    const lookalike = await dry("@scope-owner/hono-js", "1.0.0");
+    expect(lookalike.code, lookalike.out).toBe(1);
+    expect(lookalike.out).toContain("✗ @scope-owner/hono-js is too close to a popular package");
 
     const fine = await dry("@scope-owner/quokka-new", "1.0.0");
     expect(fine.code, fine.out).toBe(0);

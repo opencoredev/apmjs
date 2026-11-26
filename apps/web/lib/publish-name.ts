@@ -34,9 +34,29 @@ export function publishability(input: { name: string; available: boolean; scope?
 /** The name check's short status for a free name under a scope that is not, or not known to be, the visitor's. */
 export const OWNER_ONLY_STATUS = "free, scope owner only";
 
-/** Who may publish a free name under `scope`, after its status; `yours` is the visitor's scope when signed in. */
-export const ownerOnlySentence = (scope: string, yours: string | null): string =>
-  `Only the GitHub account ${scope.slice(1)} can publish under ${scope}. ${yours === null ? "Sign in with GitHub to see whether that is you." : `Yours is ${yours}.`}`;
+/** Who is looking at the name check: signed in (their scope, as @login), signed out, still being asked, or unknown (the ask failed). */
+export type Viewer = { readonly kind: "signed-in"; readonly scope: string } | { readonly kind: "signed-out" } | { readonly kind: "checking" } | { readonly kind: "unknown" };
+
+/** Who may publish a free name under `scope`, after its status, and what that means for this viewer. */
+export function ownerOnlySentence(scope: string, viewer: Viewer): string {
+  const owner = `Only the GitHub account ${scope.slice(1)} can publish under ${scope}.`;
+
+  switch (viewer.kind) {
+    case "signed-in":
+      return `${owner} Yours is ${viewer.scope}.`;
+    case "signed-out":
+      return `${owner} Sign in with GitHub to see whether that is you.`;
+    case "checking":
+      return owner;
+    case "unknown":
+      return `${owner} apm could not check whether that is you.`;
+    default: {
+      const _exhaustive: never = viewer;
+
+      return _exhaustive;
+    }
+  }
+}
 
 /** The name check's short status for a free bare name. */
 export const NEEDS_SCOPE_STATUS = "not taken, needs a scope";
