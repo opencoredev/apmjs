@@ -46,6 +46,12 @@ function resolveAnswer(name: string, range: string): Response {
     case "fresh-older":
       // the newest is inside the cooldown; the one before it is past it and clean
       return range.includes("<2.0.0") ? ok("1.0.0", 95, [], false) : ok("2.0.0", 95, [], true);
+    case "fresh-risky":
+      // the newest, inside the cooldown, is the look-alike; the older one past it is clean
+      return range.includes("<2.0.0") ? ok("1.0.0", 95, [], false) : ok("2.0.0", 75, [typosquat], true);
+    case "older-risky":
+      // the newest, inside the cooldown, is clean; the older one past it is the look-alike
+      return range.includes("<2.0.0") ? ok("1.0.0", 75, [typosquat], false) : ok("2.0.0", 95, [], true);
     default:
       return ok("1.0.0", 95, [], false);
   }
@@ -207,6 +213,21 @@ describe("apm add for a newcomer", () => {
     expect(kinds(older.out)).toEqual(["cooldown"]);
   });
 
+  test("the verdict is always on the version apm add installs, never on the older one explain would pick", async () => {
+    const cwd = folder("rf-which", { "package.json": manifest });
+    const risky = await apm(["add", "--json", "fresh-risky", "--pm", "npm"], { cwd });
+    const [pkg] = AddJson.parse(JSON.parse(risky.out)).packages;
+
+    expect(pkg?.warnings.map((w) => `${w.kind} ${w.version}`)).toEqual(["cooldown 2.0.0", "review-first 2.0.0"]);
+    expect(pkg?.warnings[1]?.text).toStartWith("Review fresh-risky@2.0.0 before installing: apm found a risk signal in it");
+    expect(ran()).toContain("fresh-risky@2.0.0");
+
+    const clean = await apm(["add", "--json", "older-risky", "--pm", "npm"], { cwd });
+
+    expect(kinds(clean.out)).toEqual(["cooldown"]);
+    expect(ran()).toContain("older-risky@2.0.0");
+  });
+
   test("an AI review apm cannot read leaves explain at unknown: the add's own checks decide, as before", async () => {
     const cwd = folder("rf-unknown", { "package.json": manifest });
     const strict = await apm(["add", "--strict", "--json", "noreview", "--pm", "npm"], { cwd });
@@ -269,7 +290,7 @@ describe("apm add for a newcomer", () => {
 
   test("a gitignored bunfig.toml or .yarnrc.yml with apm's registry is named only for the package manager that reads it", async () => {
     const registry = server.url.toString();
-    const repo = folder("gi/native", { "package.json": manifest, "bunfig.toml": `[install]\nregistry = "${registry}"\n`, ".yarnrc.yml": `npmRegistryServer: "${registry}"\n`, ".gitignore": "bunfig.toml\n.yarnrc.yml\n" });
+    const repo = folder("gi/native", { "package.json": JSON.stringify({ name: "app", version: "1.0.0", private: true, packageManager: "yarn@4.5.0" }), "bunfig.toml": `[install]\nregistry = "${registry}"\n`, ".yarnrc.yml": `npmRegistryServer: "${registry}"\n`, ".gitignore": "bunfig.toml\n.yarnrc.yml\n" });
 
     git(["init", "-q"], repo);
     const bun = await apm(["add", "good", "--pm", "bun"], { cwd: repo });
@@ -283,6 +304,23 @@ describe("apm add for a newcomer", () => {
     expect(yarn.text).not.toContain("git ignores bunfig.toml");
 
     expect((await apm(["add", "good", "--pm", "npm"], { cwd: repo })).text).not.toContain("git ignores");
+
+    // yarn 1 does not read .yarnrc.yml: with yarn 1's lockfile and no packageManager, no word about it
+    const classic = folder("gi/yarn-classic", { "package.json": manifest, "yarn.lock": "# yarn lockfile v1\n", ".yarnrc.yml": `npmRegistryServer: "${registry}"\n`, ".gitignore": ".yarnrc.yml\n" });
+
+    git(["init", "-q"], classic);
+    expect((await apm(["add", "good", "--pm", "yarn"], { cwd: classic })).text).not.toContain("git ignores");
+  });
+
+  test("a bun workspace member's own gitignored bunfig.toml is named", async () => {
+    const registry = server.url.toString();
+    const repo = folder("gi/bun-ws", { "package.json": JSON.stringify({ name: "ws", private: true, workspaces: ["packages/*"] }), ".gitignore": "bunfig.toml\n" });
+    const member = folder("gi/bun-ws/packages/app", { "package.json": manifest, "bunfig.toml": `[install]\nregistry = "${registry}"\n` });
+
+    git(["init", "-q"], repo);
+    const r = await apm(["add", "good", "--pm", "bun"], { cwd: member });
+
+    expect(r.text).toContain("apm: git ignores bunfig.toml,");
   });
 
   test("an npm init -y project (package.json, no lockfile, packageManager or bunfig) is added with npm, not bun", async () => {

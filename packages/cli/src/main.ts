@@ -9,7 +9,7 @@ import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isValidPa
 import { Api, ApiError, AuditResponse, NameResponse, RATE_LIMIT_RETRY, ResolveFail, ResolveOk, ResolvePending, ScoreResponse, Tree, encodeName, parseSpec, tagsWithoutLatest, type Capability, type DistTag, type InstallWarning, type Report } from "./api.ts";
 import { installedPackages, isValidRange, type Found, type Installed } from "./audit.ts";
 import { explainCommand, okInput, resolvedFor, reviewOf, searchCommand, type AgentIo } from "./agent.ts";
-import { escapedPath, explain, oneLine, resolveForVerdict, type OlderSearch, type ResolvedInput, type ReviewInput, type Verdict } from "./explain.ts";
+import { escapedPath, explain, oneLine, resolveForVerdict, type OlderSearch, type ResolvedInput, type Verdict } from "./explain.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
 import { DEFAULT_REGISTRY, displayRegistry, isApmToken, loadConfig, sameRegistry, saveToken, type Config } from "./config.ts";
 import { capabilityLines } from "./capabilities.ts";
@@ -234,9 +234,8 @@ type Resolved = {
 };
 
 /**
- * apm explain's review-first verdict on the version apm add picked, as one of the package's --json `warnings`: `text`
- * is explain's summary, `reasons` its reasons; `version` is the version explain weighed (an older one past the
- * cooldown when explain picks one).
+ * apm explain's review-first verdict on the version apm add picked and installs, as one of the package's --json
+ * `warnings`: `text` is explain's summary, `reasons` its reasons.
  */
 type Explained = Pick<InstallWarning, "name" | "version" | "score" | "grade" | "text" | "via"> & Pick<Verdict, "reasons" | "url"> & { kind: "review-first" };
 
@@ -244,11 +243,12 @@ type Explained = Pick<InstallWarning, "name" | "version" | "score" | "grade" | "
 const REVIEW_TIMEOUT_MS = 15_000;
 
 /**
- * What apm explain would say about the version the registry picked: the same rules on the same answer, the version's
- * AI review, and, for a version inside the cooldown, explain's own look for the newest older version past it. Null for
- * any other verdict: install; unknown, where apm could not read something (the add's own checks still stand, and a
- * registry from before AI reviews sends no review summary at all); and the refusals the registry already made.
- * `floor`: the floor the add asked for.
+ * What apm explain's rules say about the version the registry picked, the one apm add installs: the same answer, that
+ * version's AI review, and the floor the add asked for. For a version inside the cooldown, explain's own look for an
+ * older version past it decides only whether the age is a hold too: explain would install that older version instead,
+ * and apm add already warns about the age, so the hold stays only when there is none (or explain gave up looking).
+ * Null for any other verdict: install; unknown, where apm could not read something (the add's own checks still stand,
+ * and a registry from before AI reviews sends no review summary at all); and the refusals the registry already made.
  */
 async function explainedOf(input: { api: Api; name: string; range: string | null; ok: ResolveOk; strict: boolean; floor: number | undefined }): Promise<Explained | null> {
   const { api, name, ok } = input;
@@ -257,14 +257,15 @@ async function explainedOf(input: { api: Api; name: string; range: string | null
   const fresh = picked.deps.warnings.some((w) => w.via.length === 0 && w.kind === "cooldown");
   // the registry's answer for the range itself is the one already read; only older ranges are asked for
   const resolve = (r: string): Promise<ResolvedInput> => (r === range ? Promise.resolve(picked) : resolvedFor({ api, name, range: r, strict: input.strict, warn: (line) => say(dim(line)) }));
-  const { resolved, older } = fresh ? await resolveForVerdict({ range, resolve }) : { resolved: picked, older: { kind: "not-needed" } satisfies OlderSearch };
-  const unread: ReviewInput = { kind: "unreadable" };
-  const review = resolved.kind === "ok" ? await reviewOf(api, name, resolved.version, REVIEW_TIMEOUT_MS) : unread;
-  const v = explain({ name, range: input.range, resolved, review, older, floor: input.floor });
+  const searched: OlderSearch = fresh ? (await resolveForVerdict({ range, resolve })).older : { kind: "not-needed" };
+  const aged = searched.kind === "none" || searched.kind === "gave-up";
+  const older: OlderSearch = aged ? searched : { kind: "not-needed" };
+  const resolved = !fresh || aged ? picked : { ...picked, deps: { ...picked.deps, warnings: picked.deps.warnings.filter((w) => w.via.length > 0 || w.kind !== "cooldown") } };
+  const v = explain({ name, range: input.range, resolved, review: await reviewOf(api, name, ok.version, REVIEW_TIMEOUT_MS), older, floor: input.floor });
 
   if (v.verdict !== "review-first") return null;
 
-  return { kind: "review-first", name, version: v.version ?? ok.version, score: v.score?.score ?? null, grade: v.score?.grade ?? null, text: oneLine(v.summary), reasons: v.reasons, url: v.url, via: [] };
+  return { kind: "review-first", name, version: ok.version, score: ok.report?.score ?? null, grade: ok.report?.grade ?? null, text: oneLine(v.summary), reasons: v.reasons, url: v.url, via: [] };
 }
 
 /** The floor apm add asked for, as explain weighs the version itself: 0 with --force, --floor's value, else the default. */
@@ -2057,7 +2058,7 @@ async function cmdAdd(a: Args): Promise<number> {
     return 1;
   }
 
-  for (const file of ignoredRegistryFiles({ cwd, root: layout.layout.root, pm: det.pm, registry: cfg.registry, npmrc: cfg.registrySource })) {
+  for (const file of ignoredRegistryFiles({ cwd, root: layout.layout.root, member: layout.layout.member, pm: det.pm, registry: cfg.registry, npmrc: cfg.registrySource })) {
     warn(yellow(`apm: git ignores ${escapedPath(file)}, which points installs at apm's registry, so clones and CI will not install through apm until it is committed (keep any token out of it)`));
   }
 

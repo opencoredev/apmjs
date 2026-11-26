@@ -10,6 +10,42 @@ const BunfigRegistry = z.object({ install: z.object({ registry: z.union([z.strin
 
 const YarnrcRegistry = z.object({ npmRegistryServer: z.string().optional() }).loose();
 
+const PackageManagerField = z.object({ packageManager: z.string().optional() }).loose();
+
+/**
+ * Whether the project at `root` runs yarn 2 or later, the yarn that reads .yarnrc.yml (yarn 1 does not), without running
+ * yarn: `packageManager` names yarn 2 or later, or yarn.lock is yarn 2's format (it starts with a __metadata entry).
+ */
+function yarnBerry(root: string): boolean {
+  try {
+    const pm = PackageManagerField.safeParse(JSON.parse(readFileSync(join(root, "package.json"), "utf8"))).data?.packageManager ?? "";
+
+    if (/^yarn@(?:[2-9]|\d{2,})\./.test(pm)) return true;
+
+    return existsSync(join(root, "yarn.lock")) && /^__metadata:/m.test(readFileSync(join(root, "yarn.lock"), "utf8"));
+  } catch {
+    return false;
+  }
+}
+
+/** The package manager's own config files that can point it at a registry: bunfig.toml where bun runs and at the root, .yarnrc.yml for yarn 2 and later. */
+function nativeConfigs(input: { root: string; member: string; pm: Pm }): string[] {
+  switch (input.pm) {
+    case "bun":
+      return [...new Set([join(input.root, input.member, "bunfig.toml"), join(input.root, "bunfig.toml")])];
+    case "yarn":
+      return yarnBerry(input.root) ? [join(input.root, ".yarnrc.yml")] : [];
+    case "npm":
+    case "pnpm":
+      return [];
+    default: {
+      const _exhaustive: never = input.pm;
+
+      return _exhaustive;
+    }
+  }
+}
+
 /** How long all of apm's git calls for this check may take together before apm stops asking and says nothing. */
 const GIT_BUDGET_MS = 2_000;
 
@@ -53,13 +89,17 @@ function git(args: string[], cwd: string, deadline: number): { code: number; out
 /**
  * The files that point the package manager at `registry` and that git ignores, relative to `cwd`: `npmrc`, the project
  * .npmrc apm itself took the registry from (npm, pnpm, bun and yarn 1 read it too), and the package manager's own
- * config at `root` (bunfig.toml for bun, .yarnrc.yml for yarn) when it names that registry. Empty outside a git work
+ * config (nativeConfigs) when it names that registry. Empty outside a git work
  * tree, without git, or when git fails or does not answer in time: this only ever adds a warning, never a failure.
  */
-export function ignoredRegistryFiles(input: { cwd: string; root: string; pm: Pm; registry: string; npmrc: string | null }): string[] {
-  const native = input.pm === "bun" ? join(input.root, "bunfig.toml") : input.pm === "yarn" ? join(input.root, ".yarnrc.yml") : null;
-  const nativeSet = native !== null && existsSync(native) ? nativeRegistry(native) : null;
-  const files = [input.npmrc, nativeSet !== null && sameRegistry(nativeSet, input.registry) ? native : null].filter((f) => f !== null);
+export function ignoredRegistryFiles(input: { cwd: string; root: string; member: string; pm: Pm; registry: string; npmrc: string | null }): string[] {
+  const native = nativeConfigs(input).filter((f) => {
+    const set = existsSync(f) ? nativeRegistry(f) : null;
+
+    return set !== null && sameRegistry(set, input.registry);
+  });
+
+  const files = [...(input.npmrc === null ? [] : [input.npmrc]), ...native];
 
   if (files.length === 0 || !gitAbove(input.root) || Bun.which("git") === null) return [];
   const deadline = Date.now() + GIT_BUDGET_MS;
