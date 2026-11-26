@@ -140,6 +140,12 @@ apm name <name> [--json]
 
 Says whether a name is free, taken, or free but refused (with the reason), plus similar names and available alternatives. When you are logged in it also says whether you already own it. See [Names and scopes](/guides/names).
 
+With `--json`, `available` matches the line apm prints: `true` only for a name you could publish on this registry. A bare name on a registry that takes new packages only under a scope (apm's own), a name under someone else's scope, or a scoped name while you are logged out is `false`, and `reason` says why (`null` when available). `taken`, `conflicts` and `suggestions` are unchanged.
+
+```json
+{ "ok": true, "query": "left-pad-2", "valid": true, "taken": false, "available": false, "reason": "left-pad-2 is free but not available: this registry does not hand out bare names, ..." }
+```
+
 ## apm audit
 
 ```bash
@@ -165,10 +171,10 @@ Checks, packs with your package manager, previews the score, then uploads. With 
 | Flag | Meaning |
 | --- | --- |
 | `--bump` | `patch`, `minor`, `major` or an exact version. Writes the new version to `package.json` (not with `--dry-run`). |
-| `--dry-run` | Run every check and print the preview. Upload nothing. |
+| `--dry-run` | Run every check and print the preview. Upload nothing. Also checks what the registry or your package manager would refuse: a lowercase valid name, a strict semver version, no `"private": true`, a version not published yet (yanked and revoked ones count), and a name you may take: on apm's registry one under your own GitHub login, not already on npm, not reserved and not a look-alike of a popular package. Mistakes in `package.json` itself are reported before anything is packed. It does not run the registry's extra check for accounts not signed in with GitHub (whether the scope is someone's on npm). Each refusal prints `✗` and the command exits `1`. What apm cannot confirm, such as a scope while you are logged out, prints `!`. |
 | `--tag <tag>` | The dist-tag. Default: `latest`, or `next` for a prerelease. |
 
-`--json` prints `status` as `dry-run`, `staged` (with `approval`, the link) or `published`, plus `name`, `version`, `registry`, `files`, `score` and `grade`.
+`--json` prints `status` as `dry-run`, `staged` (with `approval`, the link) or `published`, plus `name`, `version`, `registry`, `files`, `score` and `grade`. A dry run adds `refused` and `unconfirmed`, each a list of reasons; `ok` is `false` when `refused` is not empty.
 
 ## apm yank, apm unyank
 

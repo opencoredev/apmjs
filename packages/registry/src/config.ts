@@ -1,7 +1,8 @@
 // Deploy-time settings, parsed from the Worker's environment once per request.
+import type { NamePolicy } from "@apm/core";
 import { Context } from "effect";
 
-export type NamePolicy = "scoped" | "open";
+export type { NamePolicy };
 
 export type RegistrySettings = {
   /** Base URL in tarball links. Ends with "/". */

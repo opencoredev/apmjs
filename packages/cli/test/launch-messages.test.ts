@@ -47,7 +47,10 @@ describe("apm's messages for first-time users", () => {
         if (path === "/-/apm/v1/names") {
           const query = (url.searchParams.get("q") ?? "").trim().toLowerCase();
 
-          return Response.json({ query, valid: /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._-]*$/.test(query), taken: false, available: true, owners: [], latest: null, conflicts: [], suggestions: [{ name: "@me/my-lib", available: true, taken: false }] });
+          // npm-down: the registry could not ask npm, so the name is neither taken nor free
+          const down = query === "npm-down";
+
+          return Response.json({ query, valid: /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._-]*$/.test(query), taken: false, unknown: down, available: !down, owners: [], latest: null, conflicts: [], suggestions: [{ name: "@me/my-lib", available: true, taken: false }] });
         }
 
         if (path === "/-/apm/v1/resolve") {
@@ -274,6 +277,62 @@ describe("apm's messages for first-time users", () => {
     expect(upper.code).toBe(0);
     expect(upper.text).toContain("✗ @me/My-Lib is not a valid name for a new package: npm names are lowercase. Try @me/my-lib: apm name @me/my-lib");
     expect(upper.text).not.toContain("is available");
+  });
+
+  // HOME-564 item 6: apm name --json said "available": true for a bare name and another account's scope
+  test("apm name --json is available only when the line it would print says so, with the reason when not", async () => {
+    const cwd = folder("name-json");
+    const NameJson = z.object({ ok: z.boolean(), query: z.string(), taken: z.boolean(), available: z.boolean(), reason: z.string().nullable() });
+    const json = async (name: string, opts: { token?: boolean; registry?: string } = {}): Promise<z.infer<typeof NameJson>> => NameJson.parse(JSON.parse((await apm(["name", name, "--json"], { cwd, ...opts })).out));
+    const open = `${server.url.toString()}open/`;
+
+    expect(await json("my-lib")).toMatchObject({ ok: true, query: "my-lib", taken: false, available: false, reason: expect.stringContaining("this registry does not hand out bare names") });
+    expect(await json("@other/my-lib")).toMatchObject({ available: false, reason: expect.stringContaining("only the owner of @other can publish there") });
+
+    expect(await json("@other/my-lib", { token: true })).toMatchObject({ available: false });
+    expect(await json("@me/my-lib", { token: true })).toMatchObject({ available: true, reason: null });
+    expect(await json("open-lib", { registry: open })).toMatchObject({ available: true, reason: null });
+    expect(await json("@me/My-Lib", { token: true })).toMatchObject({ available: false, query: "@me/my-lib" });
+
+    // npm did not answer: a reason, not "free but not available:" with nothing after it
+    const down = await apm(["name", "npm-down"], { cwd });
+    expect(down.text).toContain("! apm could not ask npm whether npm-down is free, so it cannot say whether you may publish it. Try again shortly");
+    expect(await json("npm-down")).toMatchObject({ available: false, reason: expect.stringContaining("apm could not ask npm whether npm-down is free") });
+  });
+
+  test("apm publish --dry-run says every field package.json gets wrong, before packing anything", async () => {
+    const cwd = folder("dry-fields", { "package.json": JSON.stringify({ name: "@me/My-Lib", version: "1.0", private: true }), "index.js": "module.exports = 1;\n" });
+    const r = await apm(["publish", "--dry-run", "--pm", "npm"], { cwd });
+
+    expect(r.code).toBe(1);
+    expect(r.text).toContain('✗ package.json has "private": true, so package managers refuse to publish it.');
+    expect(r.text).toContain("✗ @me/My-Lib is not a valid name for a new package: npm names are lowercase. Use @me/my-lib.");
+    expect(r.text).toContain('✗ "1.0" is not a version apm accepts: apm takes strict semver only (1.2.3, 1.2.3-beta.1).');
+    expect(r.text).toContain("dry run: nothing packed or uploaded, and this publish would be refused");
+    // the stand-in npm fails at once: no pack ran
+    expect(r.text).not.toContain("pack failed");
+
+    // fields that are missing or not strings get their own ✗, not a schema error, with --bump too
+    const loose = folder("dry-loose", { "package.json": JSON.stringify({ version: 1, private: true }) });
+    const bumped = await apm(["publish", "--dry-run", "--bump", "patch", "--pm", "npm", "--json"], { cwd: loose });
+    expect(bumped.code).toBe(1);
+    expect(JSON.parse(bumped.out)).toMatchObject({ ok: false, status: "dry-run", refused: [expect.stringContaining('"private": true'), expect.stringContaining('no "name" string'), expect.stringContaining('no "version" string')] });
+
+    // yarn projects upload through npm, which drops build metadata from the version it sends
+    const build = folder("dry-build", { "package.json": JSON.stringify({ name: "@me/lib", version: "1.2.3-rc.1+ci.7" }), "yarn.lock": "" });
+    const yarn = await apm(["publish", "--dry-run", "--pm", "yarn"], { cwd: build });
+    expect(yarn.code).toBe(1);
+    expect(yarn.text).toContain("✗ npm uploads 1.2.3-rc.1+ci.7 as 1.2.3-rc.1, without its build metadata");
+
+    // --bump replaces the version, build metadata and all: only the bumped one is checked against npm's upload
+    const bumpedBuild = folder("dry-build-bump", { "package.json": JSON.stringify({ name: "@me/lib", version: "1.2.3+ci.7" }) });
+    const bumpedRun = await apm(["publish", "--dry-run", "--bump", "patch", "--pm", "npm"], { cwd: bumpedBuild });
+    expect(bumpedRun.text).not.toContain("without its build metadata");
+    expect(bumpedRun.text).not.toContain("nothing packed or uploaded");
+
+    // a written version bump can still read (its x.y.z) is replaced, not refused
+    const leadingZero = folder("dry-bump-replaces", { "package.json": JSON.stringify({ name: "@me/lib", version: "1.2.3-beta.01" }) });
+    expect((await apm(["publish", "--dry-run", "--bump", "patch", "--pm", "npm"], { cwd: leadingZero })).text).not.toContain("is not a version apm accepts");
   });
 
   test("C10: a known malicious version leads with the refusal, not its grade", async () => {

@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSyn
 import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join, relative } from "node:path";
 import { z } from "zod";
-import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isValidPackageName, missingEntries, readTarball, SCORE_FLOOR, type FileLike } from "@apm/core";
+import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isScoped, isValidPackageName, missingEntries, readTarball, SCORE_FLOOR, type FileLike } from "@apm/core";
 import { Api, ApiError, AuditResponse, NameResponse, RATE_LIMIT_RETRY, ResolveFail, ResolveOk, ResolvePending, ScoreResponse, Tree, encodeName, parseSpec, tagsWithoutLatest, type Capability, type DistTag, type InstallWarning, type Report } from "./api.ts";
 import { installedPackages, isValidRange, type Found, type Installed } from "./audit.ts";
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
@@ -23,6 +23,7 @@ import { pnpmConfigRefusal, pnpmConfigRefused, projectLayout, withMemberNames, t
 import { applyChecked, computedFiles, copyProject, restoreCommands, targets, type Backup, type Computed, type Copy } from "./lockfirst.ts";
 import { makeTemp, removeTemp } from "./sandbox.ts";
 import { CLI_VERSION } from "./version.ts";
+import { manifestChecks, registryChecks, VALID_NAME_RULE, type BuildMetadata, type Existing, type PublishCheck, type RegistryView } from "./publish-checks.ts";
 import { argsError, bareInstallArgs, commandOf, helpTopic } from "./commands.ts";
 
 function flag(a: Args, k: string): string | null {
@@ -2276,6 +2277,60 @@ async function namePolicy(api: Api): Promise<"scoped" | "open" | null> {
   }
 }
 
+/** The login of this registry's token, or null when there is none or apm could not read it. */
+async function currentLogin(api: Api, cfg: Config): Promise<string | null> {
+  if (!cfg.token) return null;
+
+  try {
+    const me = await api.raw("-/whoami");
+    // the username becomes a scope apm prints and suggests: only one in a scope's alphabet counts
+    const who = z.object({ username: z.string().regex(/^[a-z0-9][a-z0-9._~-]*$/i) }).safeParse(me.body);
+
+    return me.status === 200 && who.success ? who.data.username : null;
+  } catch {
+    return null;
+  }
+}
+
+type NameVerdict = { mark: "✓" | "✗" | "!"; text: string };
+
+/** What apm name says about a name: available (✓) only when the person asking could publish it here. */
+async function nameVerdict(input: { q: string; r: z.infer<typeof NameResponse>; user: string; api: Api }): Promise<NameVerdict> {
+  const { q, r, user, api } = input;
+  const scope = /^@([^/]+)\//.exec(r.query)?.[1] ?? null;
+  const base = r.query.slice(scope === null ? 0 : scope.length + 2);
+  const yours = user === "" ? "@<your account name>" : `@${user.toLowerCase()}`;
+
+  // the registry reads the name lowercased; a new package's name must be lowercase as typed
+  if (r.valid && q.trim() !== r.query) return { mark: "✗", text: `${q.trim()} is not a valid name for a new package: npm names are lowercase. Try ${r.query}: apm name ${r.query}` };
+
+  if (!r.valid) return { mark: "✗", text: `${r.query} is not a valid package name: ${VALID_NAME_RULE}` };
+
+  if (r.taken) return { mark: "✗", text: `${r.query} is taken${r.owners.length ? ` (by ${r.owners.join(", ")})` : ""}${r.latest ? `, latest ${r.latest.version}${r.latest.score !== null ? `, score ${r.latest.score}/100` : ""}` : ""}` };
+
+  if (r.unknown) return { mark: "!", text: `apm could not ask npm whether ${r.query} is free, so it cannot say whether you may publish it. Try again shortly` };
+
+  if (!r.available) return { mark: "!", text: `${r.query} is free but not available: ${r.conflicts.map((c) => c.reason).join("; ")}` };
+
+  if (scope !== null && scope === user.toLowerCase()) return { mark: "✓", text: `${r.query} is available` };
+  // a scope is its owner's under every policy (newNameRuleRefusal); a bare name depends on the registry's rules for new
+  // names: "scoped" (production) takes one only under its publisher's account name, and rules apm could not read are
+  // said so, never called available
+  const policy = scope === null ? await namePolicy(api) : null;
+  const mine = r.suggestions.find((s) => s.name === `${yours}/${base}`);
+  const instead = user === "" ? `use ${yours}/${base} (log in with ${LOGIN_HINT}, then apm name to check it)` : mine?.available === true ? `${yours}/${base} is free` : `check ${yours}/${base}: apm name ${yours}/${base}`;
+
+  if (scope === null && policy === "open") return { mark: "✓", text: `${r.query} is available` };
+
+  if (scope === null && policy === null) return { mark: "!", text: `${r.query} is free, but apm could not read this registry's rules for new names, so it cannot say whether you may publish it (apm's own registry takes a new package only under your GitHub login)` };
+
+  if (scope === null) return { mark: "!", text: `${r.query} is free but not available: this registry does not hand out bare names, so a new package goes under your account name (on apm's own registry, your GitHub login). Instead, ${instead}` };
+
+  if (user === "") return { mark: "!", text: `${r.query} is free, but only the owner of @${scope} can publish there. Log in (${LOGIN_HINT}), then ask again to see whether that is you` };
+
+  return { mark: "!", text: `${r.query} is free but not available to you: only the owner of @${scope} can publish there. Yours is ${yours}; instead, ${instead}` };
+}
+
 async function cmdName(a: Args): Promise<number> {
   const q = a.positional[0];
   if (!q) {
@@ -2285,47 +2340,19 @@ async function cmdName(a: Args): Promise<number> {
 
   const cfg = config(process.cwd());
   const api = new Api(cfg);
-  let user = "";
-  if (cfg.token) {
-    const me = await api.raw("-/whoami");
-    // the username becomes a scope apm prints and suggests: only one in a scope's alphabet counts
-    const who = z.object({ username: z.string().regex(/^[a-z0-9][a-z0-9._~-]*$/i) }).safeParse(me.body);
-    if (me.status === 200 && who.success) user = who.data.username;
-  }
+  const user = (await currentLogin(api, cfg)) ?? "";
   const r = await api.get(`-/apm/v1/names?q=${encodeURIComponent(q)}${user ? `&user=${encodeURIComponent(user)}` : ""}`, NameResponse);
+  const verdict = await nameVerdict({ q, r, user, api });
 
   if (jsonMode) {
-    emit({ ok: true, ...r });
-    return 0;
-  }
-  const scope = /^@([^/]+)\//.exec(r.query)?.[1] ?? null;
-  const base = r.query.slice(scope === null ? 0 : scope.length + 2);
-  const yours = user === "" ? "@<your account name>" : `@${user.toLowerCase()}`;
-
-  // the registry reads the name lowercased; a new package's name must be lowercase as typed
-  if (r.valid && q.trim() !== r.query) {
-    say(red(`✗ ${q.trim()} is not a valid name for a new package: npm names are lowercase. Try ${r.query}: apm name ${r.query}`));
-
+    // `available` is apm name's answer, the same as the line it prints: true only when you could publish the name here
+    emit({ ok: true, ...r, available: verdict.mark === "✓", reason: verdict.mark === "✓" ? null : verdict.text });
     return 0;
   }
 
-  if (!r.valid) say(red(`✗ ${r.query} is not a valid package name: a name is lowercase letters, digits and - . _ (and ~ in a scope), starts with a letter or digit, is at most 214 characters, and has at most one scope, as @scope/name`));
-  else if (r.taken) say(`${red("✗")} ${bold(r.query)} is taken${r.owners.length ? ` (by ${r.owners.join(", ")})` : ""}${r.latest ? `, latest ${r.latest.version}${r.latest.score !== null ? `, score ${r.latest.score}/100` : ""}` : ""}`);
-  else if (r.available && (scope === null || scope !== user.toLowerCase())) {
-    // a scope is its owner's under every policy (access.ts newNameRefusal); a bare name depends on the registry's rules
-    // for new names: "scoped" (production) takes one only under its publisher's account name, and rules apm could not
-    // read are said so, never called available
-    const policy = scope === null ? await namePolicy(api) : null;
-    const mine = r.suggestions.find((s) => s.name === `${yours}/${base}`);
-    const instead = user === "" ? `use ${yours}/${base} (log in with ${LOGIN_HINT}, then apm name to check it)` : mine?.available === true ? `${yours}/${base} is free` : `check ${yours}/${base}: apm name ${yours}/${base}`;
+  say(`${verdict.mark === "✓" ? green("✓") : verdict.mark === "✗" ? red("✗") : yellow("!")} ${verdict.text}`);
 
-    if (scope === null && policy === "open") say(`${green("✓")} ${bold(r.query)} is available`);
-    else if (scope === null && policy === null) say(`${yellow("!")} ${bold(r.query)} is free, but apm could not read this registry's rules for new names, so it cannot say whether you may publish it (apm's own registry takes a new package only under your GitHub login)`);
-    else if (scope === null) say(`${yellow("!")} ${bold(r.query)} is free but not available: this registry does not hand out bare names, so a new package goes under your account name (on apm's own registry, your GitHub login). Instead, ${instead}`);
-    else if (user === "") say(`${yellow("!")} ${bold(r.query)} is free, but only the owner of @${scope} can publish there. Log in (${LOGIN_HINT}), then ask again to see whether that is you`);
-    else say(`${yellow("!")} ${bold(r.query)} is free but not available to you: only the owner of @${scope} can publish there. Yours is ${yours}; instead, ${instead}`);
-  } else if (r.available) say(`${green("✓")} ${bold(r.query)} is available`);
-  else say(`${yellow("!")} ${bold(r.query)} is free but not available: ${r.conflicts.map((c) => c.reason).join("; ")}`);
+  if (r.valid && q.trim() !== r.query) return 0;
   for (const s of r.similar ?? []) say(dim(`  similar: ${s.reason}`));
   const alts = r.suggestions.filter((s) => s.available).slice(0, 4);
   if (alts.length) say(dim(`  available alternatives: ${alts.map((s) => s.name).join(", ")}`));
@@ -2619,6 +2646,66 @@ function fmtSize(n: number): string {
 
 const Manifest = z.object({ name: z.string(), version: z.string(), files: z.array(z.string()).optional(), publishConfig: z.object({ registry: z.string().optional() }).loose().optional() }).loose();
 const Published = z.object({ versions: z.record(z.string(), z.object({ version: z.string() }).loose()) }).loose();
+const NameExact = z.object({ taken: z.boolean(), source: z.enum(["local", "upstream"]).nullable(), unknown: z.boolean(), owners: z.array(z.string()) }).loose();
+const PackageVersions = z.object({ source: z.literal("local"), versions: z.array(z.object({ version: z.string() }).loose()) }).loose();
+const PublishFieldsOf = z.object({ name: z.unknown().optional(), version: z.unknown().optional(), private: z.unknown().optional() }).loose();
+
+/** How many versions the package route lists, newest first (apm.ts PAGE_VERSIONS): a list this long may leave some out. */
+const PACKAGE_ROUTE_VERSIONS = 200;
+
+/**
+ * What is already under `name`, by the name check's exact part (here or on npm, and its owners here). For a package
+ * published here, every version it stores, yanked and revoked ones included, from the package route (read only for a
+ * package published here, where it queues nothing); that route lists the newest PACKAGE_ROUTE_VERSIONS.
+ */
+async function existingPackage(api: Api, name: string): Promise<Existing> {
+  try {
+    const exact = await api.raw(`-/apm/v1/names?q=${encodeURIComponent(name)}&part=exact`);
+    const found = NameExact.safeParse(exact.body);
+
+    if (exact.status !== 200 || !found.success || found.data.unknown) return { kind: "unknown" };
+
+    if (!found.data.taken) return { kind: "missing" };
+
+    if (found.data.source !== "local") return { kind: "npm" };
+    const page = await api.raw(`-/apm/v1/packages/${encodeName(name)}`);
+    const listed = PackageVersions.safeParse(page.body);
+
+    if (page.status !== 200 || !listed.success) return { kind: "unknown" };
+
+    return { kind: "local", owners: found.data.owners, versions: listed.data.versions.map((v) => v.version), complete: listed.data.versions.length < PACKAGE_ROUTE_VERSIONS };
+  } catch {
+    return { kind: "unknown" };
+  }
+}
+
+/**
+ * What registryChecks needs from the registry: the token's login, its rule for new names (bare names only) and the
+ * package. The name check reads only names without a `~` in the package part, so for the rest what exists is unknown.
+ */
+async function registryView(cfg: Config, target: { name: string; version: string }): Promise<RegistryView> {
+  const api = new Api(cfg);
+
+  const [user, policy, existing] = await Promise.all([
+    currentLogin(api, cfg),
+    isScoped(target.name) ? null : namePolicy(api),
+    isValidPackageName(target.name) ? existingPackage(api, target.name) : ({ kind: "unknown" } satisfies Existing),
+  ]);
+
+  return { user, policy, existing };
+}
+
+/** Prints a dry run's findings, refusals first; returns their reasons for the --json result. */
+function sayChecks(checks: readonly PublishCheck[]) {
+  const refused = checks.flatMap((c) => (c.kind === "refused" ? [c.reason] : []));
+  const unconfirmed = checks.flatMap((c) => (c.kind === "unconfirmed" ? [c.reason] : []));
+
+  for (const r of refused) say(red(`✗ ${r}`));
+
+  for (const u of unconfirmed) say(yellow(`! ${u}`));
+
+  return { refused, unconfirmed };
+}
 
 async function cmdPublish(a: Args): Promise<number> {
   const cwd = process.cwd();
@@ -2630,7 +2717,31 @@ async function cmdPublish(a: Args): Promise<number> {
 
   const cfg = config(cwd);
   const det = pmFor(a, cwd);
-  const pj = Manifest.parse(JSON.parse(readFileSync(pjPath, "utf8")));
+  const parsed: unknown = JSON.parse(readFileSync(pjPath, "utf8"));
+  const bumpKind = flag(a, "bump");
+  const dry = has(a, "dry-run");
+  // npm uploads for npm and yarn projects (publishArgs), and npm sends a version without its build metadata
+  const build: BuildMetadata = publishArgs(det.pm, "", null)[0] === "npm" ? "dropped" : "unknown";
+
+  // a dry run says everything package.json alone gets wrong before anything is packed; a real publish parses as before
+  if (dry) {
+    const fields = PublishFieldsOf.safeParse(parsed);
+    const raw = fields.success ? fields.data : { name: undefined, version: undefined, private: undefined };
+    // with --bump the upload carries the bumped version (bump reads only the written one's x.y.z), so only it is checked
+    const written = z.string().regex(/^\d+\.\d+\.\d+/).safeParse(raw.version);
+    const verdict = manifestChecks({ name: raw.name, version: bumpKind && written.success ? bump(written.data, bumpKind) : raw.version, private: raw.private, build });
+
+    if (verdict.kind === "refused") {
+      const found = sayChecks(verdict.checks);
+
+      fail("dry run: nothing packed or uploaded, and this publish would be refused: fix each ✗ above first.");
+      emit({ ok: false, status: "dry-run", ...found, registry: cfg.registry });
+
+      return 1;
+    }
+  }
+
+  const pj = Manifest.parse(parsed);
   // The upload goes to the registry apm checks and previews for, or nowhere: publishConfig and scoped
   // registry lines in .npmrc or bunfig would otherwise send it elsewhere (npm's public registry, say).
   const scopes = scopesOf([pj.name]);
@@ -2644,8 +2755,6 @@ async function cmdPublish(a: Args): Promise<number> {
   }
 
   if (refuseOverrides(scopeOverrides({ cwd, env: env(), registry: cfg.registry, scopes }), cfg.registry, "publish")) return 1;
-  const bumpKind = flag(a, "bump");
-  const dry = has(a, "dry-run");
   const version = bumpKind ? bump(pj.version, bumpKind) : pj.version;
   const id = `${pj.name}@${version}`;
 
@@ -2731,8 +2840,20 @@ async function cmdPublish(a: Args): Promise<number> {
 
   const summary = { name: pj.name, version, registry: cfg.registry, files: files.length, score: report.score, grade: report.grade };
   if (dry) {
+    // the upload carries the packed package.json: a pack script may have changed what package.json said
+    const verdict = manifestChecks({ name: manifest.name, version: manifest.version, private: manifest.private, build });
+    const found = sayChecks(verdict.kind === "ok" ? [...verdict.checks, ...registryChecks({ name: verdict.name, version: verdict.version, view: await registryView(cfg, verdict) })] : verdict.checks);
+    const result = verdict.kind === "ok" ? { ...summary, name: verdict.name, version: verdict.version } : summary;
+
+    if (found.refused.length > 0) {
+      fail(`dry run: nothing uploaded, and publishing ${result.name}@${result.version} would be refused: fix each ✗ above first.`);
+      emit({ ok: false, status: "dry-run", ...found, ...result });
+
+      return 1;
+    }
+
     say(dim(`dry run: nothing uploaded (it would go to ${cfg.registry})`));
-    emit({ ok: true, status: "dry-run", ...summary });
+    emit({ ok: true, status: "dry-run", ...found, ...result });
     return 0;
   }
   const tag = flag(a, "tag") ?? (version.includes("-") ? "next" : null);
