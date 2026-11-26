@@ -16,7 +16,7 @@ describe("packagePrompt", () => {
 
     expect(p).toContain("   - install:");
     expect(p).toContain("   - review-first:");
-    expect(p).toContain("   - do-not-install, not-found, or unknown after those retries: do not install.");
+    expect(p).toContain("   - do-not-install, not-found, an unknown that says asking again will not help, or unknown after those retries: do not install.");
   });
 
   // review of af366cc: a review-first package must wait for the person, not be shown and installed in one go
@@ -30,7 +30,7 @@ describe("packagePrompt", () => {
     expect(p).toContain("an MCP result marked as an error still carries the verdict: read it");
     // a cold version is usually scored within about 5 minutes: spaced retries before handing back, none for one that never will be
     expect(p).toContain("unless it says asking again will not help, ask again about 1, 2 and 4 minutes after the first ask");
-    expect(p).toContain("unknown after those retries: do not install.");
+    expect(p).toContain("an unknown that says asking again will not help, or unknown after those retries: do not install. Tell me why.");
   });
 
   // the apm CLI is not on a registry yet, so a prompt that needs it stops nearly every agent at "ask me"

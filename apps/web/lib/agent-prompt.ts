@@ -44,7 +44,7 @@ export function packagePrompt({ name, version = null }: { name: string; version?
 2. Follow it:
    - install: run the verdict's command for this project's package manager, without asking me first.
    - review-first: show me the summary and reasons, wait for my approval, then run that command.
-   - do-not-install, not-found, or unknown after those retries: do not install. Tell me why. For not-found, check the spelling: a near miss can be a typosquat.
+   - do-not-install, not-found, an unknown that says asking again will not help, or unknown after those retries: do not install. Tell me why. For not-found, check the spelling: a near miss can be a typosquat.
    If an install or review-first verdict has no command for this project's package manager, stop and tell me. Do not write your own command or switch package managers.
 3. Tell me the version you installed, the verdict's summary and its notes, if any.
 
