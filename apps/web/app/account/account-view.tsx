@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import QRCode from "qrcode";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { z } from "zod";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -407,6 +407,9 @@ function day(iso: string): string {
 /** Confirms removing one passkey with a fresh factor made for exactly that removal; the passkey itself can answer. */
 function RemovePasskey({ account, config, passkey, onCancel, onDone }: { account: Account; config: AuthConfig; passkey: PasskeyItem; onCancel: () => void; onDone: (note: string) => void }) {
   const last = account.passkeys.length === 1;
+  // "Keep it" during the factor check stops the removal before it is sent; once it is sent, it can't be kept
+  const [phase, setPhase] = useState<"confirming" | "removing">("confirming");
+  const kept = useRef(false);
 
   return (
     <div className="flex flex-col gap-3 rounded-xl bg-surface p-4">
@@ -424,20 +427,34 @@ function RemovePasskey({ account, config, passkey, onCancel, onDone }: { account
         run={async (proof) => {
           if (proof.kind === "recovery") return "Use a code from your app or your passkey for this.";
 
+          if (kept.current) return null;
+
+          setPhase("removing");
           const r = await call("account/passkeys/remove", z.object({ ok: z.boolean() }), {
             method: "POST",
             body: { id: passkey.id, ...(proof.kind === "totp" ? { code: proof.code } : { confirmation: proof.id }) },
           });
 
-          if (r.kind === "signed-out") return "Sign in again.";
+          if (r.kind !== "ok") {
+            setPhase("confirming");
 
-          if (r.kind === "error") return r.message;
+            return r.kind === "error" ? r.message : "Sign in again.";
+          }
+
           onDone(`Passkey removed. Delete it from ${passkey.provider ?? "your password manager or device"} too, or it will keep offering it here.`);
 
           return null;
         }}
       />
-      <Button variant="ghost" className="-ml-2.5 self-start text-muted-foreground" onClick={onCancel}>
+      <Button
+        variant="ghost"
+        className="-ml-2.5 self-start text-muted-foreground"
+        disabled={phase === "removing"}
+        onClick={() => {
+          kept.current = true;
+          onCancel();
+        }}
+      >
         Keep it
       </Button>
     </div>
@@ -449,7 +466,7 @@ export function PasskeyList({ account, config, onDone }: { account: Account; con
   const [removing, setRemoving] = useState<string | null>(null);
 
   if (account.passkeys.length === 0) return null;
-  const removable = canRemovePasskey(account);
+  const removable = canRemovePasskey(account, config);
 
   return (
     <div className="flex flex-col gap-2">

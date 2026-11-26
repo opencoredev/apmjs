@@ -131,20 +131,36 @@ describe("removing a passkey", () => {
     expect(await reg.query(`SELECT count(*)::int AS n FROM passkey_uses WHERE passkey_id = $1`, [secondId])).toEqual([{ n: 0 }]);
   });
 
-  test("keeps the last passkey of an account with nothing else to sign in with, and removes it once GitHub is linked", async () => {
+  test("keeps the last passkey when the only linked account is a provider this deploy does not sign in with, and removes it once GitHub signs in again", async () => {
     const theirs = await idOf(othersKey);
-    const linked = await reg.query(`SELECT a.* FROM account a JOIN users u ON u.auth_user_id = a."userId" WHERE u.name = 'octo-other'`);
+    const setProvider = (provider: string) => reg.query(`UPDATE account a SET "providerId" = $1 FROM users u WHERE u.auth_user_id = a."userId" AND u.name = 'octo-other'`, [provider]);
 
-    await reg.query(`DELETE FROM account a USING users u WHERE u.auth_user_id = a."userId" AND u.name = 'octo-other'`);
+    // this registry has GitHub on and Vercel off: a Vercel link is no way in
+    await setProvider("vercel");
     const refused = await remove(other, { id: theirs, confirmation: await confirmRemoval(other, theirs, othersKey) });
 
     expect(refused.status).toBe(409);
     expect(JSON.stringify(refused.body)).toContain("only way to sign in");
     expect((await listed(other)).security.passkeys).toBe(1);
 
-    expect(linked.length).toBe(1);
-    await reg.query(`INSERT INTO account SELECT * FROM json_populate_record(NULL::account, $1::json)`, [JSON.stringify(linked[0])]);
+    await setProvider("github");
     expect((await remove(other, { id: theirs, confirmation: await confirmRemoval(other, theirs, othersKey) })).status).toBe(200);
     expect((await listed(other)).security.passkeys).toBe(0);
+  });
+
+  test("two removals at once never take an account's last way in", async () => {
+    const solo = await signInWithGitHub(reg, gh, "octo-solo");
+
+    await solo.json("-/apm/v1/account");
+    const keys = [await addSoftPasskey(reg, "octo-solo"), await addSoftPasskey(reg, "octo-solo")];
+    const ids = await Promise.all(keys.map((k) => idOf(k)));
+    // confirm both while GitHub still answers the session, then leave the account nothing but its passkeys
+    const confirmations = await Promise.all(keys.map((k, i) => confirmRemoval(solo, ids[i] ?? "", k)));
+
+    await reg.query(`DELETE FROM account a USING users u WHERE u.auth_user_id = a."userId" AND u.name = 'octo-solo'`);
+    const results = await Promise.all(ids.map((id, i) => remove(solo, { id, confirmation: confirmations[i] ?? "" })));
+
+    expect(results.map((r) => r.status).toSorted()).toEqual([200, 409]);
+    expect((await listed(solo)).security.passkeys).toBe(1);
   });
 });

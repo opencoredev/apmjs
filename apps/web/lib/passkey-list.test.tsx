@@ -63,9 +63,11 @@ describe("the list", () => {
   });
 
   test("an account's last way in cannot be removed: one passkey and nothing linked", () => {
-    expect(canRemovePasskey(account([onePassword], github))).toBe(true);
-    expect(canRemovePasskey(account([onePassword, chrome], []))).toBe(true);
-    expect(canRemovePasskey(account([onePassword], []))).toBe(false);
+    expect(canRemovePasskey(account([onePassword], github), config)).toBe(true);
+    expect(canRemovePasskey(account([onePassword, chrome], []), config)).toBe(true);
+    expect(canRemovePasskey(account([onePassword], []), config)).toBe(false);
+    // a linked provider this site no longer signs in with is no way in
+    expect(canRemovePasskey(account([onePassword], [{ provider: "vercel", accountId: "2" }]), config)).toBe(false);
     const html = renderToStaticMarkup(<PasskeyList account={account([onePassword], [])} config={config} onDone={() => {}} />);
 
     expect(html).toMatch(/ disabled=""/);

@@ -1,6 +1,6 @@
 // Postgres storage for the registry (Neon through Hyperdrive in production). Rows are parsed into domain
 // types here, at the storage boundary. Every method is an Effect that fails with StoreError.
-import { Context, Effect, Layer } from "effect";
+import { Context, Duration, Effect, Layer } from "effect";
 import type { SqlError } from "effect/sql/SqlError";
 import * as SqlClient from "effect/sql/SqlClient";
 import { PgClient } from "@effect/sql-pg";
@@ -412,8 +412,14 @@ const PasskeyListRow = z.object({ id: z.string(), name: z.string().nullable(), a
 /** One of an account's passkeys as the account page lists it: no key material. Times are epoch ms; null when unknown. */
 export type PasskeySummary = { id: string; name: string | null; aaguid: string | null; createdAt: number | null; lastUsedAt: number | null };
 
-/** How removing a passkey ended: `last-way-in` when it is the account's only passkey and no GitHub or Vercel is linked. */
+/** How removing a passkey ended: `last-way-in` when it is the account's only passkey and no enabled provider is linked. */
 export type PasskeyRemoval = "removed" | "missing" | "last-way-in";
+
+/** The OAuth providers an account can sign in with, when the deploy has them on. */
+export type SignInProvider = "github" | "vercel";
+
+/** How long recording a passkey's last use may hold up the sign-in or check it belongs to. */
+export const PASSKEY_USE_WAIT_MS = 500;
 
 /** Faults a test can switch on for one request (worker-test.ts); the deployed Worker never passes any. */
 export type StoreFault = "event-insert";
@@ -834,10 +840,16 @@ export type StoreApi = {
   readonly setPasskeyCounter: (input: { id: string; counter: number }) => Effect.Effect<void, StoreError>;
   /** The account's passkeys for the account page, oldest first: the same rows authFactors counts. */
   readonly passkeyList: (authUserId: string) => Effect.Effect<PasskeySummary[], StoreError>;
-  /** Records that the account's passkey `credentialID` answered at `at` (a sign-in or a factor check). */
-  readonly notePasskeyUse: (input: { authUserId: string; credentialID: string; at: number }) => Effect.Effect<void, StoreError>;
-  /** Deletes the account's passkey `id`, unless it is the account's last way to sign in. */
-  readonly removePasskey: (input: { authUserId: string; id: string }) => Effect.Effect<PasskeyRemoval, StoreError>;
+  /**
+   * Records that the account's passkey `credentialID` answered at `at` (a sign-in or a factor check). Display only, so
+   * best effort: it gives up after PASSKEY_USE_WAIT_MS and never fails the sign-in or check that called it.
+   */
+  readonly notePasskeyUse: (input: { authUserId: string; credentialID: string; at: number }) => Effect.Effect<void>;
+  /**
+   * Deletes the account's passkey `id`, unless it is the account's last way to sign in: its only passkey, with no linked
+   * account of a provider in `providers` (the ones this deploy signs in with).
+   */
+  readonly removePasskey: (input: { authUserId: string; id: string; providers: readonly SignInProvider[] }) => Effect.Effect<PasskeyRemoval, StoreError>;
   /** A factor check made for one action from one session: what that action spends. */
   readonly issueConfirmation: (input: {
     sessionToken: string;
@@ -2159,7 +2171,7 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
             SELECT id, ${input.at} FROM passkey WHERE "credentialID" = ${input.credentialID} AND "userId" = ${input.authUserId}
             ON CONFLICT (passkey_id) DO UPDATE SET last_used_at = GREATEST(passkey_uses.last_used_at, EXCLUDED.last_used_at)`,
         none,
-      ),
+      ).pipe(Effect.timeoutOption(Duration.millis(PASSKEY_USE_WAIT_MS)), Effect.ignore),
     removePasskey: (input) =>
       guard.transaction(
         "removePasskey",
@@ -2172,7 +2184,7 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
               "removePasskey: ways in",
               sql`SELECT EXISTS (SELECT 1 FROM passkey WHERE id = ${input.id} AND "userId" = ${input.authUserId}) AS mine,
                          (SELECT count(*) FROM passkey WHERE "userId" = ${input.authUserId}) AS passkeys,
-                         (SELECT count(*) FROM account WHERE "userId" = ${input.authUserId}) AS linked`,
+                         (SELECT count(*) FROM account WHERE "userId" = ${input.authUserId} AND "providerId" = ANY(${[...input.providers]})) AS linked`,
               z.tuple([z.object({ mine: z.boolean(), passkeys: Int, linked: Int })]).transform(([row]) => row),
             );
 

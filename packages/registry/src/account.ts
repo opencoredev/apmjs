@@ -10,7 +10,7 @@ import { Auth, PasskeyAssertion, type ConfirmFactor } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
-import { Store, type StagedRecord, type User } from "./db.ts";
+import { Store, type SignInProvider, type StagedRecord, type User } from "./db.ts";
 import { refuse } from "./errors.ts";
 import { fail, json, parseOptionalBody } from "./http.ts";
 import { WORKER_MAX_UNPACKED_BYTES } from "./analysis.ts";
@@ -55,6 +55,8 @@ function confirmFactor(body: z.infer<typeof ConfirmBody>): { kind: "ok"; factor:
 }
 
 const now = Effect.flatMap(Clock, (c) => c.now);
+
+const SIGN_IN_PROVIDERS = ["github", "vercel"] as const satisfies readonly SignInProvider[];
 
 /** File contents the approval page shows, at most. */
 const MAX_FILE_TEXT = 512 * 1024;
@@ -326,13 +328,14 @@ export const accountRoute = (req: Request, url: URL) =>
     }
 
     // Removing a passkey takes a fresh factor made to remove exactly that one (it may be the passkey itself), and never
-    // the account's last way in: an account with no GitHub or Vercel linked keeps its last passkey.
+    // the account's last way in: an account with no linked provider this deploy signs in with keeps its last passkey.
     if (rest === "account/passkeys/remove" && req.method === "POST") {
       yield* requireSiteOrigin(req);
       const who = yield* signedIn(req);
       const body = yield* parseOptionalBody(req, RemovePasskeyBody);
       yield* secondFactor({ session: who.s, body, action: { kind: "passkey-remove", id: body.id } });
-      const removal = yield* store.removePasskey({ authUserId: who.s.authUserId, id: body.id });
+      const { providers } = yield* Auth;
+      const removal = yield* store.removePasskey({ authUserId: who.s.authUserId, id: body.id, providers: SIGN_IN_PROVIDERS.filter((p) => providers[p]) });
 
       switch (removal) {
         case "removed":

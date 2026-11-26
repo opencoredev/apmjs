@@ -232,9 +232,9 @@ export function passkeySubtitle(p: PasskeyItem): string | null {
   return p.name;
 }
 
-/** Whether removing one passkey leaves a way in: GitHub or Vercel is linked, or another passkey stays. */
-export function canRemovePasskey(a: Account): boolean {
-  return a.linked.length > 0 || a.passkeys.length > 1;
+/** Whether removing one passkey leaves a way in: a provider this site signs in with is linked, or another passkey stays. */
+export function canRemovePasskey(a: Account, config: AuthConfig): boolean {
+  return a.passkeys.length > 1 || a.linked.some((l) => (l.provider === "github" || l.provider === "vercel") && config.providers[l.provider]);
 }
 
 const BROWSERS: readonly (readonly [RegExp, string])[] = [
