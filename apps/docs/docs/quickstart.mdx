@@ -123,7 +123,7 @@ The script, the checksums and the binaries all come from apmjs.dev. The check pr
 
 `--version X` or `APM_VERSION=X` installs another released version: `curl -fsSL https://apmjs.dev/install | sh -s -- --version 0.1.8`. `APM_INSTALL=<dir>` installs to `<dir>/bin/apm`. Windows is not supported yet. On Alpine, apm needs `libstdc++` and `libgcc` (`apk add libstdc++ libgcc`).
 
-apm uses the package manager your project already uses: it reads the lockfile, then the `packageManager` field in `package.json`, then falls back to bun when bun is installed and npm when it is not. Pass `--pm npm` to choose.
+apm uses the package manager your project already uses: it reads the lockfile, then the `packageManager` field in `package.json`, then a `bunfig.toml` (bun). A project with none of them, such as a fresh `npm init -y`, gets npm. Pass `--pm bun` (or `--pm pnpm`) to choose another.
 
 ## 3. Add a package
 
