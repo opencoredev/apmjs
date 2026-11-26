@@ -39,8 +39,6 @@ const YarnRc = z.object({ yarnPath: z.string().optional().catch(undefined) }).lo
 
 const ConfigDependencies = z.record(z.string(), z.unknown()).optional().catch(undefined);
 
-const PnpmConfig = z.object({ configDependencies: ConfigDependencies }).loose();
-
 const PnpmBootDocument = z.object({ importers: z.object({ ".": z.object({ configDependencies: ConfigDependencies }).loose().optional().catch(undefined) }).loose().optional().catch(undefined) }).loose();
 
 function readJson(path: string): z.infer<typeof Manifest> | null {
@@ -164,26 +162,72 @@ function lockfileAt(root: string, pm: Pm): { kind: "ok"; file: string } | { kind
   return { kind: "ok", file: found === null ? LOCKFILES[pm][LOCKFILES[pm].length - 1] ?? "package-lock.json" : relative(root, found) };
 }
 
-/**
- * The config dependencies pnpm installs, and loads the hooks of, before it computes the lockfile: pnpm-workspace.yaml's
- * configDependencies and those pnpm 11+ records in the boot document that opens a two-document pnpm-lock.yaml. apm
- * cannot check them before pnpm runs them.
- */
-function pnpmConfigDependencies(root: string, lockfile: string): string[] {
-  const declared = Object.keys(readYaml(join(root, "pnpm-workspace.yaml"), PnpmConfig)?.configDependencies ?? {});
-  let locked: string[] = [];
+/** The variables pnpm reads its workspace directory from instead of walking up from where it runs. */
+const PNPM_WORKSPACE_DIR_ENV = ["PNPM_CONFIG_WORKSPACE_DIR", "pnpm_config_workspace_dir", "NPM_CONFIG_WORKSPACE_DIR", "npm_config_workspace_dir"];
 
+const PnpmConfigSources = z.object({ configDependencies: ConfigDependencies, include: z.unknown().optional() }).loose();
+
+/** The config dependencies the boot document of a two-document pnpm-lock.yaml in `dir` records (pnpm 11 and later). */
+function bootConfigDependencies(dir: string): string[] {
   try {
-    const docs: unknown = Bun.YAML.parse(readFileSync(join(root, lockfile), "utf8"));
+    const docs: unknown = Bun.YAML.parse(readFileSync(join(dir, "pnpm-lock.yaml"), "utf8"));
     const boot = Array.isArray(docs) && docs.length > 1 ? PnpmBootDocument.safeParse(docs[0]) : null;
 
-    locked = Object.keys(boot?.success === true ? (boot.data.importers?.["."]?.configDependencies ?? {}) : {});
+    return Object.keys(boot?.success === true ? (boot.data.importers?.["."]?.configDependencies ?? {}) : {});
   } catch {
-    locked = [];
+    return [];
+  }
+}
+
+/** Why the pnpm-workspace.yaml in `dir` could make pnpm install config dependencies apm cannot check, or null. */
+function workspaceConfigRefusal(dir: string): string | null {
+  const file = join(dir, "pnpm-workspace.yaml");
+
+  if (!existsSync(file)) return null;
+  let parsed: unknown;
+
+  try {
+    parsed = Bun.YAML.parse(readFileSync(file, "utf8")) ?? {};
+  } catch {
+    return `apm could not read ${file}`;
   }
 
-  return [...new Set([...declared, ...locked])].sort();
+  const m = PnpmConfigSources.safeParse(parsed);
+
+  if (!m.success) return `apm could not read ${file}`;
+
+  if (m.data.include !== undefined) return `${file} includes settings from other files or packages (include), which apm does not read`;
+  const names = Object.keys(m.data.configDependencies ?? {});
+
+  return names.length > 0 ? `${file} declares config dependencies (${names.sort().join(", ")})` : null;
 }
+
+/**
+ * Why pnpm, run at `cwd` with `env`, could install config dependencies and load their hooks before apm checks
+ * anything, or null. pnpm does that before every command, the lockfile-only ones included. apm looks at every folder
+ * from `cwd` up (pnpm stops at the first pnpm-workspace.yaml, apm at none) and refuses a workspace directory set in
+ * the environment, so the workspace pnpm loads is always one apm read.
+ */
+export function pnpmConfigRefusal(input: { cwd: string; env: Readonly<Record<string, string | undefined>> }): string | null {
+  const override = PNPM_WORKSPACE_DIR_ENV.find((key) => (input.env[key] ?? "") !== "");
+
+  if (override !== undefined) return `${override} is set, so pnpm would read a workspace apm did not check; unset it`;
+
+  for (let dir = input.cwd; ; dir = dirname(dir)) {
+    const workspace = workspaceConfigRefusal(dir);
+
+    if (workspace !== null) return workspace;
+    const locked = bootConfigDependencies(dir);
+
+    if (locked.length > 0) return `${join(dir, "pnpm-lock.yaml")} records config dependencies (${locked.sort().join(", ")})`;
+
+    if (dirname(dir) === dir) return null;
+  }
+}
+
+/** The refusal for a pnpm command apm will not run because of `reason` (pnpmConfigRefusal). */
+export const pnpmConfigRefused = (reason: string): string =>
+  `pnpm installs config dependencies and loads their hooks before any command, so apm cannot check them first: ${reason}. Run pnpm yourself for this project`;
 
 /** The project the package manager would install for at `cwd`, and what apm copies to compute its lockfile. */
 export function projectLayout(input: { cwd: string; pm: Pm }): LayoutResult {
@@ -214,14 +258,9 @@ export function projectLayout(input: { cwd: string; pm: Pm }): LayoutResult {
 
   if (lock.kind === "refused") return lock;
 
-  const configDeps = input.pm === "pnpm" ? pnpmConfigDependencies(root, lock.file) : [];
+  const config = input.pm === "pnpm" ? pnpmConfigRefusal({ cwd: project, env: process.env }) : null;
 
-  if (configDeps.length > 0) {
-    return {
-      kind: "refused",
-      reason: `the project has pnpm config dependencies (${configDeps.join(", ")}), which pnpm installs and runs before it computes the lockfile, so apm cannot check them first. Run pnpm yourself for this project, or remove configDependencies from pnpm-workspace.yaml and pnpm-lock.yaml`,
-    };
-  }
+  if (config !== null) return { kind: "refused", reason: pnpmConfigRefused(config) };
 
   const member = relative(root, project).split(sep).join("/");
   const memberDirs = [...new Set([...membersOf(root, patterns), ...(member === "" ? [] : [member])])];

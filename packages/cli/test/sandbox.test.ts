@@ -6,7 +6,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { isOwnTemp, makeTemp, removeTemp, writeAtomic } from "../src/sandbox.ts";
-import { projectLayout, staysInside } from "../src/project.ts";
+import { pnpmConfigRefusal, projectLayout, staysInside } from "../src/project.ts";
 
 let outside: string;
 let scratch: string;
@@ -179,7 +179,30 @@ importers:
     };
 
     expect(kind(project({ "pnpm-lock.yaml": boot("{}") }))).toBe("ok");
-    expect(kind(project({ "pnpm-workspace.yaml": "configDependencies:\n  my-plugin: 1.0.0+sha512-abc\n" }))).toContain("pnpm config dependencies (my-plugin)");
-    expect(kind(project({ "pnpm-lock.yaml": boot("\n      my-plugin:\n        integrity: sha512-abc\n        specifier: 1.0.0\n        version: 1.0.0") }))).toContain("pnpm config dependencies (my-plugin)");
+    expect(kind(project({ "pnpm-workspace.yaml": "configDependencies:\n  my-plugin: 1.0.0+sha512-abc\n" }))).toContain("declares config dependencies (my-plugin)");
+    expect(kind(project({ "pnpm-lock.yaml": boot("\n      my-plugin:\n        integrity: sha512-abc\n        specifier: 1.0.0\n        version: 1.0.0") }))).toContain("records config dependencies (my-plugin)");
+  });
+
+  test("pnpm: the guard reads every folder up, past a .git, and refuses a workspace directory set in the environment or an include", () => {
+    const top = mkdtempSync(join(outside, "pnpm-walk-"));
+    const member = join(top, "nested", "member");
+
+    mkdirSync(join(member, ".git"), { recursive: true });
+    writeFileSync(join(member, "package.json"), "{}");
+    writeFileSync(join(top, "pnpm-workspace.yaml"), "configDependencies:\n  parent-plugin: 1.0.0+sha512-abc\n");
+
+    expect(pnpmConfigRefusal({ cwd: member, env: {} })).toContain("declares config dependencies (parent-plugin)");
+    expect(projectLayout({ cwd: member, pm: "pnpm" }).kind).toBe("refused");
+
+    const clean = mkdtempSync(join(outside, "pnpm-clean-"));
+
+    expect(pnpmConfigRefusal({ cwd: clean, env: {} })).toBeNull();
+    expect(pnpmConfigRefusal({ cwd: clean, env: { npm_config_workspace_dir: top } })).toContain("npm_config_workspace_dir is set");
+
+    writeFileSync(join(clean, "pnpm-workspace.yaml"), "include:\n  ./config/security.yaml: '*'\n");
+    expect(pnpmConfigRefusal({ cwd: clean, env: {} })).toContain("(include)");
+
+    writeFileSync(join(clean, "pnpm-workspace.yaml"), "- not\n- a mapping\n");
+    expect(pnpmConfigRefusal({ cwd: clean, env: {} })).toContain("could not read");
   });
 });

@@ -19,7 +19,7 @@ import { addArgs, detectPm, frozenInstallArgs, installLockOnlyArgs, lockOnlyArgs
 import { checkedCount, checkGraph, DEFAULT_CHECK, idOf, lockGraph, type Blocked, type CheckPolicy, type InstalledPackage, type LocalPackage, type LockGraph, type Member } from "./installed.ts";
 import { pnpmRebuildable, removeInstalled, verifyInstall, type Omitted, type Placed } from "./verify.ts";
 import { devGroup, type DevGroup, omitArgs, releaseOmission } from "./groups.ts";
-import { projectLayout, withMemberNames, type Layout } from "./project.ts";
+import { pnpmConfigRefusal, pnpmConfigRefused, projectLayout, withMemberNames, type Layout } from "./project.ts";
 import { applyChecked, computedFiles, copyProject, restoreCommands, targets, type Backup, type Computed, type Copy } from "./lockfirst.ts";
 import { makeTemp, removeTemp } from "./sandbox.ts";
 import { CLI_VERSION } from "./version.ts";
@@ -2092,6 +2092,14 @@ async function cmdX(a: Args): Promise<number> {
   const dir = makeTemp("x");
 
   try {
+    const pnpmConfig = xpm === "pnpm" ? pnpmConfigRefusal({ cwd: dir, env: process.env }) : null;
+
+    if (pnpmConfig !== null) {
+      fail(`refused: ${pnpmConfigRefused(pnpmConfig)}. Nothing was run.`);
+
+      return 1;
+    }
+
     writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "apm-x", version: "0.0.0", private: true }));
     const compute = [...lockOnlyArgs(xpm, [`${r.name}@${r.version}`], { dev: false }), ...registryArgs(xpm, cfg.registry, treeScope)];
 
@@ -2644,6 +2652,14 @@ async function cmdPublish(a: Args): Promise<number> {
   // a dry run needs no login, but the real publish will: say so while nothing is at stake
   if (dry && cfg.token === null) say(yellow(`apm: apm found no login token for ${displayRegistry(cfg.registry) ?? "this registry"}; unless you have other publishing credentials for it, log in before the real publish (on an apm registry: ${LOGIN_HINT})`));
 
+  const pnpmConfig = det.pm === "pnpm" ? pnpmConfigRefusal({ cwd, env: process.env }) : null;
+
+  if (pnpmConfig !== null) {
+    fail(`refused: ${pnpmConfigRefused(pnpmConfig)}. Nothing was packed or uploaded.`);
+
+    return 1;
+  }
+
   // 2. Pack with the project's own package manager and inspect exactly what would upload.
   const dest = mkdtempSync(join(tmpdir(), "apm-pack-"));
   process.once("exit", () => rmSync(dest, { recursive: true, force: true }));
@@ -2897,6 +2913,14 @@ async function passthrough(a: Args): Promise<number> {
   }
 
   if (REMOVALS.has(a.cmd) && isLockPm(det.pm)) return checkedRemoval({ cwd, det: { pm: det.pm, why: det.why }, names: args.filter((x) => x !== "--") });
+
+  const pnpmConfig = det.pm === "pnpm" ? pnpmConfigRefusal({ cwd, env: process.env }) : null;
+
+  if (pnpmConfig !== null) {
+    fail(`refused: ${pnpmConfigRefused(pnpmConfig)}. Nothing was run.`);
+
+    return 1;
+  }
 
   const command = script ? ["run", a.cmd] : [a.cmd];
 
