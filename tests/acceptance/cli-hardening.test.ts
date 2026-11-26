@@ -245,6 +245,26 @@ describe("finding 2: APM_TOKEN only goes to the registry it was issued for", () 
     expect(score.out).toContain("NODE_AUTH_TOKEN");
   });
 
+  test("the refusal and the warnings name a repo-chosen registry by origin only, never a credential in its URL", async () => {
+    const spy = standIn();
+    const sb = makeSandbox(reg, alice);
+    const app = writeConsumer(work, reg);
+    const secretRegistry = `${spy.url}SECRET_PATH_TOKEN/?key=SECRET_QUERY_KEY`;
+
+    writeFileSync(join(app, ".npmrc"), `registry=${secretRegistry}\n${hostKey(spy.url)}:_authToken=\${NODE_AUTH_TOKEN}\n`);
+    const env = { ...laptopEnv(sb.env), APM_TOKEN: alice, NODE_AUTH_TOKEN: "npm_SECRET_CANARY_NODE_AUTH_TOKEN" };
+    const login = await apm(["login", "--username", "mallory6", "--password-stdin"], { cwd: app, env, stdin: "a-long-enough-password\n" });
+    const score = await apm(["score", "leakpkg"], { cwd: app, env });
+
+    await spy.stop();
+    expect(login.code, login.out).toBe(1);
+    expect(login.out).toContain("refused");
+    expect(login.out).toContain("APM_TOKEN is for");
+    expect(score.out).toContain("did not fill in");
+    expect(login.out + score.out).toContain(spy.url);
+    expect(login.out + score.out).not.toContain("SECRET_");
+  });
+
   test("the CI setup the docs describe still works: a committed .npmrc reads the token for apm's registry from the environment", async () => {
     const sb = makeSandbox(reg);
     const app = writeConsumer(work, reg);
@@ -427,6 +447,30 @@ describe("finding 9: apm login only saves a well-formed token", () => {
 
     expect(fromSubmodule.code, fromSubmodule.out).toBe(1);
     expect(existsSync(steered), fromSubmodule.out).toBe(false);
+  });
+
+  test("apm login does not save the token outside the project either, when the project's .npmrc chose the file", async () => {
+    // a sibling project of the user's, with a committed .npmrc; npm run exports the clone's userconfig= resolved to it
+    const sb = makeSandbox(reg);
+    const app = writeConsumer(work, reg);
+    const mine = mkdtempSync(join(work, "mine-"));
+    const theirs = join(mine, ".npmrc");
+    const committed = "registry=https://registry.example.test/\n";
+
+    writeFileSync(theirs, committed);
+    writeFileSync(join(app, ".npmrc"), `userconfig=../${mine.split("/").pop()}/.npmrc\n`);
+    const r = await apm(["login", "--username", "mallory7", "--password-stdin"], { cwd: app, env: { ...laptopEnv(sb.env), APM_REGISTRY: reg.url, npm_config_userconfig: theirs }, stdin: "a-long-enough-password\n" });
+
+    expect(r.code, r.out).toBe(1);
+    expect(readFileSync(theirs, "utf8"), r.out).toBe(committed);
+    expect(r.out).toContain("userconfig");
+
+    // the same variable set by the user, with no project .npmrc naming it, is honoured
+    rmSync(join(app, ".npmrc"));
+    const own = await apm(["login", "--username", "mallory8", "--password-stdin"], { cwd: app, env: { ...laptopEnv(sb.env), APM_REGISTRY: reg.url, npm_config_userconfig: theirs }, stdin: "a-long-enough-password\n" });
+
+    expect(own.code, own.out).toBe(0);
+    expect(readFileSync(theirs, "utf8")).toContain("_authToken=apm_");
   });
 });
 

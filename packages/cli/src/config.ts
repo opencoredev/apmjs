@@ -56,6 +56,15 @@ export function userconfigPath(env: Record<string, string | undefined>): string 
   return env.npm_config_userconfig ?? env.NPM_CONFIG_USERCONFIG ?? join(env.HOME ?? homedir(), ".npmrc");
 }
 
+/** The project .npmrc that sets `userconfig=` (npm run and npx export it as npm_config_userconfig), or null. */
+export function projectUserconfigSetter(cwd: string, env: Record<string, string | undefined>): string | null {
+  const userDirs = new Set<string>([homedir()]);
+
+  if (env.HOME) userDirs.add(env.HOME);
+
+  return projectNpmrcs(cwd, userDirs).find((p) => readNpmrc(p).has("userconfig")) ?? null;
+}
+
 export function authKey(registry: string): string {
   const u = new URL(registry);
   return `//${u.host}${u.pathname}`;

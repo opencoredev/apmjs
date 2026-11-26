@@ -11,7 +11,7 @@ import { installedPackages, isValidRange, type Found, type Installed } from "./a
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
 import { escapedPath, oneLine } from "./explain.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
-import { DEFAULT_REGISTRY, displayRegistry, isApmToken, loadConfig, sameRegistry, saveToken, tokenRegistry, type Config } from "./config.ts";
+import { DEFAULT_REGISTRY, displayRegistry, isApmToken, loadConfig, projectUserconfigSetter, sameRegistry, saveToken, tokenRegistry, type Config } from "./config.ts";
 import { capabilityLines } from "./capabilities.ts";
 import { isLockPm, isRegistryVersion, LOCKFILES, projectPins, readLock, yarnBerryNodes, type LockImporter, type LockNode, type LockPm } from "./lockfile.ts";
 import { parseArgs, type Args } from "./args.ts";
@@ -110,11 +110,16 @@ function env(): Record<string, string | undefined> {
 function config(cwd: string): Config {
   const cfg = loadConfig(cwd, env());
 
-  if (cfg.withheld) warn(yellow(`apm: APM_TOKEN is for ${cfg.withheld}, so it is not sent to ${cfg.registry} (set by a project .npmrc or npm_config_registry)`));
+  if (cfg.withheld) warn(yellow(`apm: APM_TOKEN is for ${shownRegistry(cfg.withheld)}, so it is not sent to ${shownRegistry(cfg.registry)} (set by a project .npmrc or npm_config_registry)`));
 
-  if (cfg.unexpanded) warn(yellow(`apm: ${cfg.registry} was chosen by a project .npmrc or npm_config_registry, so apm did not fill in the token ${cfg.unexpanded} asks for. Set APM_REGISTRY to that registry if you trust it.`));
+  if (cfg.unexpanded) warn(yellow(`apm: ${shownRegistry(cfg.registry)} was chosen by a project .npmrc or npm_config_registry, so apm did not fill in the token ${cfg.unexpanded} asks for. Set APM_REGISTRY to that registry if you trust it.`));
 
   return cfg;
+}
+
+/** A registry URL can carry a credential in its path or query: messages name it by origin only. */
+function shownRegistry(url: string): string {
+  return displayRegistry(url) ?? "a registry apm does not print";
 }
 
 /**
@@ -2487,8 +2492,8 @@ function refuseRepoChosenRegistry(cfg: Config, action: string): boolean {
   const trusted = tokenRegistry(env());
 
   if (sameRegistry(cfg.registry, trusted)) return false;
-  fail(`refused: apm would ${action} ${cfg.registry}, which a project .npmrc or npm_config_registry chose, not you.`);
-  say(`Nothing was sent. To use it, run with APM_REGISTRY=${cfg.registry}, or put registry=${cfg.registry} in ~/.npmrc.`);
+  fail(`refused: apm would ${action} ${shownRegistry(cfg.registry)}, which a project .npmrc or npm_config_registry chose, not you.`);
+  say("Nothing was sent. To use it, set APM_REGISTRY to it, or put it as registry= in ~/.npmrc.");
 
   return true;
 }
@@ -2531,6 +2536,15 @@ function refuseUserconfigInProject(cfg: Config): boolean {
   }
 
   const projectRoot = root ?? cwd;
+  // anywhere else, the file is the user's choice unless a project .npmrc named it
+  const setter = inside(projectRoot) ? null : projectUserconfigSetter(cwd, env());
+
+  if (setter !== null) {
+    fail(`refused: apm login would save the token to ${file}, which ${setter} chose with userconfig= (npm run and npx pass it on as npm_config_userconfig).`);
+    say("Nothing was sent. Run apm login outside this project, or without npm_config_userconfig set.");
+
+    return true;
+  }
 
   if (!inside(projectRoot)) return false;
   fail(`refused: apm login would save the token to ${file}, inside this project (npm_config_userconfig, which a project .npmrc can set through npm run or npx).`);
