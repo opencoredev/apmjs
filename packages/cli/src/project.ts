@@ -37,6 +37,12 @@ const PnpmWorkspace = z.object({ packages: z.array(z.string()).optional().catch(
 
 const YarnRc = z.object({ yarnPath: z.string().optional().catch(undefined) }).loose();
 
+const ConfigDependencies = z.record(z.string(), z.unknown()).optional().catch(undefined);
+
+const PnpmConfig = z.object({ configDependencies: ConfigDependencies }).loose();
+
+const PnpmBootDocument = z.object({ importers: z.object({ ".": z.object({ configDependencies: ConfigDependencies }).loose().optional().catch(undefined) }).loose().optional().catch(undefined) }).loose();
+
 function readJson(path: string): z.infer<typeof Manifest> | null {
   try {
     const m = Manifest.safeParse(JSON.parse(readFileSync(path, "utf8")));
@@ -158,6 +164,27 @@ function lockfileAt(root: string, pm: Pm): { kind: "ok"; file: string } | { kind
   return { kind: "ok", file: found === null ? LOCKFILES[pm][LOCKFILES[pm].length - 1] ?? "package-lock.json" : relative(root, found) };
 }
 
+/**
+ * The config dependencies pnpm installs, and loads the hooks of, before it computes the lockfile: pnpm-workspace.yaml's
+ * configDependencies and those pnpm 11+ records in the boot document that opens a two-document pnpm-lock.yaml. apm
+ * cannot check them before pnpm runs them.
+ */
+function pnpmConfigDependencies(root: string, lockfile: string): string[] {
+  const declared = Object.keys(readYaml(join(root, "pnpm-workspace.yaml"), PnpmConfig)?.configDependencies ?? {});
+  let locked: string[] = [];
+
+  try {
+    const docs: unknown = Bun.YAML.parse(readFileSync(join(root, lockfile), "utf8"));
+    const boot = Array.isArray(docs) && docs.length > 1 ? PnpmBootDocument.safeParse(docs[0]) : null;
+
+    locked = Object.keys(boot?.success === true ? (boot.data.importers?.["."]?.configDependencies ?? {}) : {});
+  } catch {
+    locked = [];
+  }
+
+  return [...new Set([...declared, ...locked])].sort();
+}
+
 /** The project the package manager would install for at `cwd`, and what apm copies to compute its lockfile. */
 export function projectLayout(input: { cwd: string; pm: Pm }): LayoutResult {
   const project = projectDir(input.cwd);
@@ -186,6 +213,15 @@ export function projectLayout(input: { cwd: string; pm: Pm }): LayoutResult {
   const lock = lockfileAt(root, input.pm);
 
   if (lock.kind === "refused") return lock;
+
+  const configDeps = input.pm === "pnpm" ? pnpmConfigDependencies(root, lock.file) : [];
+
+  if (configDeps.length > 0) {
+    return {
+      kind: "refused",
+      reason: `the project has pnpm config dependencies (${configDeps.join(", ")}), which pnpm installs and runs before it computes the lockfile, so apm cannot check them first. Run pnpm yourself for this project, or remove configDependencies from pnpm-workspace.yaml and pnpm-lock.yaml`,
+    };
+  }
 
   const member = relative(root, project).split(sep).join("/");
   const memberDirs = [...new Set([...membersOf(root, patterns), ...(member === "" ? [] : [member])])];

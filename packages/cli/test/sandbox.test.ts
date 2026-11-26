@@ -145,4 +145,41 @@ describe("what apm copies", () => {
 
     expect(r.kind === "ok" ? [r.layout.lockfile, r.layout.copy.includes("package-lock.json")] : null).toEqual(["npm-shrinkwrap.json", false]);
   });
+
+  test("pnpm: config dependencies, which pnpm installs and runs before it computes the lockfile, are refused; a pnpm pin alone is not", () => {
+    const boot = (configDependencies: string) => `---
+lockfileVersion: '9.0'
+importers:
+  .:
+    configDependencies: ${configDependencies}
+    packageManagerDependencies:
+      pnpm:
+        specifier: 12.21.0
+        version: 12.21.0
+---
+lockfileVersion: '9.0'
+importers:
+  .: {}
+`;
+
+    const project = (files: Record<string, string>): string => {
+      const root = mkdtempSync(join(outside, "pnpm-config-"));
+
+      writeFileSync(join(root, "package.json"), JSON.stringify({ name: "p", version: "1.0.0", packageManager: "pnpm@12.21.0" }));
+
+      for (const [file, text] of Object.entries(files)) writeFileSync(join(root, file), text);
+
+      return root;
+    };
+
+    const kind = (root: string): string => {
+      const r = projectLayout({ cwd: root, pm: "pnpm" });
+
+      return r.kind === "ok" ? "ok" : r.reason;
+    };
+
+    expect(kind(project({ "pnpm-lock.yaml": boot("{}") }))).toBe("ok");
+    expect(kind(project({ "pnpm-workspace.yaml": "configDependencies:\n  my-plugin: 1.0.0+sha512-abc\n" }))).toContain("pnpm config dependencies (my-plugin)");
+    expect(kind(project({ "pnpm-lock.yaml": boot("\n      my-plugin:\n        integrity: sha512-abc\n        specifier: 1.0.0\n        version: 1.0.0") }))).toContain("pnpm config dependencies (my-plugin)");
+  });
 });

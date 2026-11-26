@@ -530,12 +530,15 @@ function pnpmOrigin(spec: string, resolution: z.infer<typeof PnpmResolution> | u
 
 /**
  * The project's lockfile document. pnpm 11 and later write pnpm-lock.yaml as two YAML documents when the project pins
- * pnpm (packageManager) or has config dependencies: the env document, which installs pnpm itself, then the project's.
+ * pnpm (packageManager, recorded by pnpm 12 and later) or has config dependencies: the boot document, which installs
+ * pnpm itself and the config dependencies, then the project's. A boot document followed by an empty one is a project
+ * with nothing locked yet. Config dependencies are refused before pnpm runs (project.ts), so only the project's
+ * document is read here.
  */
 function pnpmLock(text: string): z.infer<typeof PnpmLock> {
   const parsed: unknown = Bun.YAML.parse(text);
 
-  return PnpmLock.parse(Array.isArray(parsed) ? parsed.at(-1) : parsed);
+  return PnpmLock.parse(Array.isArray(parsed) ? (parsed.at(-1) ?? {}) : parsed);
 }
 
 function pnpmGraph(text: string, importer: string, roots: Roots): Parsed {
