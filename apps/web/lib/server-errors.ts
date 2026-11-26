@@ -16,7 +16,6 @@ export const WEB_ROUTES = {
   "/admin/reviews": "admin reviews",
   "/approve/[id]": "approve",
   "/compare": "compare",
-  "/compare/socket": "compare socket",
   "/device": "device",
   "/docs": "docs",
   "/package/[...name]": "package",

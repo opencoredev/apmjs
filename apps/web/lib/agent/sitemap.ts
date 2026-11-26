@@ -12,7 +12,6 @@ export function sitemapEntries(input: { recent: readonly { package: string; at: 
     { url: siteUrl("/"), lastModified: input.now, changeFrequency: "daily", priority: 1 },
     { url: siteUrl("/docs"), changeFrequency: "weekly", priority: 0.8 },
     { url: siteUrl("/compare"), changeFrequency: "monthly", priority: 0.6 },
-    { url: siteUrl("/compare/socket"), lastModified: new Date("2026-11-26T00:00:00Z"), changeFrequency: "monthly", priority: 0.6 },
     { url: siteUrl("/reviews"), changeFrequency: "daily", priority: 0.5 },
   ];
 

@@ -49,12 +49,12 @@ describe("llms-full.txt", () => {
 describe("sitemap", () => {
   const now = new Date("2026-11-12T00:00:00Z");
   /** The site's own pages, before the packages. */
-  const PAGES = 5;
+  const PAGES = 4;
 
-  test("the home, docs, compare, apm vs Socket and AI review pages, then every popular package", () => {
+  test("the home, docs, compare and AI review pages, then every popular package", () => {
     const urls = sitemapEntries({ recent: [], now }).map((e) => e.url);
 
-    expect(urls.slice(0, PAGES)).toEqual(["https://apmjs.dev/", "https://apmjs.dev/docs", "https://apmjs.dev/compare", "https://apmjs.dev/compare/socket", "https://apmjs.dev/reviews"]);
+    expect(urls.slice(0, PAGES)).toEqual(["https://apmjs.dev/", "https://apmjs.dev/docs", "https://apmjs.dev/compare", "https://apmjs.dev/reviews"]);
     expect(urls).toHaveLength(PAGES + POPULAR_PACKAGES.length);
     expect(urls).toContain("https://apmjs.dev/package/react");
   });

@@ -147,20 +147,11 @@ export function organizationJsonLd() {
   };
 }
 
-/** A BreadcrumbList for a page below the home page; each crumb is a name and a site path. */
-export function breadcrumbJsonLd(crumbs: readonly { name: string; path: string }[]) {
-  return {
-    "@context": "https://schema.org",
-    "@type": "BreadcrumbList",
-    itemListElement: crumbs.map((c, i) => ({ "@type": "ListItem", position: i + 1, name: c.name, item: siteUrl(c.path) })),
-  };
-}
-
 export type JsonLdDocument =
   | ReturnType<typeof websiteJsonLd>
   | ReturnType<typeof packageJsonLd>
   | ReturnType<typeof organizationJsonLd>
-  | ReturnType<typeof breadcrumbJsonLd>;
+;
 
 /** JSON-LD as a script body: `<` escaped so publisher text can't close the script element. */
 export function jsonLdText(data: JsonLdDocument): string {
