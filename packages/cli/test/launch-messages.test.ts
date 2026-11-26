@@ -323,6 +323,12 @@ describe("apm's messages for first-time users", () => {
     const yarn = await apm(["publish", "--dry-run", "--pm", "yarn"], { cwd: build });
     expect(yarn.code).toBe(1);
     expect(yarn.text).toContain("✗ npm uploads 1.2.3-rc.1+ci.7 as 1.2.3-rc.1, without its build metadata");
+
+    // --bump replaces the version, build metadata and all: only the bumped one is checked against npm's upload
+    const bumpedBuild = folder("dry-build-bump", { "package.json": JSON.stringify({ name: "@me/lib", version: "1.2.3+ci.7" }) });
+    const bumpedRun = await apm(["publish", "--dry-run", "--bump", "patch", "--pm", "npm"], { cwd: bumpedBuild });
+    expect(bumpedRun.text).not.toContain("without its build metadata");
+    expect(bumpedRun.text).not.toContain("nothing packed or uploaded");
   });
 
   test("C10: a known malicious version leads with the refusal, not its grade", async () => {

@@ -181,6 +181,13 @@ describe("name check alternatives under the GitHub-scope policy", () => {
     expect(yanked.code, yanked.out).toBe(1);
     expect(yanked.out).toContain("✗ @scope-owner/quokka-js@1.1.0 is already published");
 
+    // and a yanked one stored with build metadata still holds its build-free spelling
+    expect((await putPublish(reg, token, { name: "@scope-owner/quokka-js", version: "1.2.0+ci.1", license: "MIT", main: "index.js" })).status).toBe(201);
+    expect((await apm(["yank", "@scope-owner/quokka-js@1.2.0+ci.1", "--reason", "test"], { cwd: sb.home, env: sb.env })).code).toBe(0);
+    const build = await dry("@scope-owner/quokka-js", "1.2.0");
+    expect(build.code, build.out).toBe(1);
+    expect(build.out).toContain("✗ @scope-owner/quokka-js@1.2.0+ci.1 is already published");
+
     const bare = await dry("quokka-bare", "1.0.0");
     expect(bare.code, bare.out).toBe(1);
     expect(bare.out).toContain("✗ New packages on apm are scoped to your GitHub login. Publish this as @scope-owner/quokka-bare");

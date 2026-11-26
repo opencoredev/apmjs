@@ -2727,7 +2727,8 @@ async function cmdPublish(a: Args): Promise<number> {
   if (dry) {
     const fields = PublishFieldsOf.safeParse(parsed);
     const raw = fields.success ? fields.data : { name: undefined, version: undefined, private: undefined };
-    const written = manifestChecks({ name: raw.name, version: raw.version, private: raw.private, build });
+    // with --bump the upload carries the bumped version, so only that one is held to the upload client's build rule
+    const written = manifestChecks({ name: raw.name, version: raw.version, private: raw.private, build: bumpKind ? "unknown" : build });
     const verdict = written.kind === "ok" && bumpKind ? manifestChecks({ name: written.name, version: bump(written.version, bumpKind), private: raw.private, build }) : written;
 
     if (verdict.kind === "refused") {
