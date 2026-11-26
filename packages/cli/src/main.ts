@@ -8,8 +8,8 @@ import { z } from "zod";
 import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isScoped, isValidPackageName, missingEntries, readTarball, SCORE_FLOOR, type FileLike } from "@apm/core";
 import { Api, ApiError, AuditResponse, NameResponse, RATE_LIMIT_RETRY, ResolveFail, ResolveOk, ResolvePending, ScoreResponse, Tree, encodeName, parseSpec, tagsWithoutLatest, type Capability, type DistTag, type InstallWarning, type Report } from "./api.ts";
 import { installedPackages, isValidRange, type Found, type Installed } from "./audit.ts";
-import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
-import { escapedPath, oneLine } from "./explain.ts";
+import { explainCommand, okInput, resolvedFor, reviewOf, searchCommand, type AgentIo } from "./agent.ts";
+import { escapedPath, explain, oneLine, resolveForVerdict, type OlderSearch, type ResolvedInput, type Verdict } from "./explain.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
 import { DEFAULT_REGISTRY, displayRegistry, isApmToken, loadConfig, sameRegistry, saveToken, type Config } from "./config.ts";
 import { capabilityLines } from "./capabilities.ts";
@@ -21,6 +21,7 @@ import { pnpmRebuildable, removeInstalled, verifyInstall, type Omitted, type Pla
 import { devGroup, type DevGroup, omitArgs, releaseOmission } from "./groups.ts";
 import { pnpmConfigRefusal, pnpmConfigRefused, projectLayout, withMemberNames, type Layout } from "./project.ts";
 import { applyChecked, computedFiles, copyProject, restoreCommands, targets, type Backup, type Computed, type Copy } from "./lockfirst.ts";
+import { ignoredRegistryFiles } from "./ignored.ts";
 import { makeTemp, removeTemp } from "./sandbox.ts";
 import { CLI_VERSION } from "./version.ts";
 import { manifestChecks, registryChecks, VALID_NAME_RULE, type BuildMetadata, type Existing, type PublishCheck, type RegistryView } from "./publish-checks.ts";
@@ -215,6 +216,7 @@ type TreePackages = z.infer<typeof Tree>["packages"];
  * `warnings`: what installs anyway, and why it was flagged (published inside the cooldown, a low or incomplete
  * score, no score, a failed lookup). `projectPeers`: required peers the project provides, and the version checked for each.
  * `tags`: the dist-tags of a package that has none named latest, when that is why nothing was picked; empty otherwise.
+ * `explained`: what apm explain says that keeps it from a plain install of the version picked (apm add only), else null.
  */
 type Resolved = {
   name: string;
@@ -229,7 +231,51 @@ type Resolved = {
   warnings: InstallWarning[];
   projectPeers: z.infer<typeof Tree>["projectPeers"];
   tags: readonly DistTag[];
+  explained: Explained | null;
 };
+
+/**
+ * apm explain's review-first verdict on the version apm add picked and installs, as one of the package's --json
+ * `warnings`: `text` is explain's summary, `reasons` its reasons.
+ */
+type Explained = Pick<InstallWarning, "name" | "version" | "score" | "grade" | "text" | "via"> & Pick<Verdict, "reasons" | "url"> & { kind: "review-first" };
+
+/** How long apm add waits for the AI review explain's verdict reads, per package. */
+const REVIEW_TIMEOUT_MS = 15_000;
+
+/**
+ * What apm explain's rules say about the version the registry picked, the one apm add installs: the same answer, that
+ * version's AI review, and the floor the add asked for. For a version inside the cooldown, explain's own look for an
+ * older version past it decides only whether the age is a hold too: explain would install that older version instead,
+ * and apm add already warns about the age, so the hold stays only when there is none (or explain gave up looking).
+ * Null for any other verdict: install; unknown, where apm could not read something (the add's own checks still stand,
+ * and a registry from before AI reviews sends no review summary at all); and the refusals the registry already made.
+ */
+async function explainedOf(input: { api: Api; name: string; range: string | null; ok: ResolveOk; strict: boolean; floor: number | undefined }): Promise<Explained | null> {
+  const { api, name, ok } = input;
+  const range = input.range ?? "latest";
+  const picked = okInput(ok);
+  const fresh = picked.deps.warnings.some((w) => w.via.length === 0 && w.kind === "cooldown");
+  // the registry's answer for the range itself is the one already read; only older ranges are asked for
+  const resolve = (r: string): Promise<ResolvedInput> => (r === range ? Promise.resolve(picked) : resolvedFor({ api, name, range: r, strict: input.strict, warn: (line) => say(dim(line)) }));
+  const searched: OlderSearch = fresh ? (await resolveForVerdict({ range, resolve })).older : { kind: "not-needed" };
+  const aged = searched.kind === "none" || searched.kind === "gave-up";
+  const older: OlderSearch = aged ? searched : { kind: "not-needed" };
+  const resolved = !fresh || aged ? picked : { ...picked, deps: { ...picked.deps, warnings: picked.deps.warnings.filter((w) => w.via.length > 0 || w.kind !== "cooldown") } };
+  const v = explain({ name, range: input.range, resolved, review: await reviewOf(api, name, ok.version, REVIEW_TIMEOUT_MS), older, floor: input.floor });
+
+  if (v.verdict !== "review-first") return null;
+
+  return { kind: "review-first", name, version: ok.version, score: ok.report?.score ?? null, grade: ok.report?.grade ?? null, text: oneLine(v.summary), reasons: v.reasons, url: v.url, via: [] };
+}
+
+/** The floor apm add asked for, as explain weighs the version itself: 0 with --force, --floor's value, else the default. */
+function askedFloor(a: Args): number | undefined {
+  if (has(a, "force")) return 0;
+  const n = Number(flag(a, "floor") ?? Number.NaN);
+
+  return Number.isFinite(n) ? n : undefined;
+}
 
 const FORCEABLE = /^(published \d+h ago|score \d+\/100 is below)/;
 
@@ -419,7 +465,8 @@ function resolveContext(input: { pm: Detection["pm"]; cwd: string; project: bool
   return { installed, leftOut: null };
 }
 
-async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext): Promise<Resolved> {
+/** `explained`: also read apm explain's verdict on the version picked (apm add), which --strict refuses when it is review-first. */
+async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext, opts: { explained: boolean }): Promise<Resolved> {
   const { name, range } = parseSpec(spec);
   const force = has(a, "force");
   const strict = strictMode(a);
@@ -438,8 +485,10 @@ async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext)
   const r = await resolveWaiting(api, name, params);
   if (r.status === 200) {
     const ok = ResolveOk.parse(r.body);
+    const explained = opts.explained ? await explainedOf({ api, name, range, ok, strict, floor: askedFloor(a) }) : null;
+    const blocked = explained !== null && strict ? `${name}@${ok.version}: strict mode refuses what apm explain calls review-first` : null;
 
-    return { name, version: ok.version, report: ok.report, skipped: ok.skipped, blocked: null, forceable: false, source: ok.source ?? "apm", unchecked: ok.tree?.uncheckedDeps ?? [], tree: ok.tree?.packages ?? [], warnings: ok.warnings, projectPeers: ok.tree?.projectPeers ?? [], tags: [] };
+    return { name, version: ok.version, report: ok.report, skipped: ok.skipped, blocked, forceable: false, source: ok.source ?? "apm", unchecked: ok.tree?.uncheckedDeps ?? [], tree: ok.tree?.packages ?? [], warnings: ok.warnings, projectPeers: ok.tree?.projectPeers ?? [], tags: [], explained };
   }
   if (r.status === 422) {
     const f = ResolveFail.extend({ newest: z.object({ version: z.string(), report: z.unknown() }).nullable().optional(), tree: z.object({ blocks: z.array(z.unknown()) }).loose().optional() }).parse(r.body);
@@ -450,7 +499,7 @@ async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext)
     const tags = (range === null || range === "latest") && f.skipped.length === 0 && !f.newest ? await tagsWithoutLatest(api, name) : [];
     const blocked = tags.length > 0 ? `${name} has no version tagged latest, the one apm installs when no version is named. Its versions are tagged ${tags.map((t) => `${t.tag} (${t.version})`).join(", ")}` : f.error;
 
-    return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked, forceable, source: "apm", unchecked: [], tree: [], warnings: [], projectPeers: [], tags };
+    return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked, forceable, source: "apm", unchecked: [], tree: [], warnings: [], projectPeers: [], tags, explained: null };
   }
 
   if (r.status === 503) {
@@ -458,7 +507,7 @@ async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext)
     const said = z.object({ error: z.string() }).safeParse(r.body);
     const msg = said.success ? said.data.error : `the registry could not check ${name} (HTTP 503)`;
 
-    return { name, version: null, report: null, skipped: [], blocked: msg, forceable: false, source: "apm", unchecked: [], tree: [], warnings: [], projectPeers: [], tags: [] };
+    return { name, version: null, report: null, skipped: [], blocked: msg, forceable: false, source: "apm", unchecked: [], tree: [], warnings: [], projectPeers: [], tags: [], explained: null };
   }
 
   if (r.status === 202) {
@@ -480,12 +529,13 @@ async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext)
       warnings: [],
       projectPeers: [],
       tags: [],
+      explained: null,
     };
   }
   if (r.status === 404) {
     const msg = typeof r.body === "object" && r.body !== null && "error" in r.body ? String(r.body.error) : "not found";
 
-    return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, forceable: false, source: "none", unchecked: [], tree: [], warnings: [], projectPeers: [], tags: [] };
+    return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, forceable: false, source: "none", unchecked: [], tree: [], warnings: [], projectPeers: [], tags: [], explained: null };
   }
   if (r.status === 414) throw new ApiError(r.status, `resolve failed for ${name}: the request was too long for ${api.cfg.registry} (HTTP 414). apm sends the project's direct dependencies with it; nothing was installed`, r.body);
 
@@ -535,7 +585,7 @@ function printResolved(r: Resolved): void {
   // a version the OSSF feed lists or an apm reviewer confirmed malicious, in the registry's own words (never an owner's
   // yank reason): the refusal leads, not its score
   const malicious = r.blocked === null ? undefined : r.skipped.find((s) => s.version === r.version && MALICIOUS_SKIPS.some((m) => s.reason.startsWith(m)));
-  const mark = r.blocked ? red("✗") : r.warnings.length > 0 || lookalike !== null ? yellow("!") : green("✓");
+  const mark = r.blocked ? red("✗") : r.warnings.length > 0 || lookalike !== null || r.explained !== null ? yellow("!") : green("✓");
 
   printCard(`${mark} ${r.name}@${r.version ?? "?"}`, r.report, malicious === undefined ? {} : { refusal: `refused: ${oneLine(malicious.reason)}` });
 
@@ -557,6 +607,13 @@ function printResolved(r: Resolved): void {
   }
 
   printWarnings({ warnings: r.warnings, binaries: r.tree.filter((p) => p.platform !== undefined), allFamilies: true, closing: lookalike === null ? EARLY_CLOSING : null });
+
+  if (r.explained !== null) {
+    say();
+    say(`${yellow(bold("WARNING"))} ${r.explained.text}`);
+
+    if (r.blocked === null) say(yellow(`apm explain calls ${r.explained.name}@${r.explained.version} review-first, and apm add installs it anyway. To refuse it instead, run with --strict (or APM_STRICT=1).`));
+  }
 
   if (lookalike === null) return;
   say();
@@ -690,7 +747,8 @@ function printWarnings(input: { warnings: readonly InstallWarning[]; binaries: r
 /** What to tell someone whose install was refused: --force only when it would help, and what it does. */
 function refusalAdvice(blocked: Resolved[], verb: "add" | "x", strict: boolean): void {
   const forceable = blocked.filter((b) => b.forceable);
-  const stuck = blocked.filter((b) => !b.forceable && b.tags.length === 0);
+  const explained = blocked.filter((b) => b.explained !== null);
+  const stuck = blocked.filter((b) => !b.forceable && b.tags.length === 0 && b.explained === null);
 
   for (const b of blocked) {
     const [first] = b.tags;
@@ -704,6 +762,13 @@ function refusalAdvice(blocked: Resolved[], verb: "add" | "x", strict: boolean):
   }
 
   if (stuck.length > 0) say(`--force does not help for ${stuck.map((b) => b.name).join(", ")}: revoked or yanked versions, versions apm reviewers confirmed malicious and unknown names stay blocked${strict ? "; in strict mode, so do versions apm has not scored or cannot score, and dependencies under the floor or inside their cooldown" : ""}.`);
+
+  if (explained.length > 0) {
+    say("Nothing was changed. apm explain says why:");
+
+    for (const b of explained) say(`  apm explain ${b.name}@${b.version ?? "latest"}`);
+    say(`To install with a warning instead, run apm ${verb} ${process.env.APM_STRICT === "1" ? "with APM_STRICT unset and " : ""}without --strict.`);
+  }
 
   const analysing = blocked.filter((b) => b.blocked?.includes("still being analysed") || b.blocked?.includes("could not be checked"));
 
@@ -1994,11 +2059,15 @@ async function cmdAdd(a: Args): Promise<number> {
     return 1;
   }
 
+  for (const file of ignoredRegistryFiles({ cwd, root: layout.layout.root, member: layout.layout.member, pm: det.pm, registry: cfg.registry, npmrc: cfg.registrySource })) {
+    warn(yellow(`apm: git ignores ${escapedPath(file)}, which points installs at apm's registry, so clones and CI will not install through apm until it is committed (keep any token out of it)`));
+  }
+
   const results: Resolved[] = [];
   const ctx = resolveContext({ pm: det.pm, cwd, project: true });
 
   if (ctx.leftOut !== null) say(dim(`apm: ${ctx.leftOut}, so it goes without them; the check of the computed lockfile reads every package`));
-  for (const spec of specs) results.push(await resolveSpec(api, spec, a, ctx));
+  for (const spec of specs) results.push(await resolveSpec(api, spec, a, ctx, { explained: true }));
   for (const r of results) printResolved(r);
   const blocked = results.filter((r) => r.blocked !== null || r.version === null);
 
@@ -2039,7 +2108,7 @@ function emitJson(input: { ok: boolean; det: Detection; results: Resolved[]; err
       signals: r.report?.signals.map((s) => ({ id: s.id, points: s.points })) ?? [],
       skipped: r.skipped,
       unchecked: r.unchecked,
-      warnings: r.warnings,
+      warnings: r.explained === null ? r.warnings : [...r.warnings, r.explained],
       // review of 1924692, finding 1: the peers the project provides, and the version checked for each
       projectPeers: r.projectPeers,
       blocked: r.blocked !== null,
@@ -2099,7 +2168,7 @@ async function cmdX(a: Args): Promise<number> {
   // npm computes a lockfile only by building every git dependency in it: never started with scripts ignored
   if (ignoreScripts && refuseNpmWithoutScripts({ pm: xpm, command: "x" })) return 1;
 
-  const r = await resolveSpec(api, spec, a, resolveContext({ pm: det.pm, cwd, project: false }));
+  const r = await resolveSpec(api, spec, a, resolveContext({ pm: det.pm, cwd, project: false }), { explained: false });
   printResolved(r);
   if (r.blocked !== null || r.version === null) {
     say(red(`refused to run ${r.name}: ${r.blocked ?? "no version"}`));

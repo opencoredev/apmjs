@@ -59,7 +59,7 @@ export function detectPm(cwd: string, flag: string | null): Detection {
     return null;
   });
   if (byField) return byField;
-  if (Bun.which("bun")) return { pm: "bun", why: "default (bun is installed)" };
+  if (Bun.which("bun")) return { pm: "bun", why: "default (bun is installed; no lockfile or packageManager names another, so pass --pm npm to use npm)" };
   return { pm: "npm", why: "default" };
 }
 

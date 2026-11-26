@@ -733,7 +733,8 @@ export function explain(input: ExplainInput): Verdict {
   return { ...decide(input), ...shown };
 }
 
-type ExplainInput = { name: string; range: string | null; resolved: ResolvedInput; review: ReviewInput; older?: OlderSearch };
+/** `floor`: the score floor the install asked for (`apm add --floor`, 0 with `--force`) for the version itself; absent, SCORE_FLOOR. */
+type ExplainInput = { name: string; range: string | null; resolved: ResolvedInput; review: ReviewInput; older?: OlderSearch; floor?: number | undefined };
 
 /** The page link the registry gave, when it is a web address; anything else is dropped rather than shown. */
 function pageUrl(raw: string | undefined): string | null {
@@ -917,10 +918,12 @@ function decide(input: ExplainInput): Decided {
   }
 
   // under the floor for what apm read: an incomplete analysis's -61 is said by its own hold above
-  if (report.score < SCORE_FLOOR && reading.kind !== "incomplete") {
+  const floor = input.floor ?? SCORE_FLOOR;
+
+  if (report.score < floor && reading.kind !== "incomplete") {
     const label = oneLine(lost.find((s) => !isGap(s.id))?.label ?? "see the signals");
 
-    holds.push({ why: `it ${scoreText}, under apm's floor of ${SCORE_FLOOR}, most of it for: ${label}`, reason: "", scored: true });
+    holds.push({ why: `it ${scoreText}, under apm's floor of ${floor}, most of it for: ${label}`, reason: "", scored: true });
   }
 
   const depReviews: DepReviews = deps.reviews;

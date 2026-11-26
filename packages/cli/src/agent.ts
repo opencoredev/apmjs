@@ -68,12 +68,33 @@ export function parseReview(answer: RawAnswer): ReviewInput {
 }
 
 /** The AI review of one version, read from the registry; a read that failed is "unreadable". */
-async function reviewOf(api: Api, name: string, version: string): Promise<ReviewInput> {
+export async function reviewOf(api: Api, name: string, version: string, timeoutMs?: number): Promise<ReviewInput> {
   try {
-    return parseReview(await api.raw(`-/apm/v1/review/${encodeName(name)}/${encodeURIComponent(version)}`));
+    return parseReview(await api.raw(`-/apm/v1/review/${encodeName(name)}/${encodeURIComponent(version)}`, {}, timeoutMs));
   } catch {
     return { kind: "unreadable" };
   }
+}
+
+/** A resolve's 200 answer as the verdict reads it (apm explain, and apm add's review-first check). */
+export function okInput(ok: ResolveOk): Extract<ResolvedInput, { kind: "ok" }> {
+  const tree = ok.tree;
+  const uncheckedDeps = tree?.uncheckedDeps ?? [];
+
+  // the registry's total, not the length of the list (it names at most 50); no review summary is unknown, not clean
+  return {
+    kind: "ok",
+    version: ok.version,
+    report: ok.report,
+    skipped: ok.skipped,
+    deps: {
+      unchecked: Math.max(tree?.unchecked ?? 0, uncheckedDeps.length),
+      uncheckedDeps,
+      reviews: tree?.reviews ?? { kind: "unknown" },
+      warnings: ok.warnings,
+      risks: (tree?.risks ?? []).map((d) => ({ ...d, scorer: d.scorer ?? null })),
+    },
+  };
 }
 
 /**
@@ -81,7 +102,7 @@ async function reviewOf(api: Api, name: string, version: string): Promise<Review
  * would run in (`strict`, from --strict or APM_STRICT=1). No os or cpu, as apm add sends none: every platform's
  * optional packages are checked.
  */
-async function resolvedFor(input: { api: Api; name: string; range: string | null; strict: boolean; warn: (line: string) => void }): Promise<ResolvedInput> {
+export async function resolvedFor(input: { api: Api; name: string; range: string | null; strict: boolean; warn: (line: string) => void }): Promise<ResolvedInput> {
   const { api, name, range } = input;
   let r: { status: number; body: unknown; tries: number };
   const params = new URLSearchParams({ name, range: range ?? "latest" });
@@ -103,23 +124,8 @@ async function resolvedFor(input: { api: Api; name: string; range: string | null
     const ok = ResolveOk.safeParse(r.body);
 
     if (!ok.success) return { kind: "unavailable", reason: UNREADABLE };
-    const tree = ok.data.tree;
-    const uncheckedDeps = tree?.uncheckedDeps ?? [];
 
-    // the registry's total, not the length of the list (it names at most 50); no review summary is unknown, not clean
-    return {
-      kind: "ok",
-      version: ok.data.version,
-      report: ok.data.report,
-      skipped: ok.data.skipped,
-      deps: {
-        unchecked: Math.max(tree?.unchecked ?? 0, uncheckedDeps.length),
-        uncheckedDeps,
-        reviews: tree?.reviews ?? { kind: "unknown" },
-        warnings: ok.data.warnings,
-        risks: (tree?.risks ?? []).map((d) => ({ ...d, scorer: d.scorer ?? null })),
-      },
-    };
+    return okInput(ok.data);
   }
 
   if (r.status === 422) {
