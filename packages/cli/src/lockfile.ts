@@ -528,8 +528,18 @@ function pnpmOrigin(spec: string, resolution: z.infer<typeof PnpmResolution> | u
   return { kind: "registry" };
 }
 
+/**
+ * The project's lockfile document. pnpm 11 and later write pnpm-lock.yaml as two YAML documents when the project pins
+ * pnpm (packageManager) or has config dependencies: the env document, which installs pnpm itself, then the project's.
+ */
+function pnpmLock(text: string): z.infer<typeof PnpmLock> {
+  const parsed: unknown = Bun.YAML.parse(text);
+
+  return PnpmLock.parse(Array.isArray(parsed) ? parsed.at(-1) : parsed);
+}
+
 function pnpmGraph(text: string, importer: string, roots: Roots): Parsed {
-  const lock = PnpmLock.parse(Bun.YAML.parse(text));
+  const lock = pnpmLock(text);
   const packages = lock.packages ?? {};
   const snapshots = lock.snapshots;
   const pkgOf = (key: string): z.infer<typeof PnpmPackage> | undefined => packages[key.replace(/\(.*$/, "")] ?? packages[`/${key}`] ?? packages[`/${key.replace(/\(.*$/, "")}`];
