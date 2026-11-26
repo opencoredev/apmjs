@@ -1,7 +1,6 @@
 // The package manager apm drives. apm never replaces it: it decides what to install, then runs it.
 import { existsSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { z } from "zod";
 
 export type Pm = "bun" | "npm" | "pnpm" | "yarn";
 export const PMS: readonly Pm[] = ["bun", "npm", "pnpm", "yarn"];
@@ -11,30 +10,6 @@ export function isPm(v: string): v is Pm {
 }
 
 export type Detection = { pm: Pm; why: string };
-
-/** A dependency group's specs; a spec that is not a string (npm refuses it) reads as "". */
-const Specs = z.record(z.string(), z.string().catch("")).optional().catch(undefined);
-
-const DependencyGroups = z.object({ dependencies: Specs, devDependencies: Specs, optionalDependencies: Specs, peerDependencies: Specs });
-
-/** A spec npm builds while it computes a lockfile: a git repository (by protocol or as user/repo) or a remote tarball. */
-const BUILT_BY_NPM = /^(?:git\+|git:|github:|gitlab:|bitbucket:|gist:|https?:)|^[^@\s:/][^\s:]*\/\S+$/;
-
-/**
- * Whether the package.json at `path` names a dependency npm would build (clone, and run its prepare script) while it
- * computes the lockfile, before apm can check it (main.ts refuseNpmWithoutScripts). Unreadable counts as one.
- */
-function buildsWithNpm(path: string): boolean {
-  try {
-    const m = DependencyGroups.safeParse(JSON.parse(readFileSync(path, "utf8")));
-
-    if (!m.success) return true;
-
-    return [m.data.dependencies, m.data.devDependencies, m.data.optionalDependencies, m.data.peerDependencies].some((group) => Object.values(group ?? {}).some((spec) => BUILT_BY_NPM.test(spec.trim())));
-  } catch {
-    return true;
-  }
-}
 
 const LOCKFILES: [string, Pm][] = [
   ["bun.lock", "bun"],
@@ -58,12 +33,7 @@ function findUp(cwd: string, test: (dir: string) => Detection | null): Detection
   return null;
 }
 
-/**
- * --pm flag, then the nearest lockfile, then package.json "packageManager", then a bunfig.toml (bun). A project with
- * none of them (`npm init -y`) gets npm, which every Node install has (when npm is missing, the reason says to pass
- * --pm bun), unless its package.json names a git or URL dependency and bun is installed: npm would build that before
- * apm checks anything, so bun, as before. Outside any project (no package.json), bun when it is installed, else npm.
- */
+/** --pm flag, then the nearest lockfile, then package.json "packageManager", then bun when installed, else npm. */
 export function detectPm(cwd: string, flag: string | null): Detection {
   if (flag) {
     if (!isPm(flag)) throw new Error(`--pm must be one of ${PMS.join(", ")}`);
@@ -89,23 +59,7 @@ export function detectPm(cwd: string, flag: string | null): Detection {
     return null;
   });
   if (byField) return byField;
-  const byConfig = findUp(cwd, (dir) => (existsSync(join(dir, "bunfig.toml")) ? { pm: "bun", why: "bunfig.toml" } : null));
-
-  if (byConfig) return byConfig;
-
-  const project = findUp(cwd, (dir) => (existsSync(join(dir, "package.json")) ? { pm: "npm", why: join(dir, "package.json") } : null));
-
-  if (project) {
-    // npm builds a git or tarball dependency while it computes the lockfile, before apm checks it; bun does not
-    if (buildsWithNpm(project.why) && Bun.which("bun")) return { pm: "bun", why: "default for a project with no lockfile or packageManager whose package.json has a git or URL dependency, which npm would build before apm checks it" };
-
-    const why = "default for a project with no lockfile or packageManager";
-
-    return Bun.which("npm") ? { pm: "npm", why } : { pm: "npm", why: `${why}; npm is not on PATH, so pass --pm bun to use bun` };
-  }
-
-  if (Bun.which("bun")) return { pm: "bun", why: "default outside a project (bun is installed)" };
-
+  if (Bun.which("bun")) return { pm: "bun", why: "default (bun is installed; no lockfile or packageManager names another, so pass --pm npm to use npm)" };
   return { pm: "npm", why: "default" };
 }
 

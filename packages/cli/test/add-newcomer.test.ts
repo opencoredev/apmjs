@@ -329,25 +329,11 @@ describe("apm add for a newcomer", () => {
     expect(r.text).toContain("apm: git ignores bunfig.toml,");
   });
 
-  test("an npm init -y project (package.json, no lockfile, packageManager or bunfig) is added with npm, not bun", async () => {
+  test("an npm init -y project still gets bun when it is installed (held for launch), and the reason says how to use npm", async () => {
     const cwd = folder("pm/npm-init", { "package.json": manifest });
     const r = await apm(["add", "good"], { cwd });
 
-    expect(r.text).toContain("(npm: default for a project with no lockfile or packageManager;");
-    expect(ran()).toStartWith("npm install --package-lock-only");
-    expect(ran()).not.toContain("bun ");
-
-    // with only bun on PATH it still is npm's project, and apm says how to use bun instead
-    const bunOnly = folder("pm/bun-only-bin");
-
-    writeFileSync(join(bunOnly, "bun"), readFileSync(join(bin, "bun")));
-    chmodSync(join(bunOnly, "bun"), 0o755);
-    const noNpm = await apm(["add", "good"], { cwd, path: bunOnly });
-
-    expect(noNpm.code).toBe(1);
-    expect(noNpm.text).toContain("(npm: default for a project with no lockfile or packageManager; npm is not on PATH, so pass --pm bun to use bun;");
-    expect(readFileSync(join(cwd, "package.json"), "utf8")).toBe(manifest);
-    expect(ran()).not.toContain("bun ");
+    expect(r.text).toContain("(bun: default (bun is installed; no lockfile or packageManager names another, so pass --pm npm to use npm);");
   });
 });
 
@@ -361,39 +347,21 @@ describe("detectPm", () => {
 
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-  function project(name: string, files: Record<string, string>): string {
-    const dir = join(root, name);
+  test("lockfiles, packageManager and --pm still win over the default", () => {
+    const project = (name: string, files: Record<string, string>): string => {
+      const dir = join(root, name);
 
-    mkdirSync(dir);
+      mkdirSync(dir);
 
-    for (const [file, text] of Object.entries(files)) writeFileSync(join(dir, file), text);
+      for (const [file, text] of Object.entries(files)) writeFileSync(join(dir, file), text);
 
-    return dir;
-  }
+      return dir;
+    };
 
-  const manifest = JSON.stringify({ name: "app", version: "1.0.0" });
+    const manifest = JSON.stringify({ name: "app", version: "1.0.0" });
 
-  test("a package.json alone means npm", () => {
-    expect(detectPm(project("plain", { "package.json": manifest }), null).pm).toBe("npm");
-    expect(detectPm(project("registry-deps", { "package.json": JSON.stringify({ name: "app", dependencies: { zod: "^4.0.0", alias: "npm:zod@4", scoped: "@scope/x" }, devDependencies: { ts: ">=5 <6" } }) }), null).pm).toBe("npm");
-  });
-
-  test.each([["github:attacker/evil"], ["attacker/evil#main"], ["git+https://example.test/evil.git"], ["https://example.test/evil.tgz"]])("a git or URL dependency (%s) keeps bun, which does not build it before apm checks", (spec) => {
-    const dir = project(`built-${crypto.randomUUID()}`, { "package.json": JSON.stringify({ name: "app", devDependencies: { evil: spec } }) });
-
-    expect(detectPm(dir, null).pm).toBe(Bun.which("bun") ? "bun" : "npm");
-  });
-
-  test("bun.lock, bun.lockb, bunfig.toml and packageManager bun keep bun", () => {
-    expect(detectPm(project("lock", { "package.json": manifest, "bun.lock": "{}" }), null)).toEqual({ pm: "bun", why: "bun.lock" });
-    expect(detectPm(project("lockb", { "package.json": manifest, "bun.lockb": "" }), null)).toEqual({ pm: "bun", why: "bun.lockb" });
-    expect(detectPm(project("bunfig", { "package.json": manifest, "bunfig.toml": "[install]\n" }), null)).toEqual({ pm: "bun", why: "bunfig.toml" });
-    expect(detectPm(project("field", { "package.json": JSON.stringify({ name: "app", packageManager: "bun@1.4.4" }) }), null).pm).toBe("bun");
-  });
-
-  test("another lockfile, packageManager and --pm still win", () => {
-    expect(detectPm(project("pnpm", { "package.json": manifest, "pnpm-lock.yaml": "", "bunfig.toml": "" }), null).pm).toBe("pnpm");
-    expect(detectPm(project("yarn-field", { "package.json": JSON.stringify({ name: "app", packageManager: "yarn@4.0.0" }), "bunfig.toml": "" }), null).pm).toBe("yarn");
-    expect(detectPm(project("flag", { "package.json": manifest }), "bun")).toEqual({ pm: "bun", why: "--pm flag" });
+    expect(detectPm(project("npm-lock", { "package.json": manifest, "package-lock.json": "{}" }), null)).toEqual({ pm: "npm", why: "package-lock.json" });
+    expect(detectPm(project("yarn-field", { "package.json": JSON.stringify({ name: "app", packageManager: "yarn@4.0.0" }) }), null).pm).toBe("yarn");
+    expect(detectPm(project("flag", { "package.json": manifest }), "npm")).toEqual({ pm: "npm", why: "--pm flag" });
   });
 });

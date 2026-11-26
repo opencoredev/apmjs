@@ -38,7 +38,7 @@
     },
     "packages/cli/src/pm.ts": {
       "anti-slop/no-runtime-typeof": 2,
-      "anti-slop/require-readable-spacing": 27,
+      "anti-slop/require-readable-spacing": 29,
       "anti-slop/require-safety-comment-for-type-assertion": 1
     },
     "packages/core/src/deps.ts": {

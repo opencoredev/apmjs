@@ -9,9 +9,7 @@ import { join } from "node:path";
 import { COMMANDS } from "../src/commands.ts";
 
 const CLI = join(import.meta.dir, "..", "src", "main.ts");
-
-// a bun project: with no lockfile, a package.json alone is npm's (apm add's default since HOME-638), and these runs read bun's rules
-const PACKAGE_JSON = `${JSON.stringify({ name: "help-probe", version: "1.0.0", main: "index.js", packageManager: "bun@1.4.4" })}\n`;
+const PACKAGE_JSON = `${JSON.stringify({ name: "help-probe", version: "1.0.0", main: "index.js" })}\n`;
 let requests: string[] = [];
 let server: ReturnType<typeof Bun.serve> | null = null;
 
@@ -387,7 +385,7 @@ describe("what still goes to the package manager", () => {
     expectNothingRan(r);
   });
 
-  const WITH_ZOD = `${JSON.stringify({ name: "help-probe", version: "1.0.0", packageManager: "bun@1.4.4", dependencies: { zod: "^4.0.0" }, devDependencies: { "@types/node": "^24.0.0" } })}\n`;
+  const WITH_ZOD = `${JSON.stringify({ name: "help-probe", version: "1.0.0", dependencies: { zod: "^4.0.0" }, devDependencies: { "@types/node": "^24.0.0" } })}\n`;
 
   test.each([
     [["update"]],
@@ -486,7 +484,7 @@ describe("what still goes to the package manager", () => {
     [["run", "build.ts", "a"], "bun run --no-install build.ts a"],
     [["run", "--pm", "npm", "dev"], "npm run dev"],
   ])("apm %p is passed on: it installs nothing new, or it is a project script", async (argv, call) => {
-    const r = await apm(argv, "4.5.0", `${JSON.stringify({ name: "help-probe", version: "1.0.0", packageManager: "bun@1.4.4", scripts: { dev: "vite" }, dependencies: { zod: "^4.0.0" } })}\n`);
+    const r = await apm(argv, "4.5.0", `${JSON.stringify({ name: "help-probe", version: "1.0.0", scripts: { dev: "vite" }, dependencies: { zod: "^4.0.0" } })}\n`);
 
     expect(r.code, r.out + r.err).toBe(0);
     expect(r.pmCalls).toEqual([call]);
@@ -549,8 +547,7 @@ describe("what still goes to the package manager", () => {
   });
 
   test.each([
-    [["remove", "--pm", "bun", "zod"], withDeps({ zod: "^4.0.0" }), {}, "apm remove needs a lockfile it can read (there is no bun.lock)"],
-    [["remove", "zod"], withDeps({ zod: "^4.0.0" }), {}, "apm remove needs a lockfile it can read (there is no package-lock.json)"],
+    [["remove", "zod"], withDeps({ zod: "^4.0.0" }), {}, "apm remove needs a lockfile it can read (there is no bun.lock)"],
     [["remove", "--pm", "npm", "zod"], withDeps({ zod: "^4.0.0" }), {}, "apm remove needs a lockfile it can read (there is no package-lock.json)"],
     [["remove", "--pm", "yarn", "zod"], withDeps({ zod: "^4.0.0" }), { "yarn.lock": ZOD_LOCKS[3]?.[2] ?? "" }, "apm cannot read yarn's lockfile, so it cannot check that a removal installs nothing new"],
     [["remove", "left-pad"], withDeps({ zod: "^4.0.0" }), { "bun.lock": ZOD_LOCKS[0]?.[2] ?? "" }, "refused: left-pad is not in package.json. Nothing was run."],

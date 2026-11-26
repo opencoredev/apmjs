@@ -62,7 +62,7 @@ Don't regenerate the baseline to get new findings past CI. If a rebase conflicts
 
 `anti-slop/require-readable-spacing` makes up most of the baseline and only inserts blank lines. `bunx oxlint -c oxlint.config.ts --fix <path>` applies it. It was applied to `apps/web` and `packages/core` when linting was added. The other packages wait for the in-flight registry port and hardening work to merge.
 
-Current baseline (500 findings in 35 files, tracked in `lint-baseline.json`):
+Current baseline (502 findings in 35 files, tracked in `lint-baseline.json`):
 
 | Rule | apps/web | bun-scanner | cli | core | registry | scripts | tests | tools | Total |
 |---|---|---|---|---|---|---|---|---|---|
