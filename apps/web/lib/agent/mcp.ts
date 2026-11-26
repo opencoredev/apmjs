@@ -222,13 +222,19 @@ const checkName: Tool<typeof CheckNameInput> = {
     const r = await source.names({ name, scope: bare });
 
     if (!r) return unavailable(`the name check for ${name}`);
-    const lines: string[] = [];
+    const publishable = publishability({ name, available: r.available && r.valid && !r.taken && !r.unknown, scope: claimed });
 
-    if (!r.valid) lines.push(`${name} is not a valid package name.`);
-    else if (r.taken) lines.push(`${name} is taken${r.owners.length ? ` by ${r.owners.map((m) => inlineCode(m)).join(", ")}` : ""}${r.latest ? `; latest ${inlineCode(r.latest.version)}${r.latest.score !== null ? `, score ${r.latest.score}/100` : ""}` : ""}.`);
-    else if (r.unknown) lines.push(`Could not check ${name}: npm did not answer.`);
-    else if (r.available) lines.push(publishabilityText({ name, publishable: publishability({ name, available: r.available, scope: claimed }) }));
-    else lines.push(`${name} is free but cannot be published: ${r.conflicts.map((c) => c.reason).join("; ")}`);
+    const verdict = !r.valid
+      ? `${name} is not a valid package name.`
+      : r.taken
+        ? `${name} is taken${r.owners.length ? ` by ${r.owners.map((m) => inlineCode(m)).join(", ")}` : ""}${r.latest ? `; latest ${inlineCode(r.latest.version)}${r.latest.score !== null ? `, score ${r.latest.score}/100` : ""}` : ""}.`
+        : r.unknown
+          ? `Could not check ${name}: npm did not answer.`
+          : r.available
+            ? publishabilityText({ name, publishable })
+            : `${name} is free but cannot be published: ${r.conflicts.map((c) => c.reason).join("; ")}`;
+
+    const lines = [verdict];
 
     for (const l of r.lookalikes) lines.push(`Look-alike: ${oneLine(l.reason)}`);
 
@@ -238,8 +244,11 @@ const checkName: Tool<typeof CheckNameInput> = {
     if (free.length > 0) lines.push(`Free${r.scope ? ` under @${r.scope}` : ""}: ${free.join(", ")}`);
     else if (!bare) lines.push("Pass scope (your GitHub login) to check names under your own scope; a name under your own scope is always yours.");
 
-    // `available` stays npm's answer about the name; `publishable` is whether apm lets you publish it
-    return text(lines.join("\n"), { ...r, publishable: publishability({ name, available: r.available && r.valid && !r.taken && !r.unknown, scope: claimed }) });
+    // `available` is the text's answer, as in apm name --json: true only when the caller may publish the name here, which
+    // a bare name never is under apm's scoped rule and an unverified caller never confirms for a scoped one
+    const available = publishable.kind === "yours";
+
+    return text(lines.join("\n"), { ...r, available, reason: available ? null : verdict, publishable });
   },
 };
 
