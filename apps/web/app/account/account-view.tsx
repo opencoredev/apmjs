@@ -430,6 +430,7 @@ function RemovePasskey({ account, config, passkey, onCancel, onDone }: { account
           if (kept.current) return null;
 
           setPhase("removing");
+
           const r = await call("account/passkeys/remove", z.object({ ok: z.boolean() }), {
             method: "POST",
             body: { id: passkey.id, ...(proof.kind === "totp" ? { code: proof.code } : { confirmation: proof.id }) },
