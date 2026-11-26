@@ -145,7 +145,7 @@ describe.each(SHELLS)("install script under $name", ({ cmd }) => {
       const r = install({ platform: { os, arch: "x86_64" }, shell: cmd });
 
       expect(r.code).toBe(1);
-      expect(r.err).toBe("apm install: Windows is not supported yet; apm runs on macOS and Linux.\n");
+      expect(r.err).toBe("apm install: Windows is not supported yet. Run this in WSL, or use the apm registry without the CLI: https://docs.apmjs.dev/quickstart#1-point-your-package-manager-at-apm\n");
       expect(r.fetched).toEqual([]);
     }
   });

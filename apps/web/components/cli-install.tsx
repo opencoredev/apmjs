@@ -1,11 +1,12 @@
 // The home page's one line on getting the apm CLI: the install script, Homebrew by its full tap name (plain
-// `brew install apm` is another project's formula), and the docs quickstart.
+// `brew install apm` is another project's formula), what Windows users do instead, and the docs quickstart.
 import { ArrowRightIcon } from "lucide-react";
 import { CopyBlock } from "@/components/copy-button";
 
 const INSTALL = "curl -fsSL https://apmjs.dev/install | sh";
 const BREW = "brew install opencoredev/tap/apm";
 const QUICKSTART = "https://docs.apmjs.dev/quickstart";
+const REGISTRY_ONLY = `${QUICKSTART}#1-point-your-package-manager-at-apm`;
 
 export function CliInstall() {
   return (
@@ -22,6 +23,13 @@ export function CliInstall() {
       <CopyBlock oneLine text={INSTALL} label="Copy the install command" />
       <p className="text-[13px] leading-5 text-pretty text-muted-foreground">
         Or with Homebrew: <code className="font-mono text-[12.5px] text-foreground">{BREW}</code>
+      </p>
+      <p className="text-[13px] leading-5 text-pretty text-muted-foreground">
+        On Windows, run it in WSL. Native Windows has no CLI yet, but your package manager can{" "}
+        <a href={REGISTRY_ONLY} className="text-foreground underline underline-offset-4">
+          use the apm registry without it
+        </a>
+        .
       </p>
     </section>
   );
