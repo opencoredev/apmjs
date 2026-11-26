@@ -329,6 +329,10 @@ describe("apm's messages for first-time users", () => {
     const bumpedRun = await apm(["publish", "--dry-run", "--bump", "patch", "--pm", "npm"], { cwd: bumpedBuild });
     expect(bumpedRun.text).not.toContain("without its build metadata");
     expect(bumpedRun.text).not.toContain("nothing packed or uploaded");
+
+    // a written version bump can still read (its x.y.z) is replaced, not refused
+    const leadingZero = folder("dry-bump-replaces", { "package.json": JSON.stringify({ name: "@me/lib", version: "1.2.3-beta.01" }) });
+    expect((await apm(["publish", "--dry-run", "--bump", "patch", "--pm", "npm"], { cwd: leadingZero })).text).not.toContain("is not a version apm accepts");
   });
 
   test("C10: a known malicious version leads with the refusal, not its grade", async () => {

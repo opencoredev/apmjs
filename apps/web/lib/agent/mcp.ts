@@ -216,6 +216,9 @@ const checkName: Tool<typeof CheckNameInput> = {
   input: CheckNameInput,
   async run({ name, scope }, source) {
     const bare = scope?.replace(/^@/, "") ?? null;
+    // the caller's scope is a claim nobody checked: it picks where alternatives are looked up and which scope a bare name
+    // is suggested under, but never makes a scoped name "yours"
+    const claimed = name.startsWith("@") ? null : bare;
     const r = await source.names({ name, scope: bare });
 
     if (!r) return unavailable(`the name check for ${name}`);
@@ -224,7 +227,7 @@ const checkName: Tool<typeof CheckNameInput> = {
     if (!r.valid) lines.push(`${name} is not a valid package name.`);
     else if (r.taken) lines.push(`${name} is taken${r.owners.length ? ` by ${r.owners.map((m) => inlineCode(m)).join(", ")}` : ""}${r.latest ? `; latest ${inlineCode(r.latest.version)}${r.latest.score !== null ? `, score ${r.latest.score}/100` : ""}` : ""}.`);
     else if (r.unknown) lines.push(`Could not check ${name}: npm did not answer.`);
-    else if (r.available) lines.push(publishabilityText({ name, publishable: publishability({ name, available: r.available, scope: bare }) }));
+    else if (r.available) lines.push(publishabilityText({ name, publishable: publishability({ name, available: r.available, scope: claimed }) }));
     else lines.push(`${name} is free but cannot be published: ${r.conflicts.map((c) => c.reason).join("; ")}`);
 
     for (const l of r.lookalikes) lines.push(`Look-alike: ${oneLine(l.reason)}`);
@@ -236,7 +239,7 @@ const checkName: Tool<typeof CheckNameInput> = {
     else if (!bare) lines.push("Pass scope (your GitHub login) to check names under your own scope; a name under your own scope is always yours.");
 
     // `available` stays npm's answer about the name; `publishable` is whether apm lets you publish it
-    return text(lines.join("\n"), { ...r, publishable: publishability({ name, available: r.available && r.valid && !r.taken && !r.unknown, scope: bare }) });
+    return text(lines.join("\n"), { ...r, publishable: publishability({ name, available: r.available && r.valid && !r.taken && !r.unknown, scope: claimed }) });
   },
 };
 
