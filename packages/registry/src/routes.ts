@@ -153,6 +153,7 @@ const REGISTRY_WRITES = [
   { name: "login device", methods: ["POST"], pattern: path("/-/apm/v1/login/device") },
   { name: "login device token", methods: ["POST"], pattern: path("/-/apm/v1/login/device/token") },
   { name: "tokens revoke", methods: ["POST"], pattern: path("/-/apm/v1/account/tokens/revoke") },
+  { name: "passkey remove", methods: ["POST"], pattern: path("/-/apm/v1/account/passkeys/remove") },
   { name: "factor passkey-challenge", methods: ["POST"], pattern: path("/-/apm/v1/factor/passkey-challenge") },
   { name: "factor confirm", methods: ["POST"], pattern: path("/-/apm/v1/factor/confirm") },
   { name: "verify", methods: ["POST"], pattern: path("/-/apm/v1/verify") },

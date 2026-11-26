@@ -9,13 +9,15 @@ import { passkey } from "@better-auth/passkey";
 import { Pool } from "pg";
 import { z } from "zod";
 import { optedOut, signInMethod, type AccountEvents } from "./account-events.ts";
-import type { AuthOptions, GitHubEndpoints } from "./auth.ts";
+import type { AuthOptions, GitHubEndpoints, PasskeyUses } from "./auth.ts";
 import type { Store } from "./db.ts";
 import type { StoreError } from "./errors.ts";
 
 export { hashPassword, symmetricDecrypt, symmetricEncrypt, verifyPassword } from "better-auth/crypto";
 
 export { generateAuthenticationOptions, verifyAuthenticationResponse } from "@simplewebauthn/server";
+
+export { getAuthenticatorName } from "@better-auth/passkey";
 
 export { Pool };
 
@@ -29,6 +31,9 @@ const GITHUB: GitHubEndpoints = {
 const GitHubUser = z.object({ id: z.number(), login: z.string(), name: z.string().nullish(), email: z.string().nullish(), avatar_url: z.string().nullish() });
 const GitHubEmails = z.array(z.object({ email: z.string(), primary: z.boolean(), verified: z.boolean() }));
 
+/** The part of a passkey sign-in's body that names the passkey that answered. */
+const PasskeySignIn = z.object({ response: z.object({ id: z.string().min(1).max(1024) }) });
+
 export function buildBetterAuth(input: {
   pool: Pool;
   options: AuthOptions;
@@ -37,8 +42,9 @@ export function buildBetterAuth(input: {
   now: () => number;
   cliClientId: string;
   accountEvents: AccountEvents | null;
+  passkeyUses: PasskeyUses | null;
 }) {
-  const { pool, options, store, now, cliClientId, accountEvents } = input;
+  const { pool, options, store, now, cliClientId, accountEvents, passkeyUses } = input;
   const baseURL = input.baseURL.replace(/\/$/, "");
   const web = new URL(baseURL);
   const gh = options.github ? { ...options.github, endpoints: options.github.endpoints ?? GITHUB } : null;
@@ -72,6 +78,15 @@ export function buildBetterAuth(input: {
       session: {
         create: {
           after: async (session, ctx) => {
+            try {
+              // the account page's "last used" for the passkey that signed in, written after the answer
+              const signIn = signInMethod(ctx) === "passkey" ? PasskeySignIn.safeParse(ctx?.body) : null;
+
+              if (signIn?.success) passkeyUses?.({ authUserId: session.userId, credentialID: signIn.data.response.id, at: now() });
+            } catch {
+              // a lost "last used" never reaches the person signing in
+            }
+
             try {
               const method = signInMethod(ctx);
 
