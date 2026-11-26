@@ -158,7 +158,7 @@ Checks every installed version with the same check `apm add` runs after an insta
 apm publish [--bump patch|minor|major|<version>] [--dry-run] [--tag <tag>]
 ```
 
-Checks, packs with your package manager, previews the score, then uploads. With a login token the version is staged and the command prints the approval link. See [Publish a package](/guides/publishing).
+Checks, packs with your package manager, previews the score, then uploads. With a login token the version is staged and the command prints the approval link. See [Publish a package](/guides/publishing). It uploads only to a registry you chose (`APM_REGISTRY`, else `registry=` in `~/.npmrc`, else the default) and refuses one a project `.npmrc` or `npm_config_registry` picked.
 
 | Flag | Meaning |
 | --- | --- |
@@ -208,7 +208,7 @@ apm login [--no-browser]
 apm login --username <name> --password-stdin [--email <address>]
 ```
 
-The first form signs you in through the browser with a device code and saves a login token to your user `.npmrc`. A version published with it waits until you approve it on apmjs.dev. `--no-browser` only prints the link. The second form is npm's password login, for self-hosted registries that run with `APM_LEGACY_AUTH=1`.
+The first form signs you in through the browser with a device code and saves a login token to your user `.npmrc`. A version published with it waits until you approve it on apmjs.dev. `--no-browser` only prints the link. The second form is npm's password login, for self-hosted registries that run with `APM_LEGACY_AUTH=1`. Both sign in only to a registry you chose: `APM_REGISTRY`, else `registry=` in `~/.npmrc`, else the default. When a project `.npmrc` or `npm_config_registry` names another one, `apm login` refuses before it sends anything.
 
 ## apm explain
 
@@ -239,11 +239,11 @@ Prints the user the current token belongs to, and the registry.
 | Variable | Meaning |
 | --- | --- |
 | `APM_REGISTRY` | The registry to use. Wins over every config file. |
-| `APM_TOKEN` | A token to use instead of the one in `.npmrc`. Sent only to the registry it was issued for: `APM_REGISTRY`, else `registry=` in your user `.npmrc`, else the default. |
+| `APM_TOKEN` | A token to use instead of the one in `.npmrc`. Sent only to the registry it was issued for: `APM_REGISTRY`, else `registry=` in `~/.npmrc`, else the default. |
 | `npm_config_registry` | Used when `APM_REGISTRY` is not set. |
 | `npm_config_userconfig` | Path of the user `.npmrc`. Default `~/.npmrc`. |
 | `NO_COLOR` | Turn off colors. |
 | `APM_PENDING_WAIT_MS` | How long `apm add --strict` and `apm x --strict` keep asking about versions still being analysed. Default `90000`. |
 | `APM_STRICT` | `1` makes `apm add`, `apm x` and `apm explain` strict, as `--strict` does. |
 
-Without `APM_REGISTRY` or `npm_config_registry`, apm reads `registry=` from the nearest project `.npmrc`, then your user `.npmrc`, then uses `https://registry.apmjs.dev/`. The token is the `_authToken` line for that exact registry host; a `${VAR}` value is read from the environment.
+Without `APM_REGISTRY` or `npm_config_registry`, apm reads `registry=` from the nearest project `.npmrc`, then your user `.npmrc`, then uses `https://registry.apmjs.dev/`. The token is the `_authToken` line for that exact registry host; a `${VAR}` value is read from the environment. When a project `.npmrc` or `npm_config_registry` chose a registry other than the one `APM_TOKEN` belongs to, apm fills in a `${VAR}` token only from `~/.npmrc`, so a cloned repository cannot have apm send it one of your secrets. Set `APM_REGISTRY` to a registry you trust to lift this.

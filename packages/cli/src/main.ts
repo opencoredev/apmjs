@@ -3,7 +3,7 @@
 // then hands the real work to the package manager the project already uses.
 import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { delimiter, dirname, join, relative } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isValidPackageName, missingEntries, readTarball, SCORE_FLOOR, type FileLike } from "@apm/core";
 import { Api, ApiError, AuditResponse, NameResponse, RATE_LIMIT_RETRY, ResolveFail, ResolveOk, ResolvePending, ScoreResponse, Tree, encodeName, parseSpec, tagsWithoutLatest, type Capability, type DistTag, type InstallWarning, type Report } from "./api.ts";
@@ -11,7 +11,7 @@ import { installedPackages, isValidRange, type Found, type Installed } from "./a
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
 import { escapedPath, oneLine } from "./explain.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
-import { DEFAULT_REGISTRY, displayRegistry, isApmToken, loadConfig, sameRegistry, saveToken, type Config } from "./config.ts";
+import { DEFAULT_REGISTRY, displayRegistry, isApmToken, loadConfig, projectUserconfigSetter, sameRegistry, saveToken, tokenRegistry, type Config } from "./config.ts";
 import { capabilityLines } from "./capabilities.ts";
 import { isLockPm, isRegistryVersion, LOCKFILES, projectPins, readLock, yarnBerryNodes, type LockImporter, type LockNode, type LockPm } from "./lockfile.ts";
 import { parseArgs, type Args } from "./args.ts";
@@ -110,9 +110,16 @@ function env(): Record<string, string | undefined> {
 function config(cwd: string): Config {
   const cfg = loadConfig(cwd, env());
 
-  if (cfg.withheld) warn(yellow(`apm: APM_TOKEN is for ${cfg.withheld}, so it is not sent to ${cfg.registry} (set by a project .npmrc or npm_config_registry)`));
+  if (cfg.withheld) warn(yellow(`apm: APM_TOKEN is for ${shownRegistry(cfg.withheld)}, so it is not sent to ${shownRegistry(cfg.registry)} (set by a project .npmrc or npm_config_registry)`));
+
+  if (cfg.unexpanded) warn(yellow(`apm: ${shownRegistry(cfg.registry)} was chosen by a project .npmrc or npm_config_registry, so apm did not fill in the token ${escapedPath(cfg.unexpanded)} asks for. Set APM_REGISTRY to that registry if you trust it.`));
 
   return cfg;
+}
+
+/** A registry URL can carry a credential in its path or query: messages name it by origin only. */
+function shownRegistry(url: string): string {
+  return displayRegistry(url) ?? "a registry apm does not print";
 }
 
 /**
@@ -2426,7 +2433,10 @@ async function cmdState(a: Args, action: "yank" | "unyank" | "revoke" | "restore
     return 2;
   }
 
-  const api = new Api(config(process.cwd()));
+  const stateCfg = config(process.cwd());
+
+  if (refuseRepoChosenRegistry(stateCfg, `${action} a version on`)) return 1;
+  const api = new Api(stateCfg);
   const reason = flag(a, "reason");
   if (action === "revoke" && !reason) {
     warn("apm revoke needs --reason; everyone with this version installed will see it.");
@@ -2455,7 +2465,10 @@ async function cmdIncident(a: Args): Promise<number> {
     return 2;
   }
 
-  const api = new Api(config(process.cwd()));
+  const incidentCfg = config(process.cwd());
+
+  if (refuseRepoChosenRegistry(incidentCfg, "run an incident response on")) return 1;
+  const api = new Api(incidentCfg);
   const proof = await readProof(a);
   const body = { since, reason: flag(a, "reason") ?? "account compromised", ...proof, dryRun: has(a, "dry-run") };
   const r = await api.raw("-/apm/v1/incident", { method: "POST", body });
@@ -2497,10 +2510,83 @@ function openBrowser(url: string): void {
   }
 }
 
+/**
+ * apm login, apm publish and the account commands hand credentials only to a registry the user chose (APM_REGISTRY,
+ * ~/.npmrc or the default): one a project .npmrc or npm_config_registry picked would get the device code, the password,
+ * an authenticator code or, through the package manager's own `${VAR}` lines, the publish credentials. True when it
+ * refused.
+ */
+function refuseRepoChosenRegistry(cfg: Config, action: string): boolean {
+  const trusted = tokenRegistry(env());
+
+  if (sameRegistry(cfg.registry, trusted)) return false;
+  fail(`refused: apm would ${action} ${shownRegistry(cfg.registry)}, which a project .npmrc or npm_config_registry chose, not you.`);
+  say("Nothing was sent. To use it, set APM_REGISTRY to it, or put it as registry= in ~/.npmrc.");
+
+  return true;
+}
+
+/**
+ * apm login saves the token to the user config, which npm_config_userconfig names, and `npm run` and `npx` set that
+ * variable from a project .npmrc's `userconfig=` (a workspace's too, run from its folder). A token saved inside the
+ * project could be committed with it, so a path inside the repository (the nearest folder with .git, else the current
+ * one) is refused; ~/.npmrc itself always counts as the user's. True when it refused.
+ */
+function refuseUserconfigInProject(cfg: Config): boolean {
+  const file = resolve(cfg.userconfig);
+  const home = resolve(env().HOME ?? homedir());
+
+  if (file === join(home, ".npmrc")) return false;
+
+  // by path component: a file named `..pwn` inside the folder is inside it
+  const inside = (dir: string): boolean => {
+    const rel = relative(dir, file);
+
+    return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+  };
+
+  const cwd = process.cwd();
+
+  // a folder that holds the home folder (a dotfiles repo in git) is not a project
+  const holdsHome = (dir: string): boolean => {
+    const rel = relative(dir, home);
+
+    return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  };
+
+  let root: string | null = null;
+
+  // the outermost folder with .git that is not a dotfiles home: a submodule's .git file does not end the project there
+  for (let dir = cwd; ; dir = dirname(dir)) {
+    if (existsSync(join(dir, ".git")) && !holdsHome(dir)) root = dir;
+
+    if (dirname(dir) === dir) break;
+  }
+
+  const projectRoot = root ?? cwd;
+  // anywhere else, the file is the user's choice unless a project .npmrc named it
+  const setter = inside(projectRoot) ? null : projectUserconfigSetter(cwd, env());
+
+  if (setter !== null) {
+    fail(`refused: apm login would save the token to ${escapedPath(file)}, which ${escapedPath(setter)} chose with userconfig= (npm run and npx pass it on as npm_config_userconfig).`);
+    say("Nothing was sent. Run apm login outside this project, or without npm_config_userconfig set.");
+
+    return true;
+  }
+
+  if (!inside(projectRoot)) return false;
+  fail(`refused: apm login would save the token to ${escapedPath(file)}, inside this project (npm_config_userconfig, which a project .npmrc can set through npm run or npx).`);
+  say("Nothing was sent. Run apm login outside this project, or without npm_config_userconfig set.");
+
+  return true;
+}
+
 /** Device login: the browser signs in (GitHub or Vercel) and approves the code; the CLI gets a token that stages publishes. */
 async function cmdLogin(a: Args): Promise<number> {
   if (flag(a, "username") || flag(a, "password") || has(a, "password-stdin")) return cmdPasswordLogin(a);
   const cfg = config(process.cwd());
+
+  if (refuseRepoChosenRegistry(cfg, "sign in to") || refuseUserconfigInProject(cfg)) return 1;
   const api = new Api({ ...cfg, token: null });
   const start = await api.raw("-/apm/v1/login/device", { method: "POST", body: {} });
   const d = DeviceStart.safeParse(start.body);
@@ -2546,6 +2632,8 @@ async function cmdLogin(a: Args): Promise<number> {
 /** npm's password login, for registries that run with legacy auth on. */
 async function cmdPasswordLogin(a: Args): Promise<number> {
   const cfg = config(process.cwd());
+
+  if (refuseRepoChosenRegistry(cfg, "sign in to") || refuseUserconfigInProject(cfg)) return 1;
   const username = flag(a, "username") ?? (process.stdin.isTTY ? prompt("Username:") : null);
   if (!username) {
     warn("usage: apm login --username <name> --password-stdin");
@@ -2629,6 +2717,9 @@ async function cmdPublish(a: Args): Promise<number> {
   }
 
   const cfg = config(cwd);
+
+  // npm publish keeps credential variables and fills in the repo's own `${VAR}` auth lines for the registry it uploads to
+  if (refuseRepoChosenRegistry(cfg, "publish to")) return 1;
   const det = pmFor(a, cwd);
   const pj = Manifest.parse(JSON.parse(readFileSync(pjPath, "utf8")));
   // The upload goes to the registry apm checks and previews for, or nowhere: publishConfig and scoped
