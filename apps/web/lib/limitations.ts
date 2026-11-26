@@ -14,10 +14,15 @@ export const GENERAL_LIMITS: readonly string[] = [
 ];
 
 /**
- * Known vulnerabilities, on every list of what apm did not check: neither the score nor the install verdict reads a CVE
- * or GitHub advisory database. The site's own line, not core's NOT_CHECKED, whose wording stored analyses keep.
+ * Known vulnerabilities, on every list of what apm did not check: neither the score nor the install verdict reads the
+ * published security advisories. The site's own line, not core's NOT_CHECKED, whose wording stored analyses keep.
  */
-export const KNOWN_VULNERABILITIES = "Known vulnerabilities (published CVEs and GitHub security advisories): not part of the score or the install verdict. Run apm audit or npm audit after installing to list them.";
+export const KNOWN_VULNERABILITIES = "Known vulnerabilities (published security advisories): not part of the score or the install verdict. In a project, apm audit or npm audit lists the advisories for what is installed.";
+
+/** What was not checked, as an answer lists it for text and data alike: the scorer's list, then known vulnerabilities. */
+export function notCheckedList(scorer: readonly string[] | undefined): string[] {
+  return [...(scorer ?? []), KNOWN_VULNERABILITIES];
+}
 
 /** General entries earlier scorers wrote. Shown as today's list, not as written. */
 const EARLIER_GENERAL: ReadonlySet<string> = new Set([

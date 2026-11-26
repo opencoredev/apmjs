@@ -558,8 +558,8 @@ test("every verdict says known vulnerabilities are not checked, and where to fin
   const install = explainInstall({ name: "zod", range: null, resolve: ok(92), review: { kind: "queued" } });
   const missing = explainInstall({ name: "zod", range: null, resolve: { kind: "missing", reason: "no such package" }, review: { kind: "unreadable" } });
 
-  expect(KNOWN_VULNERABILITIES).toMatch(/CVE/);
-  expect(KNOWN_VULNERABILITIES).toMatch(/apm audit or npm audit/);
+  expect(KNOWN_VULNERABILITIES).toMatch(/published security advisories/);
+  expect(KNOWN_VULNERABILITIES).toMatch(/apm audit or npm audit lists the advisories for what is installed/);
   expect(install.notChecked).toEqual([KNOWN_VULNERABILITIES]);
   expect(missing.notChecked).toEqual([KNOWN_VULNERABILITIES]);
   expect(verdictText(install)).toContain(`Not checked:\n- ${KNOWN_VULNERABILITIES}`);
@@ -580,6 +580,13 @@ describe("parsePackageSpec", () => {
     expect(parsePackageSpec("JSONStream")).toEqual({ name: "JSONStream", range: null });
     expect(parsePackageSpec("JSONStream@^1.3")).toEqual({ name: "JSONStream", range: "^1.3" });
     expect(parsePackageSpec("JSON Stream")).toBeNull();
+  });
+
+  // the Kelvin sign lowercases to an ASCII k: a name is checked as given, in ASCII, never in a folded form
+  test("a non-ASCII character that lowercases to ASCII is not a name", () => {
+    expect(parsePackageSpec("\u212Aelvin")).toBeNull();
+    expect(parsePackageSpec("@\u212A/x")).toBeNull();
+    expect(parsePackageSpec("@Scope/X@1.2.3")).toEqual({ name: "@Scope/X", range: "1.2.3" });
   });
 });
 

@@ -62,7 +62,7 @@ describe("packageMarkdown", () => {
   });
 
   test("lists what was not checked, and pulled versions", () => {
-    expect(md).toContain(`## Not checked\n\n- \`what the code does at runtime\`\n- \`dependency foo@1 (could not score)\`\n- ${KNOWN_VULNERABILITIES}`);
+    expect(md).toContain(`## Not checked\n\n- \`what the code does at runtime\`\n- \`dependency foo@1 (could not score)\`\n- ${inlineCode(KNOWN_VULNERABILITIES)}`);
     expect(md).toContain("- 1.2.0: yanked, reason `broken build`. New installs skip it.");
   });
 

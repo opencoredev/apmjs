@@ -288,7 +288,7 @@ function ScorePanel({ score, name, version, unpackedSize }: { score: NonNullable
         >
           <div className={`h-full rounded-full ${tone.bar}`} style={{ width: `${Math.max(2, score.score)}%` }} />
         </div>)}
-        {notChecked.length > 0 && <LimitationsLine notChecked={notChecked} />}
+        <LimitationsLine notChecked={notChecked} />
         {score.redacted && <p className="w-full text-sm text-inverse-muted">This version was revoked, so its evidence lines are not shown.</p>}
       </div>
       <EvidenceAdminProvider>
@@ -343,7 +343,7 @@ function ScorePanel({ score, name, version, unpackedSize }: { score: NonNullable
         ))}
       </ul>
       </EvidenceAdminProvider>
-      {notChecked.length > 0 && <LimitationsList notChecked={notChecked} />}
+      <LimitationsList notChecked={notChecked} />
     </div>
   );
 }

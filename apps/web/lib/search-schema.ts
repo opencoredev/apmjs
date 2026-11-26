@@ -111,10 +111,11 @@ export function looksLikePackageName(q: string): boolean {
   return q.length > 0 && q.length <= 214 && NAME_RE.test(q);
 }
 
-/**
- * A name to look up as given: npm names are case-sensitive and legacy ones (JSONStream, Base64) have capitals, so the
- * name is checked in lowercase but never changed. A new name to claim must pass looksLikePackageName itself.
- */
+// NAME_RE with capitals: npm names are case-sensitive and legacy ones (JSONStream, Base64) have them. ASCII only, so
+// a character that lowercases to ASCII (the Kelvin sign) is not a name.
+const EXISTING_NAME_RE = /^(?:@[A-Za-z0-9][A-Za-z0-9._~-]*\/)?[A-Za-z0-9][A-Za-z0-9._~-]*$/;
+
+/** A name to look up as given, capitals included. A new name to claim must pass looksLikePackageName. */
 export function looksLikeExistingPackageName(q: string): boolean {
-  return looksLikePackageName(q.toLowerCase());
+  return q.length > 0 && q.length <= 214 && EXISTING_NAME_RE.test(q);
 }
