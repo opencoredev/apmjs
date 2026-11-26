@@ -59,19 +59,20 @@ jq '.unchecked' audit.json
 jq -e '(.findings | type == "array") and (.findings | length == 0) and (.checked > 0)' audit.json
 ```
 
-The last line also fails the job when the audit produced no result (for example `{"ok": false, "error": ...}` when the registry cannot be reached) or checked nothing.
+The last line also fails the job when the audit produced no result (for example `{"ok": false, "error": ...}` when the registry cannot be reached) or found no packages in `node_modules`.
 
 ### With a login token
 
 A request with a valid token has no cap on how many unscored versions it queues, and the registry accepts up to 2,000 packages per request (apm still sends 200 at a time). There is no separate CI token type yet; use the token `apm login` gives you:
 
 1. On your own machine, run `APM_REGISTRY=https://registry.apmjs.dev/ apm login`, open the link it prints, check the code and approve. Setting `APM_REGISTRY` keeps a project `.npmrc` that points at `~safe` from changing which registry the token is saved for. apm writes the token to your user `.npmrc`, on the `//registry.apmjs.dev/:_authToken=` line.
-2. Copy that token into a CI secret and expose it as `APM_TOKEN` to every step that runs apm. In GitHub Actions:
+2. Copy that token into a CI secret and expose it as `APM_TOKEN` to the audit step, with `APM_REGISTRY` pinned to the registry the token belongs to. In GitHub Actions:
 
    ```yaml
    - name: apm audit
      env:
        APM_TOKEN: ${{ secrets.APM_TOKEN }}
+       APM_REGISTRY: https://registry.apmjs.dev/
      run: |
        apm whoami
        apm audit --json
@@ -79,7 +80,7 @@ A request with a valid token has no cap on how many unscored versions it queues,
 
    `apm whoami` stops the job with `not logged in` when the token no longer works. Without it, a revoked or expired token makes `apm audit` run as anonymous.
 
-apm sends `APM_TOKEN` only when the registry it talks to is the one the token is bound to: `APM_REGISTRY`, else `registry=` in your user `.npmrc`, else `https://registry.apmjs.dev/` (host, path and protocol must match). It also keeps `APM_TOKEN` out of the environment of the package manager, install scripts and binaries it runs. If your project `.npmrc` points at the `~safe` view, apm talks to `https://registry.apmjs.dev/~safe/`, holds the token back and prints `APM_TOKEN is for https://registry.apmjs.dev/, so it is not sent to ...`. Set `APM_REGISTRY=https://registry.apmjs.dev/` for the audit step in that case.
+apm sends `APM_TOKEN` only when the registry it talks to is the one the token is bound to: `APM_REGISTRY`, else `registry=` in your user `.npmrc`, else `https://registry.apmjs.dev/` (host, path and protocol must match). It also keeps `APM_TOKEN` out of the environment of the package manager, install scripts and binaries it runs. The example sets `APM_REGISTRY` for that reason: without it, a project `.npmrc` that points at the `~safe` view makes apm talk to `https://registry.apmjs.dev/~safe/`, hold the token back and print `APM_TOKEN is for https://registry.apmjs.dev/, so it is not sent to ...`.
 
 The token has the powers the warning under [Upload from CI](#upload-from-ci) describes, so treat it like a publish token.
 

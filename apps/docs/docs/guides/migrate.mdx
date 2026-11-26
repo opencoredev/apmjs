@@ -59,7 +59,7 @@ yarn install --frozen-lockfile
 
 If you chose the `~safe` view, replace with `https://registry.apmjs.dev/~safe/` instead: yarn 1 downloads from the URL in the lockfile, so entries rewritten to the plain registry would skip the view's rules.
 
-`apm add` hands its own registry to the package manager it runs: apm's, unless `APM_REGISTRY` or an `.npmrc` names another. So in bun and npm projects it writes apm URLs into the lockfile even before you add the setting.
+`apm add` hands its own configured registry to the package manager it runs (apm's by default). So in bun and npm projects it writes apm URLs into the lockfile even before you add the setting.
 
 `apm add` asks your package manager for the exact version it checked (`ms@2.1.3`). With their default settings, bun and pnpm then write that exact version to `package.json` (`"ms": "2.1.3"`), where `bun add ms` and `pnpm add ms` write a range (`"ms": "^2.1.3"`); npm writes a range either way. If you want a range, edit `package.json` afterwards.
 
@@ -125,4 +125,4 @@ Then clear what is left:
 - In CI, remove the `apm audit` step and the `APM_TOKEN` secret, and any `APM_REGISTRY` or `npm_config_registry` that points at apm. Without a registry setting the apm CLI still talks to apm, so a leftover audit step keeps running against it.
 - If you pointed your user config at apm (`~/.npmrc`, `~/.bunfig.toml`), remove the line there too.
 - To sign out, delete the `//registry.apmjs.dev/:_authToken=` line from your user `.npmrc` and revoke the token on your account page at `https://apmjs.dev/account`.
-- To remove the CLI, delete the folder it installed to (`~/.apm`, or the `APM_INSTALL` folder you chose), or run `brew uninstall opencoredev/tap/apm` if you installed it with Homebrew.
+- To remove the CLI, delete `~/.apm/bin/apm` (or `<dir>/bin/apm` if you installed with `APM_INSTALL=<dir>`; delete only that file, since the folder may hold other software), or run `brew uninstall opencoredev/tap/apm` if you installed it with Homebrew.
