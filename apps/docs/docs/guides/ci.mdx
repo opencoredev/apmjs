@@ -49,17 +49,20 @@ A CI job with no apm token audits anonymously. apm sends the installed versions 
 unchecked semver@7.8.2  not checked: anonymous scan queues at most 8 unscored packages per request; sign in (apm login) to queue more
 ```
 
-So an anonymous audit fails on a project with more than a handful of versions nobody has scored yet, which is common right after you move a real app to apm. Scores are shared: once a version has been scored, every later audit, yours or anyone's, uses that score. The anonymous audit still reports revoked, yanked and confirmed-malicious versions, versions on the OSSF malicious-packages list, and upstream advisories for every package, because the registry checks those before it looks at the score.
+So an anonymous audit fails on a project with more than a handful of versions nobody has scored yet, which is common right after you move a real app to apm. Scores are shared: once a version has been scored, every later audit, yours or anyone's, uses that score. The anonymous audit still reports revoked, yanked and confirmed-malicious versions and versions on the OSSF malicious-packages list, because the registry checks those before it looks at the score. Upstream advisories come from a separate request; when it fails, the affected packages are listed under `unchecked` with `advisories could not be fetched from the upstream registry`.
 
-To fail the job only on what was found, and print what could not be checked without failing on it, read the JSON. This needs `jq`:
+To fail the job on what was found and on every check that could not run, but not on versions that are only waiting for a score, read the JSON. This needs `jq`:
 
 ```bash
 apm audit --json > audit.json || true
 jq '.unchecked' audit.json
-jq -e '(.findings | type == "array") and (.findings | length == 0) and (.checked > 0)' audit.json
+jq -e '
+  (.findings | type == "array") and (.findings | length == 0) and (.checked > 0) and
+  ([.unchecked[] | select(.reason | (startswith("not checked: anonymous scan queues") or startswith("not scored yet")) | not)] | length == 0)
+' audit.json
 ```
 
-The last line also fails the job when the audit produced no result (for example `{"ok": false, "error": ...}` when the registry cannot be reached) or found no packages in `node_modules`.
+The last command passes only when nothing was found and the only unchecked entries are versions over the anonymous queue cap or still being analysed. It fails when the audit produced no result (for example `{"ok": false, "error": ...}` when the registry cannot be reached), found no packages in `node_modules`, or could not fetch advisories or read a package.
 
 ### With a login token
 
