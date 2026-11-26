@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { COMMANDS } from "../src/commands.ts";
 
 const CLI = join(import.meta.dir, "..", "src", "main.ts");
+
 // a bun project: with no lockfile, a package.json alone is npm's (apm add's default since HOME-638), and these runs read bun's rules
 const PACKAGE_JSON = `${JSON.stringify({ name: "help-probe", version: "1.0.0", main: "index.js", packageManager: "bun@1.4.4" })}\n`;
 let requests: string[] = [];

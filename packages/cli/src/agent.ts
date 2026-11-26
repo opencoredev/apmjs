@@ -68,9 +68,9 @@ export function parseReview(answer: RawAnswer): ReviewInput {
 }
 
 /** The AI review of one version, read from the registry; a read that failed is "unreadable". */
-export async function reviewOf(api: Api, name: string, version: string): Promise<ReviewInput> {
+export async function reviewOf(api: Api, name: string, version: string, timeoutMs?: number): Promise<ReviewInput> {
   try {
-    return parseReview(await api.raw(`-/apm/v1/review/${encodeName(name)}/${encodeURIComponent(version)}`));
+    return parseReview(await api.raw(`-/apm/v1/review/${encodeName(name)}/${encodeURIComponent(version)}`, {}, timeoutMs));
   } catch {
     return { kind: "unreadable" };
   }
@@ -102,7 +102,7 @@ export function okInput(ok: ResolveOk): Extract<ResolvedInput, { kind: "ok" }> {
  * would run in (`strict`, from --strict or APM_STRICT=1). No os or cpu, as apm add sends none: every platform's
  * optional packages are checked.
  */
-async function resolvedFor(input: { api: Api; name: string; range: string | null; strict: boolean; warn: (line: string) => void }): Promise<ResolvedInput> {
+export async function resolvedFor(input: { api: Api; name: string; range: string | null; strict: boolean; warn: (line: string) => void }): Promise<ResolvedInput> {
   const { api, name, range } = input;
   let r: { status: number; body: unknown; tries: number };
   const params = new URLSearchParams({ name, range: range ?? "latest" });

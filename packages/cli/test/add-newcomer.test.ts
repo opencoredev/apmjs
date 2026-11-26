@@ -13,8 +13,43 @@ const typosquat = { id: "typosquat", label: "Name looks like a popular package's
 const AddJson = z.object({
   ok: z.boolean(),
   pm: z.string(),
-  packages: z.array(z.object({ name: z.string(), blocked: z.boolean(), reason: z.string().nullable(), warnings: z.array(z.object({ kind: z.string(), name: z.string(), version: z.string(), text: z.string() }).loose()) }).loose()),
+  packages: z.array(z.object({ name: z.string(), blocked: z.boolean(), reason: z.string().nullable(), warnings: z.array(z.object({ kind: z.string(), name: z.string(), version: z.string(), text: z.string(), reasons: z.array(z.string()), via: z.array(z.string()) }).loose()) }).loose()),
 });
+
+/** The registry's answer for name@range: a scored version, fresh or not, or nothing in range. */
+function resolveAnswer(name: string, range: string): Response {
+  const report = (score: number, signals: unknown[]) => ({ scorer: "apm-score-v11", coverage: { kind: "complete" }, score, grade: score >= 75 ? "A" : "F", signals });
+
+  const ok = (version: string, score: number, signals: unknown[], fresh: boolean) =>
+    Response.json({
+      name,
+      range,
+      source: "upstream",
+      version,
+      report: report(score, signals),
+      skipped: [],
+      tree: { unchecked: 0, uncheckedDeps: [], packages: [], projectPeers: [], risks: [], reviews: { kind: "off" } },
+      warnings: fresh ? [{ name, version, kind: "cooldown", score, grade: "A", text: "published 2h ago, inside apm's 24-hour cooldown", reasons: [], url: "", via: [] }] : [],
+    });
+
+  const none = () => Response.json({ error: `No version of ${name} matching ${range} passes the policy.`, name, range, version: null, skipped: [] }, { status: 422 });
+
+  switch (name) {
+    case "loadsh":
+    case "noreview":
+      return ok("1.0.0", 75, [typosquat], false);
+    case "lowscore":
+      return ok("1.0.0", 30, [], false);
+    case "fresh":
+      // an exact pin of the only version, inside the cooldown: nothing older to pick
+      return range.startsWith("<") || range.includes(" <") ? none() : ok("1.0.0", 95, [], true);
+    case "fresh-older":
+      // the newest is inside the cooldown; the one before it is past it and clean
+      return range.includes("<2.0.0") ? ok("1.0.0", 95, [], false) : ok("2.0.0", 95, [], true);
+    default:
+      return ok("1.0.0", 95, [], false);
+  }
+}
 
 describe("apm add for a newcomer", () => {
   let server: ReturnType<typeof Bun.serve>;
@@ -30,7 +65,7 @@ describe("apm add for a newcomer", () => {
     mkdirSync(bin);
 
     for (const pm of ["npm", "pnpm", "bun", "yarn"]) {
-      writeFileSync(join(bin, pm), `#!/bin/sh\necho ${pm} "$@" >> "$RAN_LOG"\nexit 7\n`);
+      writeFileSync(join(bin, pm), `#!/bin/sh\n[ "$1" = --version ] && echo 4.5.0 && exit 0\necho ${pm} "$@" >> "$RAN_LOG"\nexit 7\n`);
       chmodSync(join(bin, pm), 0o755);
     }
 
@@ -40,12 +75,9 @@ describe("apm add for a newcomer", () => {
       fetch(req) {
         const url = new URL(req.url);
 
-        if (url.pathname === "/-/apm/v1/resolve") {
-          const name = url.searchParams.get("name") ?? "";
-          const report = { scorer: "apm-score-v11", coverage: { kind: "complete" }, score: name === "loadsh" ? 75 : 95, grade: name === "loadsh" ? "B" : "A", signals: name === "loadsh" ? [typosquat] : [] };
+        if (url.pathname === "/-/apm/v1/resolve") return resolveAnswer(url.searchParams.get("name") ?? "", url.searchParams.get("range") ?? "latest");
 
-          return Response.json({ name, range: "latest", source: "upstream", version: "1.0.0", report, skipped: [], tree: { unchecked: 0, uncheckedDeps: [], packages: [], projectPeers: [], risks: [], reviews: { kind: "off" } }, warnings: [] });
-        }
+        if (url.pathname.startsWith("/-/apm/v1/review/noreview/")) return Response.json({ error: "unavailable" }, { status: 503 });
 
         return Response.json({ error: "Not found" }, { status: 404 });
       },
@@ -69,24 +101,44 @@ describe("apm add for a newcomer", () => {
 
   const manifest = JSON.stringify({ name: "app", version: "1.0.0", private: true });
 
-  async function apm(args: string[], opts: { cwd: string; path?: string; strictEnv?: true }): Promise<{ code: number; out: string; text: string }> {
+  /** The environment apm runs with here: APM_REGISTRY and APM_STRICT only when a test asks for them. */
+  type AddEnv = { PATH: string; TMPDIR: string; HOME: string; NO_COLOR: string; APM_TOKEN: string; RAN_LOG: string; APM_REGISTRY?: string; APM_STRICT?: string };
+
+  /** apm in `cwd`; `registry: "npmrc"` leaves APM_REGISTRY unset, so the project's .npmrc names the registry. */
+  async function apm(args: string[], opts: { cwd: string; path?: string; strictEnv?: true; registry?: "npmrc" }): Promise<{ code: number; out: string; text: string }> {
     rmSync(join(root, "ran.log"), { force: true });
-    const env = { ...(opts.strictEnv ? { APM_STRICT: "1" } : {}), PATH: opts.path ?? `${bin}:/usr/bin:/bin`, TMPDIR: root, HOME: folder(`home-${crypto.randomUUID()}`), APM_REGISTRY: server.url.toString(), NO_COLOR: "1", APM_TOKEN: "", RAN_LOG: join(root, "ran.log") };
+    const env: AddEnv = { PATH: opts.path ?? `${bin}:/usr/bin:/bin`, TMPDIR: root, HOME: folder(`home-${crypto.randomUUID()}`), NO_COLOR: "1", APM_TOKEN: "", RAN_LOG: join(root, "ran.log") };
+
+    if (opts.registry !== "npmrc") env.APM_REGISTRY = server.url.toString();
+
+    if (opts.strictEnv) env.APM_STRICT = "1";
     const proc = Bun.spawn([process.execPath, join(import.meta.dir, "..", "src", "main.ts"), ...args], { cwd: opts.cwd, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
     const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
 
     return { code, out, text: out + err };
   }
 
+  const kinds = (out: string): string[] => AddJson.parse(JSON.parse(out)).packages.flatMap((p) => p.warnings.map((w) => w.kind));
+
   test("a package apm explain calls review-first is a warning in --json, and the add goes on without --strict", async () => {
     const cwd = folder("rf-default", { "package.json": manifest });
     const r = await apm(["add", "loadsh", "--pm", "npm", "--json"], { cwd });
-    const doc = AddJson.parse(JSON.parse(r.out));
-    const [pkg] = doc.packages;
+    const [pkg] = AddJson.parse(JSON.parse(r.out)).packages;
 
     expect(pkg?.blocked).toBe(false);
-    expect(pkg?.warnings.map((w) => w.kind)).toEqual(["review-first"]);
-    expect(pkg?.warnings[0]?.text).toContain("Review loadsh@1.0.0 before installing: apm found a risk signal in it: Name looks like a popular package's");
+    expect(pkg?.warnings).toEqual([
+      {
+        kind: "review-first",
+        name: "loadsh",
+        version: "1.0.0",
+        score: 75,
+        grade: "A",
+        text: "Review loadsh@1.0.0 before installing: apm found a risk signal in it: Name looks like a popular package's. It passes apm's install policy and scores 75/100 (A). No AI review: this registry runs none.",
+        reasons: ["Name looks like a popular package's (-20 points).", "This registry runs no AI review."],
+        url: null,
+        via: [],
+      },
+    ]);
     expect(r.text).toContain("apm explain calls loadsh@1.0.0 review-first, and apm add installs it anyway. To refuse it instead, run with --strict");
     // the package manager was started (and failed, as the stand-in does): the add went ahead
     expect(ran()).toContain("npm install --package-lock-only");
@@ -103,78 +155,134 @@ describe("apm add for a newcomer", () => {
     expect(doc.ok).toBe(false);
     expect(pkg?.blocked).toBe(true);
     expect(pkg?.reason).toBe("loadsh@1.0.0: strict mode refuses what apm explain calls review-first");
-    expect(pkg?.warnings.map((w) => w.kind)).toEqual(["review-first"]);
+    expect(kinds(r.out)).toEqual(["review-first"]);
     expect(r.text).toContain("refused: loadsh@1.0.0: strict mode refuses what apm explain calls review-first");
-    expect(r.text).toContain("apm explain loadsh says why; to install with a warning instead, run apm add without --strict.");
+    expect(r.text).toContain("Nothing was changed. apm explain says why:\n  apm explain loadsh@1.0.0\nTo install with a warning instead, run apm add without --strict.");
     expect(r.text).not.toContain("--force does not help");
     expect(ran()).toBe("");
     expect(readFileSync(join(cwd, "package.json"), "utf8")).toBe(manifest);
     expect(existsSync(join(cwd, "package-lock.json"))).toBe(false);
   });
 
-  test("APM_STRICT=1 refuses it the same way, and a package explain would install is not held", async () => {
+  test("APM_STRICT=1 refuses it the same way and says to unset it; a package explain would install is not held", async () => {
     const cwd = folder("rf-clean", { "package.json": manifest });
     const held = await apm(["add", "--json", "loadsh", "--pm", "npm"], { cwd, strictEnv: true });
 
     expect(held.code).toBe(1);
     expect(AddJson.parse(JSON.parse(held.out)).ok).toBe(false);
+    expect(held.text).toContain("run apm add with APM_STRICT unset and without --strict");
     expect(ran()).toBe("");
 
     const clean = await apm(["add", "--strict", "--json", "good", "--pm", "npm"], { cwd });
-    const [pkg] = AddJson.parse(JSON.parse(clean.out)).packages;
 
-    expect(pkg?.blocked).toBe(false);
-    expect(pkg?.warnings).toEqual([]);
+    expect(kinds(clean.out)).toEqual([]);
     expect(clean.text).not.toContain("review-first");
     expect(ran()).toContain("npm install --package-lock-only");
   });
 
-  test("a gitignored .npmrc that points installs at apm gets one warning; a committed one, no repository or no git gets none", async () => {
+  test("the floor the add asks for is the one explain weighs: --force and --floor lift a low score, the default holds it", async () => {
+    const cwd = folder("rf-floor", { "package.json": manifest });
+    const held = await apm(["add", "--strict", "--json", "lowscore", "--pm", "npm"], { cwd });
+
+    expect(held.code).toBe(1);
+    expect(AddJson.parse(JSON.parse(held.out)).packages[0]?.warnings[0]?.text).toContain("under apm's floor of 40");
+
+    for (const flags of [["--force"], ["--floor", "20"]]) {
+      const r = await apm(["add", "--strict", "--json", ...flags, "lowscore", "--pm", "npm"], { cwd });
+
+      expect(kinds(r.out), flags.join(" ")).toEqual([]);
+      expect(ran()).toContain("npm install --package-lock-only");
+    }
+  });
+
+  test("a fresh version with nothing older in range is review-first as in explain; one with an older clean version is not", async () => {
+    const cwd = folder("rf-fresh", { "package.json": manifest });
+    const pinned = await apm(["add", "--json", "fresh@1.0.0", "--pm", "npm"], { cwd });
+
+    expect(kinds(pinned.out)).toEqual(["cooldown", "review-first"]);
+    expect(pinned.text).toContain("it was published inside apm's 24-hour cooldown and no older version in range is past it");
+
+    const older = await apm(["add", "--json", "fresh-older", "--pm", "npm"], { cwd });
+
+    expect(kinds(older.out)).toEqual(["cooldown"]);
+  });
+
+  test("an AI review apm cannot read leaves explain at unknown: the add's own checks decide, as before", async () => {
+    const cwd = folder("rf-unknown", { "package.json": manifest });
+    const strict = await apm(["add", "--strict", "--json", "noreview", "--pm", "npm"], { cwd });
+
+    expect(kinds(strict.out)).toEqual([]);
+    expect(ran()).toContain("npm install --package-lock-only");
+  });
+
+  const git = (args: string[], cwd: string): void => void Bun.spawnSync(["git", ...args], { cwd, stdout: "ignore", stderr: "ignore" });
+
+  test("a gitignored .npmrc that apm takes the registry from gets one warning; tracked, shadowed or no repository gets none", async () => {
     const npmrc = `registry=${server.url.toString()}\n`;
-    // the test root's .git is an empty folder, not a repository: git check-ignore fails, and apm says nothing
+    // the test root's .git is an empty folder, not a repository: git says it is not a work tree, and apm says nothing
     const notRepo = folder("gi/not-a-repo", { "package.json": manifest, ".npmrc": npmrc, ".gitignore": ".npmrc\n" });
-    const outside = await apm(["add", "good", "--pm", "npm"], { cwd: notRepo });
+    const outside = await apm(["add", "good", "--pm", "npm"], { cwd: notRepo, registry: "npmrc" });
 
     expect(outside.text).not.toContain("git ignores");
     expect(outside.text).toContain("npm install --package-lock-only");
 
     const repo = folder("gi/repo", { "package.json": manifest, ".npmrc": npmrc, ".gitignore": ".npmrc\n" });
-    const git = (args: string[], cwd: string): void => void Bun.spawnSync(["git", ...args], { cwd, stdout: "ignore", stderr: "ignore" });
 
-    rmSync(join(repo, ".git"), { recursive: true, force: true });
     git(["init", "-q"], repo);
-    const ignored = await apm(["add", "good", "--pm", "npm"], { cwd: repo });
+    const ignored = await apm(["add", "good", "--pm", "npm"], { cwd: repo, registry: "npmrc" });
 
     expect(ignored.text).toContain("apm: git ignores .npmrc, which points installs at apm's registry, so clones and CI will not install through apm until it is committed (keep any token out of it)");
 
+    // APM_REGISTRY names the registry: the .npmrc is not what this add relies on
+    expect((await apm(["add", "good", "--pm", "npm"], { cwd: repo })).text).not.toContain("git ignores");
+
     // without git on PATH, apm says nothing about it and goes on
-    const noGit = await apm(["add", "good", "--pm", "npm"], { cwd: repo, path: bin });
+    const noGit = await apm(["add", "good", "--pm", "npm"], { cwd: repo, path: bin, registry: "npmrc" });
 
     expect(noGit.text).not.toContain("git ignores");
     expect(noGit.text).toContain("npm install --package-lock-only");
 
+    // a git that cannot start is no git
+    const broken = folder("gi/broken-bin");
+
+    writeFileSync(join(broken, "git"), "#!/no/such/interpreter\n");
+    chmodSync(join(broken, "git"), 0o755);
+    const brokenGit = await apm(["add", "good", "--pm", "npm"], { cwd: repo, path: `${broken}:${bin}`, registry: "npmrc" });
+
+    expect(brokenGit.text).not.toContain("git ignores");
+    expect(brokenGit.text).toContain("npm install --package-lock-only");
+
     // a committed .npmrc is tracked, so git does not report it as ignored
     git(["add", "-f", ".npmrc"], repo);
-    const tracked = await apm(["add", "good", "--pm", "npm"], { cwd: repo });
-
-    expect(tracked.text).not.toContain("git ignores");
-
-    // another registry in an ignored .npmrc is not apm's to warn about
-    const other = folder("gi/other", { "package.json": manifest, ".npmrc": "registry=https://registry.npmjs.org/\n", ".gitignore": ".npmrc\n" });
-
-    git(["init", "-q"], other);
-    expect((await apm(["add", "good", "--pm", "npm"], { cwd: other })).text).not.toContain("git ignores");
+    expect((await apm(["add", "good", "--pm", "npm"], { cwd: repo, registry: "npmrc" })).text).not.toContain("git ignores");
   });
 
-  test("a gitignored bunfig.toml or .yarnrc.yml with apm's registry is named too", async () => {
+  test("an ignored .npmrc above a nested project, where apm takes the registry from, is named by its path", async () => {
+    const top = folder("gi/parent", { ".npmrc": `registry=${server.url.toString()}\n`, ".gitignore": ".npmrc\n" });
+    const nested = folder("gi/parent/apps/web", { "package.json": manifest });
+
+    git(["init", "-q"], top);
+    const r = await apm(["add", "good", "--pm", "npm"], { cwd: nested, registry: "npmrc" });
+
+    expect(r.text).toContain(`apm: git ignores ${join("..", "..", ".npmrc")}, which points installs at apm's registry`);
+  });
+
+  test("a gitignored bunfig.toml or .yarnrc.yml with apm's registry is named only for the package manager that reads it", async () => {
     const registry = server.url.toString();
-    const repo = folder("gi/bun", { "package.json": manifest, "bunfig.toml": `[install]\nregistry = "${registry}"\n`, ".yarnrc.yml": `npmRegistryServer: "${registry}"\n`, ".gitignore": "bunfig.toml\n.yarnrc.yml\n" });
+    const repo = folder("gi/native", { "package.json": manifest, "bunfig.toml": `[install]\nregistry = "${registry}"\n`, ".yarnrc.yml": `npmRegistryServer: "${registry}"\n`, ".gitignore": "bunfig.toml\n.yarnrc.yml\n" });
 
-    Bun.spawnSync(["git", "init", "-q"], { cwd: repo, stdout: "ignore", stderr: "ignore" });
-    const r = await apm(["add", "good", "--pm", "npm"], { cwd: repo });
+    git(["init", "-q"], repo);
+    const bun = await apm(["add", "good", "--pm", "bun"], { cwd: repo });
 
-    expect(r.text).toContain("apm: git ignores bunfig.toml,");
-    expect(r.text).toContain("apm: git ignores .yarnrc.yml,");
+    expect(bun.text).toContain("apm: git ignores bunfig.toml,");
+    expect(bun.text).not.toContain(".yarnrc.yml");
+
+    const yarn = await apm(["add", "good", "--pm", "yarn"], { cwd: repo });
+
+    expect(yarn.text).toContain("apm: git ignores .yarnrc.yml,");
+    expect(yarn.text).not.toContain("git ignores bunfig.toml");
+
+    expect((await apm(["add", "good", "--pm", "npm"], { cwd: repo })).text).not.toContain("git ignores");
   });
 
   test("an npm init -y project (package.json, no lockfile, packageManager or bunfig) is added with npm, not bun", async () => {
@@ -183,6 +291,18 @@ describe("apm add for a newcomer", () => {
 
     expect(r.text).toContain("(npm: default for a project with no lockfile or packageManager;");
     expect(ran()).toStartWith("npm install --package-lock-only");
+    expect(ran()).not.toContain("bun ");
+
+    // with only bun on PATH it still is npm's project, and apm says how to use bun instead
+    const bunOnly = folder("pm/bun-only-bin");
+
+    writeFileSync(join(bunOnly, "bun"), readFileSync(join(bin, "bun")));
+    chmodSync(join(bunOnly, "bun"), 0o755);
+    const noNpm = await apm(["add", "good"], { cwd, path: bunOnly });
+
+    expect(noNpm.code).toBe(1);
+    expect(noNpm.text).toContain("(npm: default for a project with no lockfile or packageManager; npm is not on PATH, so pass --pm bun to use bun;");
+    expect(readFileSync(join(cwd, "package.json"), "utf8")).toBe(manifest);
     expect(ran()).not.toContain("bun ");
   });
 });

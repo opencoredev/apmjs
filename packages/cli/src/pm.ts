@@ -35,7 +35,7 @@ function findUp(cwd: string, test: (dir: string) => Detection | null): Detection
 
 /**
  * --pm flag, then the nearest lockfile, then package.json "packageManager", then a bunfig.toml (bun). A project with
- * none of them (`npm init -y`) gets npm, which every Node install has; bun only when npm is not installed. Outside any
+ * none of them (`npm init -y`) gets npm, which every Node install has (when npm is missing, the reason says to pass --pm bun). Outside any
  * project (no package.json), bun when it is installed, else npm.
  */
 export function detectPm(cwd: string, flag: string | null): Detection {
@@ -69,9 +69,9 @@ export function detectPm(cwd: string, flag: string | null): Detection {
 
   const project = findUp(cwd, (dir) => (existsSync(join(dir, "package.json")) ? { pm: "npm", why: "default for a project with no lockfile or packageManager" } : null));
 
-  if (project && (Bun.which("npm") || !Bun.which("bun"))) return project;
+  if (project) return Bun.which("npm") ? project : { pm: "npm", why: `${project.why}; npm is not on PATH, so pass --pm bun to use bun` };
 
-  if (Bun.which("bun")) return { pm: "bun", why: project ? "default (npm is not installed)" : "default outside a project (bun is installed)" };
+  if (Bun.which("bun")) return { pm: "bun", why: "default outside a project (bun is installed)" };
 
   return { pm: "npm", why: "default" };
 }
