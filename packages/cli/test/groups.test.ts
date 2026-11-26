@@ -266,6 +266,25 @@ describe("finding 1 of a24c6aa: section headers read with the grammar of npm's o
       expect(env(path, { APM_REGISTRY: "https://r.example/" })).toMatchObject({ registry: "https://r.example/", token: "apm_envenvenvenvenvenv01", withheld: null });
     }
   });
+
+  test("the warning that APM_TOKEN was withheld names registries by origin only, never a credential in the URL", async () => {
+    // a refused port: whoami fails at once, after the warning
+    const p = project({ user: "[custom] \nregistry=http://127.0.0.1:9/SECRET_PATH_TOKEN/?key=SECRET_QUERY_KEY\n" });
+
+    const proc = Bun.spawn([process.execPath, join(import.meta.dir, "..", "src", "main.ts"), "whoami"], {
+      cwd: p.root,
+      env: { HOME: p.env.HOME, APM_TOKEN: "apm_envenvenvenvenvenv01", NO_COLOR: "1", PATH: "/usr/bin:/bin" },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+
+    expect(err).toContain("APM_TOKEN is not sent");
+    expect(err).toContain("http://127.0.0.1:9/");
+    expect(out + err).not.toContain("SECRET_");
+  });
 });
 
 describe("pnpm and bun", () => {

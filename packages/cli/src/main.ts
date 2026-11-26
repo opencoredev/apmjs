@@ -110,8 +110,11 @@ function env(): Record<string, string | undefined> {
 function config(cwd: string): Config {
   const cfg = loadConfig(cwd, env());
 
-  if (cfg.withheld?.kind === "other-registry") warn(yellow(`apm: APM_TOKEN is for ${cfg.withheld.registry}, so it is not sent to ${cfg.registry} (set by a project .npmrc or npm_config_registry)`));
-  else if (cfg.withheld?.kind === "ambiguous") warn(yellow(`apm: APM_TOKEN is not sent: ${cfg.userconfig} names its registry ${cfg.withheld.exact} to npm 9.2 and ${cfg.withheld.spaced} to npm 11 (a "[section] " header with a trailing space); set APM_REGISTRY to the one the token is for`));
+  // a registry URL can carry a credential: warnings name it by origin only
+  const shown = (url: string): string => displayRegistry(url) ?? "a registry apm does not print";
+
+  if (cfg.withheld?.kind === "other-registry") warn(yellow(`apm: APM_TOKEN is for ${shown(cfg.withheld.registry)}, so it is not sent to ${shown(cfg.registry)} (set by a project .npmrc or npm_config_registry)`));
+  else if (cfg.withheld?.kind === "ambiguous") warn(yellow(`apm: APM_TOKEN is not sent: ${cfg.userconfig} names its registry ${shown(cfg.withheld.exact)} to npm 9.2 and ${shown(cfg.withheld.spaced)} to npm 11 (a "[section] " header with a trailing space); set APM_REGISTRY to the one the token is for`));
 
   return cfg;
 }
