@@ -37,6 +37,7 @@ export default defineConfig({
     copyright: "apm is MIT licensed.",
     links: [
       { label: "apmjs.dev", href: "https://apmjs.dev/" },
+      { label: "apm vs Socket", href: "https://apmjs.dev/compare/socket" },
       { label: "Privacy", href: "https://apmjs.dev/privacy" },
       { label: "Terms", href: "https://apmjs.dev/terms" },
       { label: "Status", href: "https://status.apmjs.dev" },
