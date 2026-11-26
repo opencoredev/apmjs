@@ -19,7 +19,7 @@ import { addArgs, detectPm, frozenInstallArgs, installLockOnlyArgs, lockOnlyArgs
 import { checkedCount, checkGraph, DEFAULT_CHECK, idOf, lockGraph, type Blocked, type CheckPolicy, type InstalledPackage, type LocalPackage, type LockGraph, type Member } from "./installed.ts";
 import { pnpmRebuildable, removeInstalled, verifyInstall, type Omitted, type Placed } from "./verify.ts";
 import { devGroup, type DevGroup, omitArgs, releaseOmission } from "./groups.ts";
-import { projectLayout, withMemberNames, type Layout } from "./project.ts";
+import { pnpmConfigRefusal, pnpmConfigRefused, projectLayout, withMemberNames, type Layout } from "./project.ts";
 import { applyChecked, computedFiles, copyProject, restoreCommands, targets, type Backup, type Computed, type Copy } from "./lockfirst.ts";
 import { makeTemp, removeTemp } from "./sandbox.ts";
 import { CLI_VERSION } from "./version.ts";
@@ -1045,6 +1045,15 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
   try {
     const cmd = [...lockOnlyArgs(pm, pinned, { dev: has(a, "dev") }), ...registryArgs(pm, registry, input.scopes)];
 
+    const copyConfig = pm === "pnpm" ? pnpmConfigRefusal({ cwd: join(copy.dir, layout.member), env: pmEnv(registry, input.scopes) }) : null;
+
+    if (copyConfig !== null) {
+      fail(`refused: ${pnpmConfigRefused(copyConfig)}. Your project is unchanged.`);
+      emitJson({ ok: false, det, results, error: lastError });
+
+      return 1;
+    }
+
     say(dim(`→ ${cmd.join(" ")}  (${pm}: ${det.why}; in a copy of your project, which installs nothing)`));
     const run = await runCmd(cmd, { cwd: join(copy.dir, layout.member), env: pmEnv(registry, input.scopes), stdoutToStderr: true });
 
@@ -1500,6 +1509,14 @@ async function installWithoutScripts(input: { cwd: string; det: Detection & { pm
   let checked: Written;
 
   try {
+    const copyConfig = pm === "pnpm" ? pnpmConfigRefusal({ cwd: join(copy.dir, layout.member), env: environment }) : null;
+
+    if (copyConfig !== null) {
+      fail(`refused: ${pnpmConfigRefused(copyConfig)}. Your project is unchanged.`);
+
+      return done(1);
+    }
+
     const cmd = installLockOnlyArgs(pm);
 
     say(dim(`apm: no packages given; → ${cmd.join(" ")}  (${pm}: ${det.why}; in a copy of your project, which installs nothing)`));
@@ -1760,6 +1777,9 @@ async function checkedRemoval(input: { cwd: string; det: Detection & { pm: LockP
     const missing = withoutDependencies(join(copy.dir, t.manifest), names);
 
     if (missing.length > 0) return refuse(`${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} not in ${t.manifest}`);
+    const copyConfig = pm === "pnpm" ? pnpmConfigRefusal({ cwd: join(copy.dir, layout.member), env: environment }) : null;
+
+    if (copyConfig !== null) return refuse(pnpmConfigRefused(copyConfig));
     const cmd = [...installLockOnlyArgs(pm), ...(pm === "npm" ? ["--package-lock=true"] : pm === "pnpm" ? ["--no-frozen-lockfile", "--config.lockfile=true", "--config.ignore-pnpmfile=true"] : [])];
 
     say(dim(`apm: removing ${names.join(", ")}; → ${cmd.join(" ")}  (${pm}: ${det.why}; in a copy of your project, which installs nothing into your project)`));
@@ -2092,6 +2112,14 @@ async function cmdX(a: Args): Promise<number> {
   const dir = makeTemp("x");
 
   try {
+    const pnpmConfig = xpm === "pnpm" ? pnpmConfigRefusal({ cwd: dir, env: process.env }) : null;
+
+    if (pnpmConfig !== null) {
+      fail(`refused: ${pnpmConfigRefused(pnpmConfig)}. Nothing was run.`);
+
+      return 1;
+    }
+
     writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "apm-x", version: "0.0.0", private: true }));
     const compute = [...lockOnlyArgs(xpm, [`${r.name}@${r.version}`], { dev: false }), ...registryArgs(xpm, cfg.registry, treeScope)];
 
@@ -2633,6 +2661,14 @@ async function cmdPublish(a: Args): Promise<number> {
     }
   }
 
+  const pnpmConfig = det.pm === "pnpm" ? pnpmConfigRefusal({ cwd, env: process.env }) : null;
+
+  if (pnpmConfig !== null) {
+    fail(`refused: ${pnpmConfigRefused(pnpmConfig)}. Nothing was packed or uploaded, and package.json is unchanged.`);
+
+    return 1;
+  }
+
   if (bumpKind) {
     if (!dry) {
       const full: unknown = JSON.parse(readFileSync(pjPath, "utf8"));
@@ -2702,6 +2738,14 @@ async function cmdPublish(a: Args): Promise<number> {
   const tag = flag(a, "tag") ?? (version.includes("-") ? "next" : null);
   // `publish <tarball>` runs no package scripts, so the credential variables an .npmrc may name stay; APM_TOKEN does not
   const pubEnv = childEnv({ parent: process.env, registry: cfg.registry, scopes, keepAuth: true });
+  const pnpmRecheck = det.pm === "pnpm" ? pnpmConfigRefusal({ cwd, env: process.env }) : null;
+
+  if (pnpmRecheck !== null) {
+    fail(`refused: ${pnpmConfigRefused(pnpmRecheck)}. Nothing was uploaded.`);
+
+    return 1;
+  }
+
   const pub = await runCmd([...publishArgs(det.pm, tgzPath, tag), ...registryArgs(det.pm, cfg.registry, scopes)], { cwd, env: pubEnv, quiet: true });
   if (pub.code !== 0) {
     warn(pub.out.trim());
@@ -2897,6 +2941,18 @@ async function passthrough(a: Args): Promise<number> {
   }
 
   if (REMOVALS.has(a.cmd) && isLockPm(det.pm)) return checkedRemoval({ cwd, det: { pm: det.pm, why: det.why }, names: args.filter((x) => x !== "--") });
+
+  // what pnpm reads as its own options: the arguments of a named script, pnpm test and pnpm start go to the script, and so do pnpm run's after the script name
+  const firstOperand = own.findIndex((x) => !x.startsWith("-"));
+  const pnpmOwned = script || a.cmd === "test" || a.cmd === "start" ? [] : a.cmd === "run" && firstOperand !== -1 ? own.slice(0, firstOperand) : own;
+  const dirFlag = det.pm === "pnpm" ? pnpmOwned.find((x) => /^(?:--dir|--workspace-dir|-C)(?:=|$)|^-C./.test(x)) : undefined;
+  const pnpmConfig = dirFlag !== undefined ? `${dirFlag} points pnpm at a folder apm did not check` : det.pm === "pnpm" ? pnpmConfigRefusal({ cwd, env: process.env }) : null;
+
+  if (pnpmConfig !== null) {
+    fail(`refused: ${pnpmConfigRefused(pnpmConfig)}. Nothing was run.`);
+
+    return 1;
+  }
 
   const command = script ? ["run", a.cmd] : [a.cmd];
 

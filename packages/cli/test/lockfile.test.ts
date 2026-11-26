@@ -106,6 +106,40 @@ snapshots:
   test("peer suffixes and aliases resolve to their packages, and only the subtree is read", () => {
     expect(under({ pm: "pnpm", cwd: project("pnpm-lock.yaml", lock), roots: ["root"] })).toEqual(["@s/leaf@2.0.0 sha512-leaf", "peer@1.0.0 sha512-peer", "real-pkg@3.0.0 sha512-real", "root@1.0.0 sha512-root"]);
   });
+
+  test("pnpm 11+: the env document that pins pnpm comes first, and the project's lockfile is the one read", () => {
+    const env = `---
+lockfileVersion: '9.0'
+importers:
+  .:
+    configDependencies: {}
+    packageManagerDependencies:
+      pnpm:
+        specifier: 12.21.0
+        version: 12.21.0
+packages:
+  pnpm@12.21.0:
+    resolution: {integrity: sha512-pnpm}
+snapshots:
+  pnpm@12.21.0: {}
+---
+`;
+
+    const cwd = project("pnpm-lock.yaml", env + lock);
+    const r = readLock({ pm: "pnpm", path: join(cwd, "pnpm-lock.yaml"), cwd });
+
+    if (r.kind !== "read") throw new Error(`lockfile not read: ${r.kind}`);
+
+    expect(r.nodes.map((n) => `${n.name}@${n.version}`).sort()).toEqual(["@s/leaf@2.0.0", "peer@1.0.0", "real-pkg@3.0.0", "root@1.0.0", "unrelated@1.0.0"]);
+    expect(under({ pm: "pnpm", cwd, roots: ["root"] })).toEqual(["@s/leaf@2.0.0 sha512-leaf", "peer@1.0.0 sha512-peer", "real-pkg@3.0.0 sha512-real", "root@1.0.0 sha512-root"]);
+  });
+
+  test("pnpm 11+: a boot document followed by an empty one is a project with nothing locked", () => {
+    const cwd = project("pnpm-lock.yaml", "---\nlockfileVersion: '9.0'\nimporters:\n  .:\n    packageManagerDependencies:\n      pnpm:\n        specifier: 12.21.0\n        version: 12.21.0\n---\n");
+    const r = readLock({ pm: "pnpm", path: join(cwd, "pnpm-lock.yaml"), cwd });
+
+    expect(r.kind === "read" ? r.nodes : r.kind).toEqual([]);
+  });
 });
 
 // review of 1924692, finding 1: a peer the project provides is checked at the version its lockfile pins

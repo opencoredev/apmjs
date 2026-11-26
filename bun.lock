@@ -91,7 +91,7 @@
     },
     "packages/cli": {
       "name": "@apm/cli",
-      "version": "0.1.7",
+      "version": "0.1.8",
       "bin": {
         "apm": "./src/main.ts",
       },
