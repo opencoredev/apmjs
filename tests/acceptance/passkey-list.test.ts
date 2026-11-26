@@ -50,6 +50,20 @@ async function confirmRemoval(b: Browser, id: string, key: SoftPasskey): Promise
   return String(dig(r.body, "confirmation"));
 }
 
+/** Which passkeys show a last use, once the write after the answer has landed (it runs in the Worker's waitUntil). */
+async function usedOnceSettled(b: Browser, expected: boolean[]): Promise<boolean[]> {
+  let used: boolean[] = [];
+
+  for (let i = 0; i < 30; i++) {
+    used = (await listed(b)).passkeys.map((p) => p.lastUsedAt !== null);
+
+    if (JSON.stringify(used) === JSON.stringify(expected)) break;
+    await Bun.sleep(100);
+  }
+
+  return used;
+}
+
 const remove = (b: Browser, body: { id: string; confirmation?: string }, headers: Record<string, string> = {}) => b.json("-/apm/v1/account/passkeys/remove", { method: "POST", body, headers });
 
 beforeAll(async () => {
@@ -91,10 +105,10 @@ describe("the passkey list", () => {
     });
 
     expect(signIn.status, JSON.stringify(signIn.body)).toBe(200);
-    expect((await listed(owner)).passkeys.map((p) => p.lastUsedAt !== null)).toEqual([false, true]);
+    expect(await usedOnceSettled(owner, [false, true])).toEqual([false, true]);
 
     await confirmRemoval(owner, "unused-id", first);
-    expect((await listed(owner)).passkeys.map((p) => p.lastUsedAt !== null)).toEqual([true, true]);
+    expect(await usedOnceSettled(owner, [true, true])).toEqual([true, true]);
   });
 });
 

@@ -12,7 +12,7 @@ import type { BetterAuthInstance } from "./auth-engine.ts";
 import type { AccountEvents } from "./account-events.ts";
 import { z } from "zod";
 import { Clock } from "./clock.ts";
-import { Store, type Linked, type PasskeySummary, type User } from "./db.ts";
+import { Store, type Linked, type PasskeySummary, type PasskeyUse, type User } from "./db.ts";
 import { AuthError, type StoreError } from "./errors.ts";
 import { CONNECT_TIMEOUT, STATEMENT_TIMEOUT_MS } from "./db-health.ts";
 import { isAccountChange, sessionActionKey } from "./actions.ts";
@@ -67,6 +67,9 @@ export type ConfirmFactor = CodeProof | { kind: "passkey"; challengeId: string; 
 export type Confirmed = { kind: "ok"; id: ConfirmationId; expiresAt: number } | Exclude<ProofCheck, { kind: "ok" }>;
 
 export type SignedIn = { authUserId: string; sessionToken: string; signedInAt: number };
+
+/** Records a passkey's last use after the response, on a connection of its own; null where nothing runs after it. */
+export type PasskeyUses = (use: PasskeyUse) => void;
 
 /** One of the account's passkeys as the account page shows it: `provider` is the password manager or platform its AAGUID names. */
 export type PasskeyView = PasskeySummary & { provider: string | null };
@@ -189,7 +192,7 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
    * Better Auth over the same Postgres. The instance (and its connection) is made on first use in a request,
    * so routes that never touch sign-in pay nothing for it, and the connection closes when the request ends.
    */
-  static layer(input: { databaseUrl: string; options: AuthOptions; baseURL: string; accountEvents?: AccountEvents | null }): Layer.Layer<Auth, never, Store | Clock> {
+  static layer(input: { databaseUrl: string; options: AuthOptions; baseURL: string; accountEvents?: AccountEvents | null; passkeyUses?: PasskeyUses | null }): Layer.Layer<Auth, never, Store | Clock> {
     return Layer.effect(
       Auth,
       Effect.gen(function* () {
@@ -197,6 +200,7 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
         const clock = yield* Clock;
         const nowMs = yield* clock.now;
         const gh = input.options.github ?? null;
+        const passkeyUses = input.passkeyUses ?? null;
         const requestScope = yield* Effect.scope;
 
         const instance = yield* Effect.cached(
@@ -205,7 +209,7 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
               // sign-in waits on Postgres no longer than the Store does (db-health.ts)
               const pool = new engine.Pool({ connectionString: input.databaseUrl, max: 1, connectionTimeoutMillis: Duration.toMillis(CONNECT_TIMEOUT), query_timeout: STATEMENT_TIMEOUT_MS });
 
-              return { pool, auth: engine.buildBetterAuth({ pool, options: input.options, baseURL: input.baseURL, store, now: () => nowMs, cliClientId: CLI_CLIENT_ID, accountEvents: input.accountEvents ?? null }) };
+              return { pool, auth: engine.buildBetterAuth({ pool, options: input.options, baseURL: input.baseURL, store, now: () => nowMs, cliClientId: CLI_CLIENT_ID, accountEvents: input.accountEvents ?? null, passkeyUses }) };
             }),
             ({ pool }) => Effect.promise(() => pool.end()).pipe(Effect.ignore),
           ).pipe(
@@ -416,7 +420,8 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
 
             if (verified.kind === "refused") return { kind: "bad" } satisfies ProofCheck;
             yield* store.setPasskeyCounter({ id: key.id, counter: verified.counter });
-            yield* store.notePasskeyUse({ authUserId: session.authUserId, credentialID: key.credentialID, at: yield* clock.now });
+            const at = yield* clock.now;
+            yield* Effect.sync(() => passkeyUses?.({ authUserId: session.authUserId, credentialID: key.credentialID, at }));
 
             return { kind: "ok" } satisfies ProofCheck;
           });

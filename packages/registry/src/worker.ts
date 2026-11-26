@@ -9,7 +9,7 @@ import { matureRevocations, refreshLatestScores, seedKeptPackages } from "./apm.
 import { KeptRefresh, refreshKeptPackages, runRefresh } from "./kept-package.ts";
 import { sweepConfirmations, sweepStaged } from "./account.ts";
 import { accountEvents } from "./account-events.ts";
-import { Auth, type AuthOptions } from "./auth.ts";
+import { Auth, type AuthOptions, type PasskeyUses } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
 import { Blocklist, blockTruth } from "./blocklist.ts";
 import { DatabaseUnavailable, isDatabaseUnavailable } from "./db-health.ts";
@@ -298,7 +298,19 @@ function runServices(env: WorkerEnv, settings: RegistrySettings, clock: Layer.La
   // sign-up and sign-in counts go to Databuddy after the answer, so only a request (with its waitUntil) sends them
   const events = background === null ? null : accountEvents({ clientId: env.APM_DATABUDDY_CLIENT_ID ?? "", background, url: env.APM_DATABUDDY_TRACK_URL });
 
-  return Layer.mergeAll(Layer.provideMerge(Auth.layer({ databaseUrl, options: authOptions(env), baseURL: settings.webUrl, accountEvents: events }), withScoring), RequestMemory.layer(ISOLATE_POOL));
+  // a passkey's last use is written after the answer, on a connection of its own: display only, so a sign-in or a
+  // factor check never waits on it, and its write never touches the request's connection
+  const passkeyUses: PasskeyUses | null =
+    background === null
+      ? null
+      : (use) =>
+          background(
+            Effect.runPromiseExit(Effect.flatMap(Store, (s) => s.notePasskeyUse(use)).pipe(Effect.provide(Store.postgres(databaseUrl)), Effect.scoped)).then((exit) => {
+              if (Exit.isFailure(exit)) logFailure("passkey-use", {}, Cause.pretty(exit.cause));
+            }),
+          );
+
+  return Layer.mergeAll(Layer.provideMerge(Auth.layer({ databaseUrl, options: authOptions(env), baseURL: settings.webUrl, accountEvents: events, passkeyUses }), withScoring), RequestMemory.layer(ISOLATE_POOL));
 }
 
 /**

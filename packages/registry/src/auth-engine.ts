@@ -9,7 +9,7 @@ import { passkey } from "@better-auth/passkey";
 import { Pool } from "pg";
 import { z } from "zod";
 import { optedOut, signInMethod, type AccountEvents } from "./account-events.ts";
-import type { AuthOptions, GitHubEndpoints } from "./auth.ts";
+import type { AuthOptions, GitHubEndpoints, PasskeyUses } from "./auth.ts";
 import type { Store } from "./db.ts";
 import type { StoreError } from "./errors.ts";
 
@@ -42,8 +42,9 @@ export function buildBetterAuth(input: {
   now: () => number;
   cliClientId: string;
   accountEvents: AccountEvents | null;
+  passkeyUses: PasskeyUses | null;
 }) {
-  const { pool, options, store, now, cliClientId, accountEvents } = input;
+  const { pool, options, store, now, cliClientId, accountEvents, passkeyUses } = input;
   const baseURL = input.baseURL.replace(/\/$/, "");
   const web = new URL(baseURL);
   const gh = options.github ? { ...options.github, endpoints: options.github.endpoints ?? GITHUB } : null;
@@ -78,10 +79,10 @@ export function buildBetterAuth(input: {
         create: {
           after: async (session, ctx) => {
             try {
-              // the account page's "last used" for the passkey that signed in; never able to fail the sign-in
+              // the account page's "last used" for the passkey that signed in, written after the answer
               const signIn = signInMethod(ctx) === "passkey" ? PasskeySignIn.safeParse(ctx?.body) : null;
 
-              if (signIn?.success) await record(store.notePasskeyUse({ authUserId: session.userId, credentialID: signIn.data.response.id, at: now() }));
+              if (signIn?.success) passkeyUses?.({ authUserId: session.userId, credentialID: signIn.data.response.id, at: now() });
             } catch {
               // a lost "last used" never reaches the person signing in
             }

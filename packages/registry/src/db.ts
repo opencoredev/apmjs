@@ -418,7 +418,10 @@ export type PasskeyRemoval = "removed" | "missing" | "last-way-in";
 /** The OAuth providers an account can sign in with, when the deploy has them on. */
 export type SignInProvider = "github" | "vercel";
 
-/** How long recording a passkey's last use may hold up the sign-in or check it belongs to. */
+/** One answer from one of the account's passkeys: `credentialID` as WebAuthn names it, `at` in epoch ms. */
+export type PasskeyUse = { authUserId: string; credentialID: string; at: number };
+
+/** How long the write of a passkey's last use may take before it is dropped. */
 export const PASSKEY_USE_WAIT_MS = 500;
 
 /** Faults a test can switch on for one request (worker-test.ts); the deployed Worker never passes any. */
@@ -841,10 +844,10 @@ export type StoreApi = {
   /** The account's passkeys for the account page, oldest first: the same rows authFactors counts. */
   readonly passkeyList: (authUserId: string) => Effect.Effect<PasskeySummary[], StoreError>;
   /**
-   * Records that the account's passkey `credentialID` answered at `at` (a sign-in or a factor check). Display only, so
-   * best effort: it gives up after PASSKEY_USE_WAIT_MS and never fails the sign-in or check that called it.
+   * Records that the account's passkey `credentialID` answered at `at` (a sign-in or a factor check), giving up after
+   * PASSKEY_USE_WAIT_MS. Display only: the Worker runs it after the response on a Store of its own (worker.ts).
    */
-  readonly notePasskeyUse: (input: { authUserId: string; credentialID: string; at: number }) => Effect.Effect<void>;
+  readonly notePasskeyUse: (input: PasskeyUse) => Effect.Effect<void, StoreError>;
   /**
    * Deletes the account's passkey `id`, unless it is the account's last way to sign in: its only passkey, with no linked
    * account of a provider in `providers` (the ones this deploy signs in with).
@@ -2171,7 +2174,7 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
             SELECT id, ${input.at} FROM passkey WHERE "credentialID" = ${input.credentialID} AND "userId" = ${input.authUserId}
             ON CONFLICT (passkey_id) DO UPDATE SET last_used_at = GREATEST(passkey_uses.last_used_at, EXCLUDED.last_used_at)`,
         none,
-      ).pipe(Effect.timeoutOption(Duration.millis(PASSKEY_USE_WAIT_MS)), Effect.ignore),
+      ).pipe(Effect.timeoutOption(Duration.millis(PASSKEY_USE_WAIT_MS)), Effect.asVoid),
     removePasskey: (input) =>
       guard.transaction(
         "removePasskey",
