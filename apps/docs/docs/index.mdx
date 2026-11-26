@@ -31,7 +31,7 @@ apm is early. The registry, CLI and score engine work and are tested, and the re
 | Part | What it does | Where |
 | --- | --- | --- |
 | Registry | npm-compatible registry, upstream proxy for npm, scores, yank and revoke, staged publishing. | `https://registry.apmjs.dev/` |
-| `~safe` view | Opt-in strict mode: the same registry with young, low-scoring and not fully analysed versions hidden. Works with any client. | `https://registry.apmjs.dev/~safe/` |
+| `~safe` view | Opt-in strict mode: the same registry with young, low-scoring and not fully analysed versions hidden. Works with any client, but a very large package apm has not fully read (Next.js today) has no version in it. | `https://registry.apmjs.dev/~safe/` |
 | Website | Package search, version pages with evidence, publish approvals, your account. | `https://apmjs.dev` |
 | `apm` CLI | Checks before it hands the work to bun, npm, pnpm or yarn. | [CLI reference](/reference/cli) |
 | Bun scanner | Makes plain `bun install` refuse revoked and confirmed-malicious versions and warn about low scores. | [Bun scanner](/guides/bun-scanner) |

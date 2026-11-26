@@ -7,7 +7,7 @@ description: An opt-in strict registry URL that hides versions under 24 hours ol
 
 It is the strict option for npm and pnpm. `apm add`, the registry's resolve and scan answers and the Bun scanner warn about a low or missing score and install anyway; the view still hides such versions, because using it is the choice to filter them. It matches `apm add --strict`, and `APM_SCANNER_STRICT=1` for Bun.
 
-It is opt-in. The default for every client is the plain registry, `https://registry.apmjs.dev/` (see the [quick start](/quickstart)). Because the view hides every version apm has not fully analysed, a large package can have no version in it, and `npm install` then fails with `No versions available`.
+It is opt-in. The default for every client is the plain registry, `https://registry.apmjs.dev/` (see the [quick start](/quickstart)). Because the view hides every version apm has not fully analysed, a very large package can have no version in it at all, and `npm install` then fails with `No versions available`. Today that includes `next` (Next.js). For a project that depends on such a package, use the plain registry for that project, with `apm add --strict` and `apm audit`, or install that package from the plain registry.
 
 ```ini title=".npmrc"
 registry=https://registry.apmjs.dev/~safe/
