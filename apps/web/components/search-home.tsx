@@ -24,7 +24,7 @@ import {
 } from "@/lib/search-schema";
 import { normalizeQuery as normalize, packageHref, searchHref as urlFor } from "@/lib/typeahead";
 import { track } from "@/lib/databuddy-client";
-import { NEEDS_SCOPE_STATUS, needsScopeSentence, publishability } from "@/lib/publish-name";
+import { NEEDS_SCOPE_STATUS, OWNER_ONLY_STATUS, needsScopeSentence, ownerOnlySentence, publishability, type Publishability } from "@/lib/publish-name";
 
 const NAME_CHECK_DEBOUNCE_MS = 250;
 
@@ -130,7 +130,12 @@ function Slot({ label, href, children }: { label: string; href?: string; childre
   );
 }
 
-function ExactStatus({ q, state }: { q: string; state: PartState<"exact"> }) {
+/** What a free name means for this visitor: `viewer` is their GitHub login once the alternatives part says it. */
+function publishableFor(q: string, viewer: PartState<"alternatives">): Publishability {
+  return publishability({ name: q, available: true, scope: viewer.kind === "ok" ? viewer.data.scope : null });
+}
+
+function ExactStatus({ q, state, viewer }: { q: string; state: PartState<"exact">; viewer: PartState<"alternatives"> }) {
   if (state.kind === "loading") return <Status kind="wait">checking</Status>;
 
   if (state.kind === "error") return <Status kind="warn">couldn&apos;t check</Status>;
@@ -147,23 +152,34 @@ function ExactStatus({ q, state }: { q: string; state: PartState<"exact"> }) {
 
   if (data.unknown) return <Status kind="warn">couldn&apos;t check npm</Status>;
 
-  if (data.available) return publishability({ name: q, available: true }).kind === "needs-scope" ? <Status kind="warn">{NEEDS_SCOPE_STATUS}</Status> : <Status kind="free">available</Status>;
+  if (data.available) {
+    const p = publishableFor(q, viewer);
+
+    if (p.kind === "needs-scope") return <Status kind="warn">{NEEDS_SCOPE_STATUS}</Status>;
+
+    if (p.kind === "scoped" || p.kind === "not-yours") return <Status kind="warn">{OWNER_ONLY_STATUS}</Status>;
+
+    if (p.kind === "yours") return <Status kind="free">available</Status>;
+  }
 
   return <Status kind="warn">{data.valid ? "blocked: too close to a popular name" : "invalid"}</Status>;
 }
 
-function ExactSlot({ q, state }: { q: string; state: PartState<"exact"> }) {
+function ExactSlot({ q, state, viewer }: { q: string; state: PartState<"exact">; viewer: PartState<"alternatives"> }) {
   const data = state.kind === "ok" ? state.data : null;
-  const publishable = publishability({ name: q, available: data?.available === true });
+  const publishable: Publishability = data?.available === true ? publishableFor(q, viewer) : { kind: "not-free" };
 
   return (
     <Slot label="Exact name" href={data?.taken ? packageHref(q) : undefined}>
       <Highlight name={q} q="" className="text-lg font-medium" />
       <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
-        <ExactStatus q={q} state={state} />
+        <ExactStatus q={q} state={state} viewer={viewer} />
       </span>
       {data && !data.taken && data.conflicts[0] && <span className="text-sm text-pretty text-muted-foreground">{data.conflicts[0].reason}</span>}
       {publishable.kind === "needs-scope" && <span className="text-sm text-pretty text-muted-foreground">{needsScopeSentence(publishable.suggestion)}</span>}
+      {(publishable.kind === "scoped" || publishable.kind === "not-yours") && (
+        <span className="text-sm text-pretty text-muted-foreground">{ownerOnlySentence(publishable.scope, publishable.kind === "not-yours" ? publishable.yours : null)}</span>
+      )}
     </Slot>
   );
 }
@@ -259,7 +275,7 @@ type NameStates = { exact: PartState<"exact">; lookalike: PartState<"lookalike">
 function NameSlots({ q, states }: { q: string; states: NameStates }) {
   return (
     <>
-      <ExactSlot q={q} state={states.exact} />
+      <ExactSlot q={q} state={states.exact} viewer={states.alternatives} />
       <ScopeSlot q={q} state={states.alternatives} />
       <LookalikeSlot state={states.lookalike} />
       <AlternativesSlot state={states.alternatives} />
@@ -296,7 +312,7 @@ function NameDisclosure({ q, states }: { q: string; states: NameStates }) {
       >
         <span className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
           <span className="text-sm text-muted-foreground">Name check</span>
-          <ExactStatus q={q} state={states.exact} />
+          <ExactStatus q={q} state={states.exact} viewer={states.alternatives} />
         </span>
         <ChevronDownIcon className={cn("size-4 shrink-0 text-muted-foreground transition-transform", open && "rotate-180")} aria-hidden />
       </button>

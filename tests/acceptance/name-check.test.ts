@@ -1,7 +1,10 @@
 // Spec: the name check reads real npm packuments and never calls a name "available" when npm could not be asked.
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { z } from "zod";
-import { dig, enableTotp, getJson, putPublish, signInWithGitHub, startFakeGitHub, startRegistry, type Browser, type FakeGitHub, type Registry } from "./harness";
+import { apm, dig, enableTotp, getJson, makeSandbox, putPublish, signInWithGitHub, startFakeGitHub, startRegistry, writePackage, type Browser, type FakeGitHub, type Registry } from "./harness";
 
 describe("name check against an upstream registry", () => {
   let fake: ReturnType<typeof Bun.serve>;
@@ -156,6 +159,32 @@ describe("name check alternatives under the GitHub-scope policy", () => {
 
     expect(byName.get("@scope-owner/hono")?.available).toBe(true);
     expect(byName.get("@scope-owner/hono-js")?.available).toBe(false);
+  });
+
+  // HOME-564 item 6: a dry run was green for names and versions this registry refuses
+  test("apm publish --dry-run refuses what a publish here would be refused for, and uploads nothing", async () => {
+    const token = await reg.mintToken({ user: "scope-owner", scope: "publish" });
+    const sb = makeSandbox(reg, token);
+    const work = mkdtempSync(join(tmpdir(), "apm-dry-names-"));
+    const dry = async (name: string, version: string) => apm(["publish", "--dry-run", "--pm", "bun"], { cwd: writePackage(work, { name, version }, reg, token), env: sb.env });
+
+    const existing = await dry("@scope-owner/quokka-js", "1.0.0");
+    expect(existing.code, existing.out).toBe(1);
+    expect(existing.out).toContain("✗ @scope-owner/quokka-js@1.0.0 is already published");
+
+    const bare = await dry("quokka-bare", "1.0.0");
+    expect(bare.code, bare.out).toBe(1);
+    expect(bare.out).toContain("✗ New packages on apm are scoped to your GitHub login. Publish this as @scope-owner/quokka-bare");
+
+    const other = await dry("@someone-else/quokka", "1.0.0");
+    expect(other.code, other.out).toBe(1);
+    expect(other.out).toContain("✗ You cannot publish under @someone-else. New packages go under your own scope: @scope-owner/quokka.");
+
+    const fine = await dry("@scope-owner/quokka-new", "1.0.0");
+    expect(fine.code, fine.out).toBe(0);
+    expect(fine.out).not.toContain("✗");
+
+    for (const name of ["quokka-bare", "@someone-else%2fquokka", "@scope-owner%2fquokka-new"]) expect((await getJson(`${reg.url}${name}`)).status).toBe(404);
   });
 
   test("a CLI token checks under its own scope too", async () => {

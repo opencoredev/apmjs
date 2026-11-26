@@ -276,6 +276,22 @@ describe("apm's messages for first-time users", () => {
     expect(upper.text).not.toContain("is available");
   });
 
+  // HOME-564 item 6: apm name --json said "available": true for a bare name and another account's scope
+  test("apm name --json is available only when the line it would print says so, with the reason when not", async () => {
+    const cwd = folder("name-json");
+    const NameJson = z.object({ ok: z.boolean(), query: z.string(), taken: z.boolean(), available: z.boolean(), reason: z.string().nullable() });
+    const json = async (name: string, opts: { token?: boolean; registry?: string } = {}): Promise<z.infer<typeof NameJson>> => NameJson.parse(JSON.parse((await apm(["name", name, "--json"], { cwd, ...opts })).out));
+    const open = `${server.url.toString()}open/`;
+
+    expect(await json("my-lib")).toMatchObject({ ok: true, query: "my-lib", taken: false, available: false, reason: expect.stringContaining("this registry does not hand out bare names") });
+    expect(await json("@other/my-lib")).toMatchObject({ available: false, reason: expect.stringContaining("only the owner of @other can publish there") });
+
+    expect(await json("@other/my-lib", { token: true })).toMatchObject({ available: false });
+    expect(await json("@me/my-lib", { token: true })).toMatchObject({ available: true, reason: null });
+    expect(await json("open-lib", { registry: open })).toMatchObject({ available: true, reason: null });
+    expect(await json("@me/My-Lib", { token: true })).toMatchObject({ available: false, query: "@me/my-lib" });
+  });
+
   test("C10: a known malicious version leads with the refusal, not its grade", async () => {
     const cwd = folder("c10", { "package.json": manifest });
     const r = await apm(["add", "lodahs", "--pm", "npm"], { cwd });
