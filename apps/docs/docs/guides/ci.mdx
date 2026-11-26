@@ -10,7 +10,7 @@ You can run apm's checks in CI today. Publishing from CI works too, but every ve
 | In CI you want to | Use | Status |
 | --- | --- | --- |
 | Fail the install on revoked or low-scoring versions (by default a low score only warns) | `apm add --strict` or `registry=https://registry.apmjs.dev/~safe/` | Works |
-| Install only versions that pass the cooldown and floor with npm or pnpm | `registry=https://registry.apmjs.dev/~safe/` | Works |
+| Install only versions that pass the cooldown and floor with npm or pnpm | `registry=https://registry.apmjs.dev/~safe/` | Works, but when no version of a package passes, the view lists none (Next.js today; see below) |
 | Run the Bun security scanner automatically on `bun install` | `@apm/bun-scanner` (not on a registry yet; strict mode cannot run from a local path) | Not published yet |
 | Fail the build on revoked versions already in the lockfile | `apm audit` | Works |
 | Upload a version from CI | `apm publish` with a login token | Works; the version is staged and a person approves it |
@@ -25,7 +25,7 @@ A score informs; it does not block, so by default a low or missing score only wa
 registry=https://registry.apmjs.dev/~safe/
 ```
 
-The view also hides versions apm has not fully analysed, so a large package can fail to install through it.
+The view also hides every version apm has not fully read, so it can withhold all of a very large package. Today that includes `next`: the view lists no version of it, and `npm install` or `pnpm install` fails with no matching version. If you accept that gap for such a package, keep the plain registry (`registry=https://registry.apmjs.dev/`) and run `apm add` without `--strict` (and with `APM_STRICT` unset): it warns that apm read only part of the package and installs it. `apm add --strict` refuses the same partial read, and `apm audit` reports it and exits non-zero, so a CI job that fails on audit fails on that package too. If you need full coverage, skip the package or pick a version that passes.
 
 For Bun, the [Bun scanner](/guides/bun-scanner) is not published on a registry yet (and strict mode refuses local `file:` dependencies, including itself), so use `bunfig.toml` pointed at `https://registry.apmjs.dev/~safe/` and run `apm audit --json` in CI until `@apm/bun-scanner` is published.
 

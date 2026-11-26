@@ -7,7 +7,7 @@ description: An opt-in strict registry URL that hides versions under 24 hours ol
 
 It is the strict option for npm and pnpm. `apm add`, the registry's resolve and scan answers and the Bun scanner warn about a low or missing score and install anyway; the view still hides such versions, because using it is the choice to filter them. It matches `apm add --strict`, and `APM_SCANNER_STRICT=1` for Bun.
 
-It is opt-in. The default for every client is the plain registry, `https://registry.apmjs.dev/` (see the [quick start](/quickstart)). Because the view hides every version apm has not fully analysed, a large package can have no version in it, and `npm install` then fails with `No versions available`.
+It is opt-in. The default for every client is the plain registry, `https://registry.apmjs.dev/` (see the [quick start](/quickstart)). Because the view hides every version apm has not fully analysed, a very large package can have no version in it at all, and `npm install` then fails with `No versions available`. Today that includes `next` (Next.js). If you accept that gap, keep the plain registry (`registry=https://registry.apmjs.dev/`) and run `apm add` without `--strict` (and with `APM_STRICT` unset): it warns that apm read only part of the package and installs it. `apm add --strict` refuses the same partial read, and `apm audit` reports it and exits non-zero, so a CI job that fails on audit fails on that package too. If you need full coverage, skip the package or pick a version that passes.
 
 ```ini title=".npmrc"
 registry=https://registry.apmjs.dev/~safe/
@@ -29,7 +29,7 @@ The same rules apply everywhere in the view: the package document, a single vers
 
 ## How `latest` moves
 
-Dist-tags point at what the view serves. If the newest version is hidden, `latest` points at the newest version that passes. `npm install some-package` then installs that one, without any change to your `package.json`.
+Dist-tags point at what the view serves. If the newest version is hidden, `latest` points at the newest version that passes; when no version passes, there is no `latest` and the package lists no versions. `npm install some-package` then installs that one, without any change to your `package.json`.
 
 ## Scoring on first request
 
