@@ -43,7 +43,7 @@ Then install as usual (`bun install`, `npm install`, `pnpm install`). Packages c
 apm's package documents leave out fields npm's have and no install reads from them: each version keeps its install fields, scripts, links and checksums, and drops the rest (`licenseText`, `readme`, the `exports` map, npm's signatures), and the abbreviated form installs use has no `devDependencies`. `npm view <package> devDependencies` still works. The full list is in [What apm's packuments leave out](/reference/http-api#what-apms-packuments-leave-out).
 
 :::tip
-For a strict mode with stock npm or pnpm, use `registry=https://registry.apmjs.dev/~safe/` instead. The [`~safe` view](/guides/safe-view) hides versions under 24 hours old, versions scoring under 40 and versions apm has not fully analysed, so some very large packages have no version it can install. Today that includes `next`; a project that depends on one should use the plain registry with `apm add --strict` instead.
+For a strict mode with stock npm or pnpm, use `registry=https://registry.apmjs.dev/~safe/` instead. The [`~safe` view](/guides/safe-view) hides versions under 24 hours old, versions scoring under 40 and versions apm has not fully analysed, so some very large packages have no version it can install. Today that includes `next`. To install it anyway, use the plain registry and `apm add` without `--strict`, which warns that apm read only part of it; `--strict` and `apm audit` flag it too.
 :::
 
 ## 2. Get the apm CLI

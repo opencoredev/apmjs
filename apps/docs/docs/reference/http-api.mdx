@@ -20,7 +20,7 @@ The registry at `https://registry.apmjs.dev/` speaks the npm registry protocol, 
 
 ## The `~safe` view
 
-Prefix any path with `/~safe` to read through the safe view: `https://registry.apmjs.dev/~safe/<package>`. Package documents, versions and tarballs then leave out versions that are revoked, pending revocation, yanked, younger than 24 hours, unscored, not fully analysed, or scoring under 40, and `latest` points at the newest version that passes. A hidden version answers `404` with the reason (for a withheld version, only "revoked by its owner" or "revocation pending"). See [The ~safe view](/guides/safe-view).
+Prefix any path with `/~safe` to read through the safe view: `https://registry.apmjs.dev/~safe/<package>`. Package documents, versions and tarballs then leave out versions that are revoked, pending revocation, yanked, younger than 24 hours, unscored, not fully analysed, or scoring under 40, and `latest` points at the newest version that passes (when none passes, there is no `latest` and no version). A hidden version answers `404` with the reason (for a withheld version, only "revoked by its owner" or "revocation pending"). See [The ~safe view](/guides/safe-view).
 
 ## npm protocol routes
 
