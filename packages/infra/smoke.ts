@@ -29,7 +29,7 @@ import { Client } from "pg";
 import { z } from "zod";
 import { apmAdd, bunInstallLocked, metadataProblem, NO_SCRIPTS_ENV, npmCi, PROBE_NAMES, probeFixture, singleLockfile, tarballPath, type Locked, type Probe } from "./smoke-commands.ts";
 import { confirmBuild, parseSmokeArgs, smokeTargets } from "./smoke-identity.ts";
-import { largeExplain, ossfListed } from "./smoke-probes.ts";
+import { largeExplain, ossfListed, safeLarge } from "./smoke-probes.ts";
 import { installCheck } from "./cli-check.ts";
 import { readCliReleases } from "./cli-ledger.ts";
 
@@ -186,7 +186,7 @@ async function resolution(): Promise<void> {
 async function verdictProbes(): Promise<void> {
   const deps = { fetch, registry, web };
 
-  for (const c of [await largeExplain(deps), ...(await ossfListed(deps))]) record(c.ok, c.name, c.detail);
+  for (const c of [await largeExplain(deps), await safeLarge(deps), ...(await ossfListed(deps))]) record(c.ok, c.name, c.detail);
 }
 
 /**
