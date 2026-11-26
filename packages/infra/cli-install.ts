@@ -171,7 +171,7 @@ main() {
   case "$(uname -s)" in
     Linux) os=linux ;;
     Darwin) os=darwin ;;
-    MINGW* | MSYS* | CYGWIN* | Windows_NT) die "Windows is not supported yet; apm runs on macOS and Linux." ;;
+    MINGW* | MSYS* | CYGWIN* | Windows_NT) die "Windows is not supported yet. Run this in WSL, or use the apm registry without the CLI: https://docs.apmjs.dev/quickstart#1-point-your-package-manager-at-apm" ;;
     *) die "$(uname -s) is not supported; apm runs on macOS and Linux." ;;
   esac
   case "$(uname -m)" in
