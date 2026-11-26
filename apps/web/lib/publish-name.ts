@@ -3,8 +3,12 @@
 // kept apart. Pure: the home page's name check and the check_name MCP tool share it.
 
 export type Publishability =
-  /** a free scoped name: publishable by the owner of that scope, a GitHub login */
+  /** a free scoped name under the publisher's own scope (`scope` matches it) */
+  | { readonly kind: "yours"; readonly scope: string }
+  /** a free scoped name when the publisher is not known: publishable by the owner of that scope, a GitHub login */
   | { readonly kind: "scoped"; readonly scope: string }
+  /** a free scoped name under someone else's scope: only that scope's owner can publish it, not `yours` */
+  | { readonly kind: "not-yours"; readonly scope: string; readonly yours: string }
   /** a free bare name: not taken on npm, but apm publishes it only under a scope, such as `suggestion` */
   | { readonly kind: "needs-scope"; readonly suggestion: string }
   /** taken, blocked, invalid or not checked: nothing to publish under this name */
@@ -16,9 +20,42 @@ export function publishability(input: { name: string; available: boolean; scope?
 
   if (!available) return { kind: "not-free" };
 
-  if (name.startsWith("@")) return { kind: "scoped", scope: name.slice(0, Math.max(name.indexOf("/"), 1)) };
+  if (name.startsWith("@")) {
+    const scope = name.slice(0, Math.max(name.indexOf("/"), 1));
+
+    if (!input.scope) return { kind: "scoped", scope };
+
+    return scope === `@${input.scope.toLowerCase()}` ? { kind: "yours", scope } : { kind: "not-yours", scope, yours: `@${input.scope}` };
+  }
 
   return { kind: "needs-scope", suggestion: `@${input.scope ?? "you"}/${name}` };
+}
+
+/** The name check's short status for a free name under a scope that is not, or not known to be, the visitor's. */
+export const OWNER_ONLY_STATUS = "free, scope owner only";
+
+/** Who is looking at the name check: signed in (their scope, as @login), signed out, still being asked, or unknown (the ask failed). */
+export type Viewer = { readonly kind: "signed-in"; readonly scope: string } | { readonly kind: "signed-out" } | { readonly kind: "checking" } | { readonly kind: "unknown" };
+
+/** Who may publish a free name under `scope`, after its status, and what that means for this viewer. */
+export function ownerOnlySentence(scope: string, viewer: Viewer): string {
+  const owner = `Only the GitHub account ${scope.slice(1)} can publish under ${scope}.`;
+
+  switch (viewer.kind) {
+    case "signed-in":
+      return `${owner} Yours is ${viewer.scope}.`;
+    case "signed-out":
+      return `${owner} Sign in with GitHub to see whether that is you.`;
+    case "checking":
+      return owner;
+    case "unknown":
+      return `${owner} apm could not check whether that is you.`;
+    default: {
+      const _exhaustive: never = viewer;
+
+      return _exhaustive;
+    }
+  }
 }
 
 /** The name check's short status for a free bare name. */
@@ -32,8 +69,12 @@ export function publishabilityText(input: { name: string; publishable: Publishab
   const { name, publishable: p } = input;
 
   switch (p.kind) {
+    case "yours":
+      return `${name} is available. ${p.scope} is your GitHub login, so you can publish it.`;
+    case "not-yours":
+      return `${name} is free, but only the owner of ${p.scope} can publish it. Yours is ${p.yours}.`;
     case "scoped":
-      return `${name} is available. You can publish it if ${p.scope} is your GitHub login.`;
+      return `${name} is free; only the owner of ${p.scope} (a GitHub login) can publish it.`;
     case "needs-scope":
       return `${name} is ${NEEDS_SCOPE_STATUS}. ${needsScopeSentence(p.suggestion)}`;
     case "not-free":

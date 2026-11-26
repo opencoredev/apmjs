@@ -7,6 +7,13 @@ export function isValidPackageName(name: string): boolean {
   return name.length > 0 && name.length <= 214 && NAME_RE.test(name);
 }
 
+const PUBLISH_NAME_RE = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
+
+/** A name the registry's publish route takes: isValidPackageName's, with `~` allowed in the package part too. */
+export function isValidPublishName(name: string): boolean {
+  return name.length > 0 && name.length <= 214 && PUBLISH_NAME_RE.test(name);
+}
+
 /**
  * Whether npm could hold a package of this name, old names included (validate-npm-package-name's rules for old
  * packages: uppercase and URL-safe punctuation pass): an optional `@scope/` and a name, each URL-safe as written, not
@@ -24,6 +31,29 @@ export function isPossibleNpmName(name: string): boolean {
 
 export function isScoped(name: string): boolean {
   return name.startsWith("@");
+}
+
+/** A registry's rule for new names: "scoped" takes one only under its publisher's account name, "open" takes bare names too. */
+export type NamePolicy = "scoped" | "open";
+
+/**
+ * Why `user` may not take `name` as a new package, by the name alone, or null. A scope is its owner's under every
+ * policy; a bare name is refused under "scoped". The registry refuses a first publish with this text (access.ts
+ * newNameRefusal), and apm publish --dry-run says the same before anything is uploaded.
+ */
+export function newNameRuleRefusal(input: { name: string; user: string; policy: NamePolicy }): string | null {
+  const { name, user, policy } = input;
+  const bare = bareOf(name);
+
+  if (!isScoped(name)) {
+    return policy === "open"
+      ? null
+      : `New packages on apm are scoped to your GitHub login. Publish this as @${user}/${bare} (set "name" in package.json). A bare name like "${bare}" always means the npm package, so apm does not hand out bare names.`;
+  }
+
+  const scope = scopeOf(name);
+
+  return scope === user ? null : `You cannot publish under @${scope}. New packages go under your own scope: @${user}/${bare}.`;
 }
 
 /** Optimal string alignment distance: insert, delete, substitute, swap adjacent. */

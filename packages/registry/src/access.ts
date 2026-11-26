@@ -1,5 +1,6 @@
 // Publishing rules that depend on who someone is: GitHub-scoped names, npm scope reservation,
 // "a passkey or 2FA before you publish", and the fresh second factor destructive actions need.
+import { newNameRuleRefusal } from "@apm/core";
 import { Effect, Option } from "effect";
 import { actionKey, commandLine, confirmUrl, type LiveAction } from "./actions.ts";
 import { Auth } from "./auth.ts";
@@ -36,24 +37,12 @@ const isVerified = (user: string) =>
 export const newNameRefusal = (name: string, user: string): Checked =>
   Effect.gen(function* () {
     const { namePolicy } = yield* RegistryConfig;
-    const slash = name.indexOf("/");
-    const bare = name.startsWith("@") ? name.slice(slash + 1) : name;
+    const refused = newNameRuleRefusal({ name, user, policy: namePolicy });
 
-    if (!name.startsWith("@")) {
-      if (namePolicy === "open") return null;
+    if (refused !== null) return { status: 403, error: refused };
 
-      return {
-        status: 403,
-        error: `New packages on apm are scoped to your GitHub login. Publish this as @${user}/${bare} (set "name" in package.json). A bare name like "${bare}" always means the npm package, so apm does not hand out bare names.`,
-      };
-    }
-
-    const scope = name.slice(1, slash);
-
-    if (scope !== user) {
-      return { status: 403, error: `You cannot publish under @${scope}. New packages go under your own scope: @${user}/${bare}.` };
-    }
-
+    if (!name.startsWith("@")) return null;
+    const scope = name.slice(1, name.indexOf("/"));
     const upstream = yield* Effect.serviceOption(Upstream);
 
     if (Option.isSome(upstream) && !(yield* isVerified(user))) {
