@@ -3915,6 +3915,11 @@ export function upstreamPackument(input: {
     for (const [i, v] of kept.entries()) {
       // a view's tarballs stay inside the view, so a lockfile written from it keeps being checked
       const doc: Record<string, unknown> = { ...manifests[i], dist: { tarball: tarballUrl(`${base}${view?.prefix ?? ""}`, src.name, v.version), shasum: v.shasum, integrity: v.integrity } };
+
+      // npm's full document has no hasInstallScript (npm derives it for its abbreviated one), so it is derived here, as
+      // for a package published here (server.ts, versionDoc)
+      if (Object.keys(scriptsOf(v.manifest)).length > 0) doc.hasInstallScript = true;
+
       const r = reportFor(v, at);
 
       if (r) doc._apmScore = compact(r);

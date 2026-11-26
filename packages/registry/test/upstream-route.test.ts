@@ -50,6 +50,22 @@ const VIEWED = {
 };
 
 /**
+ * npm's full packument for `native`, as npm sends fsevents@2.3.3 (node-gyp's install script and gypfile), esbuild
+ * (a postinstall) and a version with no install script: npm's full document has no hasInstallScript, only its
+ * abbreviated one does.
+ */
+const NATIVE = {
+  name: "native",
+  "dist-tags": { latest: "2.3.3" },
+  versions: {
+    "1.0.0": { name: "native", version: "1.0.0", scripts: { test: "node test.js" }, dist: dist("native", "1.0.0") },
+    "2.0.0": { name: "native", version: "2.0.0", scripts: { postinstall: "node install.js" }, dist: dist("native", "2.0.0") },
+    "2.3.3": { name: "native", version: "2.3.3", gypfile: true, scripts: { install: "node-gyp rebuild", test: "node test.js" }, os: ["darwin"], dist: dist("native", "2.3.3") },
+  },
+  time: { "1.0.0": "2026-10-01T00:00:00Z", "2.0.0": "2026-10-02T00:00:00Z", "2.3.3": "2026-10-03T00:00:00Z" },
+};
+
+/**
  * `heavy`: 2,000 versions, each with 12.2 KB of a kept field and 364 devDependencies. Alone, each read fits every
  * per-read limit (25 MiB weight cached and scored; 47.8 MiB weight, 1.46 million nodes, of devDependencies); together
  * they pass REQUEST_METADATA_WEIGHT (72 MiB).
@@ -83,6 +99,8 @@ function fakeNpm() {
       if (!path.startsWith("/@") && /%2f/i.test(path)) return Response.json({ error: "Method not allowed" }, { status: 405 });
 
       if (path === "/viewed") return Response.json(VIEWED);
+
+      if (path === "/native") return Response.json(NATIVE);
 
       if (path === "/heavy") return new Response(HEAVY, { headers: { "content-type": "application/json" } });
 
@@ -147,6 +165,30 @@ describe("the npm packument route", () => {
     const abbreviatedBody = Served.parse(JSON.parse(abbreviated?.text ?? ""));
 
     expect(Object.values(abbreviatedBody.versions).some((v) => "devDependencies" in v || "licenseText" in v)).toBe(false);
+  });
+
+  test("a version with an install script says hasInstallScript in both packuments, as npm's abbreviated one does, and the full one keeps gypfile", async () => {
+    const full = await get("/native");
+
+    expect(full?.status).toBe(200);
+    const fullBody = Served.parse(JSON.parse(full?.text ?? ""));
+
+    // on 6be417d neither packument said hasInstallScript, and the full one left out gypfile
+    expect(fullBody.versions["2.3.3"]?.hasInstallScript).toBe(true);
+    expect(fullBody.versions["2.3.3"]?.gypfile).toBe(true);
+    expect(fullBody.versions["2.0.0"]?.hasInstallScript).toBe(true);
+    expect("hasInstallScript" in (fullBody.versions["1.0.0"] ?? {})).toBe(false);
+
+    const abbreviated = await get("/native", "application/vnd.npm.install-v1+json");
+
+    expect(abbreviated?.status).toBe(200);
+    const abbreviatedBody = Served.parse(JSON.parse(abbreviated?.text ?? ""));
+
+    expect(abbreviatedBody.versions["2.3.3"]?.hasInstallScript).toBe(true);
+    expect(abbreviatedBody.versions["2.0.0"]?.hasInstallScript).toBe(true);
+    expect("hasInstallScript" in (abbreviatedBody.versions["1.0.0"] ?? {})).toBe(false);
+    // npm's abbreviated packument has neither scripts nor gypfile
+    expect(Object.values(abbreviatedBody.versions).some((v) => "scripts" in v || "gypfile" in v)).toBe(false);
   });
 
   test("devDependencies that do not fit beside the packument in the request's budget are left out, not held", async () => {
