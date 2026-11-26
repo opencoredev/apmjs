@@ -6,6 +6,7 @@ import { packageMarkdown } from "./package-md";
 import { loadPackageView } from "./package-view";
 import { fakeSource, INSTALL, INSTALLS, NETWORK, pkg, resolvedTo, REVIEW_CLEAN, UGENT_REFUSED } from "./testing";
 import { codeBlock, inlineCode, oneLine } from "./text";
+import { KNOWN_VULNERABILITIES } from "../limitations";
 import type { PackageInfo } from "../registry";
 import { parseResolve, type ResolveOutcome } from "./source";
 
@@ -61,7 +62,7 @@ describe("packageMarkdown", () => {
   });
 
   test("lists what was not checked, and pulled versions", () => {
-    expect(md).toContain("## Not checked\n\n- `what the code does at runtime`\n- `dependency foo@1 (could not score)`");
+    expect(md).toContain(`## Not checked\n\n- \`what the code does at runtime\`\n- \`dependency foo@1 (could not score)\`\n- ${inlineCode(KNOWN_VULNERABILITIES)}`);
     expect(md).toContain("- 1.2.0: yanked, reason `broken build`. New installs skip it.");
   });
 

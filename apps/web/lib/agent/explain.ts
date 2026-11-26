@@ -1,19 +1,19 @@
 // Reads what an install verdict needs (the registry's resolve answer with its dependency walk, then the AI review of
 // the version it picked) and returns the verdict. Shared by GET /api/explain and the explain_install MCP tool. Both
 // reads skip every cache (see AgentSource): a version confirmed malicious a second ago must not get "install".
-import { looksLikePackageName } from "../search-schema";
+import { looksLikeExistingPackageName } from "../search-schema";
 import { compareVersions, parseVersion } from "../semver";
 import type { AgentSource, ResolveOutcome } from "./source";
 import { explainInstall, reviewInput, type OlderSearch, type Verdict } from "./verdict";
 
-/** "zod", "zod@^4", "@scope/name@1.2.3" → name and range; null when the name can't be a package name. */
+/** "zod", "zod@^4", "@scope/name@1.2.3" → name (case kept) and range; null when the name can't be a package name. */
 export function parsePackageSpec(spec: string): { name: string; range: string | null } | null {
   const s = spec.trim();
   const at = s.lastIndexOf("@");
-  const name = (at > 0 ? s.slice(0, at) : s).toLowerCase();
+  const name = at > 0 ? s.slice(0, at) : s;
   const range = at > 0 ? s.slice(at + 1).trim() : "";
 
-  if (!looksLikePackageName(name) || range.length > 256) return null;
+  if (!looksLikeExistingPackageName(name) || range.length > 256) return null;
 
   return { name, range: range === "" ? null : range };
 }

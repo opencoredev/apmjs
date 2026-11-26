@@ -4,7 +4,9 @@ import { z } from "zod";
 import { mcpGet, mcpOptions, mcpPost } from "./mcp-http";
 import type { Json } from "./json";
 import { PROTOCOL_VERSIONS, TOOLS } from "./mcp";
+import { KNOWN_VULNERABILITIES } from "../limitations";
 import { fakeSource, NETWORK, pkg, resolvedTo, REVIEW_CLEAN, UGENT_REFUSED, type Fake } from "./testing";
+import { inlineCode } from "./text";
 
 const allow = () => ({ ok: true }) as const;
 
@@ -93,7 +95,7 @@ describe("tools", () => {
   });
 
   test("check_package returns the Markdown view and the score, signals and capabilities as data", async () => {
-    const r = await call("check_package", { name: "Left-Pad" }, { packages: { "left-pad": pkg() }, reviews: { "left-pad@1.3.0": REVIEW_CLEAN } });
+    const r = await call("check_package", { name: "left-pad" }, { packages: { "left-pad": pkg() }, reviews: { "left-pad@1.3.0": REVIEW_CLEAN } });
 
     expect(r.text).toContain("# left-pad");
     expect(r.text).toContain("## Risk signals");
@@ -107,6 +109,32 @@ describe("tools", () => {
 
     expect(r.isError).toBe(true);
     expect(r.text).toBe("No package named nope on apm or npm.");
+  });
+
+  // npm names are case-sensitive: JSONStream (1.3.5) and jsonstream (1.0.3) are two packages
+  test("lookups keep the name's case; check_name lowercases the name to claim", async () => {
+    const checked = await call("check_package", { name: "JSONStream" }, { packages: { JSONStream: pkg({ name: "JSONStream" }) } });
+
+    expect(checked.isError).toBe(false);
+    expect(checked.calls[0]).toBe("package JSONStream");
+    expect(checked.text).toContain("# JSONStream");
+    expect((await call("explain_install", { name: "JSONStream" })).calls[0]).toBe("resolve JSONStream@latest");
+    expect((await call("get_file_excerpt", { name: "JSONStream", version: "1.3.5", path: "index.js" })).calls[0]).toBe("excerpt JSONStream@1.3.5 index.js:1±20");
+    expect((await call("check_name", { name: "My-Name" })).calls).toEqual(["names my-name -"]);
+    expect((await call("check_package", { name: "\u212Aelvin" })).isError).toBe(true);
+  });
+
+  test("check_package lists known vulnerabilities as not checked in its text and its data, with or without a score", async () => {
+    const scored = await call("check_package", { name: "left-pad" }, { packages: { "left-pad": pkg() } });
+
+    expect(scored.structured.notChecked).toEqual(["what the code does at runtime", "dependency foo@1 (could not score)", KNOWN_VULNERABILITIES]);
+    expect(scored.text).toContain(`- ${inlineCode(KNOWN_VULNERABILITIES)}`);
+
+    const unscored = await call("check_package", { name: "left-pad" }, { packages: { "left-pad": pkg({ score: null }) } });
+
+    expect(unscored.structured.score).toBeNull();
+    expect(unscored.structured.notChecked).toEqual([KNOWN_VULNERABILITIES]);
+    expect(unscored.text).toContain(`- ${inlineCode(KNOWN_VULNERABILITIES)}`);
   });
 
   test("check_name checks alternatives under the scope given, without its @", async () => {

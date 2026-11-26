@@ -10,6 +10,7 @@ import { ScoreBadge } from "@/components/score-badge";
 import { SignInPanel } from "@/components/sign-in-panel";
 import { Account, AuthConfig, call, passkeyConfirmation, StagedDetail, StagedFile, timeLeft, type Signal } from "@/lib/account";
 import { isSafeTag } from "@/lib/install-note";
+import { notCheckedList } from "@/lib/limitations";
 import { cn } from "@/lib/utils";
 
 type State =
@@ -415,11 +416,11 @@ export function StagedReview({ s, account, config, onDecided }: { s: StagedDetai
                 {risks.length + notes.length === 0 && <li className="px-4 py-3 text-[15px] text-muted-foreground">No signals.</li>}
               </ul>
             )}
-            {s.score && s.score.notChecked.length > 0 && (
+            {s.score && (
               <div className="flex flex-col gap-2">
                 <h3 className="text-[15px] font-medium">Not checked</h3>
                 <ul className="flex list-disc flex-col gap-1 pl-5 text-[15px] leading-6 text-muted-foreground marker:text-muted-foreground/60">
-                  {s.score.notChecked.map((n) => (
+                  {notCheckedList(s.score.notChecked).map((n) => (
                     <li key={n}>{n}</li>
                   ))}
                 </ul>
