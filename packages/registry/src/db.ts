@@ -339,14 +339,12 @@ const AnalysisItem = z.discriminatedUnion("kind", [
  */
 export type AnalysisKey = { readonly package: string; readonly version: string; readonly digest: string | null; readonly trimmed?: boolean };
 
-/** An upstream package's analyses, its live dismissals and what it cannot score, as upstreamAnalyses reads them. */
+/** An upstream package's analyses, its live dismissals and what it cannot score, as pageRead reads them. */
 const AnalysesColumns = {
   analyses: z.array(z.object({ version: z.string(), digest: z.string(), analysis: z.unknown() })),
   dismissals: z.array(DismissalRow),
   unscorable: z.array(z.object({ version: z.string(), outcome: UnscorableReason, detail: z.string().nullable(), digest: z.string().nullable() })),
 };
-
-const AnalysesRow = z.object(AnalysesColumns);
 
 /** Store.pageRead's one row: the local columns, empty unless `pkg` is there, and the upstream ones, empty unless it is not. */
 const PageReadRow = z.object({
@@ -601,7 +599,7 @@ export type StoreApi = {
   /** Versions `user` published after `since` that are not revoked, across every package. */
   readonly publishedSince: (user: string, since: number) => Effect.Effect<VersionRecord[], StoreError>;
 
-  /** The current scorer's analyses of this package and the versions it decided it cannot score, in one query. */
+  /** The current scorer's analyses of this package and the versions it decided it cannot score: upstreamAnalysesOf for one name. */
   readonly upstreamAnalyses: (name: string) => Effect.Effect<UpstreamAnalyses, StoreError>;
   /** upstreamAnalyses for several packages in three statements, keyed by package name; a package with neither is left out. */
   readonly upstreamAnalysesOf: (names: readonly string[]) => Effect.Effect<Map<string, UpstreamAnalyses>, StoreError>;
@@ -989,7 +987,7 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
     rows.length === 0 ? Effect.succeed(rows) : Effect.map(dismissalsOf([...new Set(rows.map((v) => v.package))]), (ds) => dismissedFrom(rows, ds));
 
   /** An upstream package's scores keyed by "<version> <digest>", each with its dismissed evidence left out, and what it cannot score. */
-  const analysesOf = (analyses: z.output<typeof AnalysesRow>["analyses"], dismissals: readonly DismissalRecord[], unscorable: z.output<typeof AnalysesRow>["unscorable"]): UpstreamAnalyses => ({
+  const analysesOf = (analyses: z.output<typeof PageReadRow>["analyses"], dismissals: readonly DismissalRecord[], unscorable: z.output<typeof PageReadRow>["unscorable"]): UpstreamAnalyses => ({
     // rows come oldest scorer first, so the current scorer's analysis of the same bytes replaces a reused v10 one
     scores: new Map(analyses.flatMap((a) => currentScore(a.analysis, dismissalsFor(dismissals, a.version, a.digest)).map((score) => [`${a.version} ${a.digest}`, score] as const))),
     unscorable: new Map(unscorable.map((u) => [u.version, { reason: u.outcome, detail: u.detail ?? "", digest: u.digest }] as const)),
@@ -1414,25 +1412,10 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
         all(VersionRow),
       ).pipe(Effect.flatMap(withDismissals)),
 
-    // the analyses and the package's live dismissals in one round trip: every read of an upstream package's scores
-    // (the package, score, file and readme answers) waits on it. One row holding two arrays, so each analysis and
-    // each dismissal is sent once: a join would repeat every dismissal on every analysis row.
-    upstreamAnalyses: (name) =>
-      Effect.gen(function* () {
-        const row = yield* run(
-          "upstreamAnalyses",
-          sql`SELECT
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', u.version, 'digest', u.digest, 'analysis', u.analysis) ORDER BY u.scorer), '[]'::jsonb)
-                   FROM upstream_analysis u WHERE u.package = ${name} AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis)))) AS analyses,
-                (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.dismissed_at, e.id), '[]'::jsonb)
-                   FROM evidence_dismissals e WHERE e.package = ${name} AND e.restored_at IS NULL) AS dismissals,
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', o.version, 'outcome', o.outcome, 'detail', o.detail, 'digest', o.digest) ORDER BY o.scorer), '[]'::jsonb)
-                   FROM analysis_outcomes o WHERE o.package = ${name} AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL) AS unscorable`,
-          one(AnalysesRow),
-        );
-
-        return analysesOf(row?.analyses ?? [], row?.dismissals ?? [], row?.unscorable ?? []);
-      }),
+    // upstreamAnalysesOf for one package: each analysis a row of its own. One row holding every analysis as a jsonb_agg
+    // value was next's whole history (61 analyses, about 16 MB), which production's connection dropped, so the ~safe
+    // and full packuments of next answered 503 (2026-11-26)
+    upstreamAnalyses: (name) => Effect.map(api.upstreamAnalysesOf([name]), (got) => got.get(name) ?? { scores: new Map(), unscorable: new Map() }),
     // getPackage, listVersions and owners, or keptPackage and upstreamAnalyses, as one statement: a package page's
     // answer waited on four round trips in a row before (each about 75 ms from production's Workers to Neon). The
     // local columns are read only when the package row is there, the upstream ones only when it is not, and the kept
@@ -1688,8 +1671,8 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
         if (names.length === 0) return new Map<string, UpstreamAnalyses>();
         const wanted = [...new Set(names)];
 
-        // the analyses, the decided outcomes and the live dismissals in one statement, so from one snapshot, as
-        // upstreamAnalyses reads them for one package: the walk reads them once a level. Each is a row of its own, so a
+        // the analyses, the decided outcomes and the live dismissals in one statement, so from one snapshot: the walk
+        // reads them once a level, upstreamAnalyses for one package. Each is a row of its own, so a
         // row holds one analysis at most: every stored analysis of next as one jsonb_agg value was tens of MB, which the
         // connection dropped (production, 2026-11-25)
         const items = yield* run(
