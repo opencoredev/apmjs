@@ -113,22 +113,24 @@ export default function CompareSocket() {
         <h2 id="table-title" className="mb-6 text-center text-[28px] leading-tight font-medium tracking-[-0.02em] sm:text-4xl">
           Row by row.
         </h2>
-        <div className="overflow-hidden rounded-2xl border">
-          <div className="hidden grid-cols-[180px_1fr_1fr] border-b text-sm md:grid" aria-hidden>
-            <div className="px-5 py-3" />
-            <div className="px-5 py-3 text-muted-foreground">Socket</div>
-            <div className="bg-surface px-5 py-3 font-medium">apm</div>
+        <div role="table" aria-labelledby="table-title" className="overflow-hidden rounded-2xl border">
+          <div role="row" className="hidden grid-cols-[180px_1fr_1fr] border-b text-sm md:grid">
+            <div role="columnheader" className="px-5 py-3">
+              <span className="sr-only">Topic</span>
+            </div>
+            <div role="columnheader" className="px-5 py-3 text-muted-foreground">Socket</div>
+            <div role="columnheader" className="bg-surface px-5 py-3 font-medium">apm</div>
           </div>
           {ROWS.map((r) => (
-            <div key={r.label} className="grid border-t border-dashed first:border-t-0 md:grid-cols-[180px_1fr_1fr]">
-              <div className="px-5 pt-4 pb-1 font-medium md:py-4">{r.label}</div>
-              <div className="flex gap-3 px-5 py-2 text-[15px] leading-6 text-muted-foreground md:py-4">
+            <div key={r.label} role="row" className="grid border-t border-dashed first:border-t-0 md:grid-cols-[180px_1fr_1fr]">
+              <div role="rowheader" className="px-5 pt-4 pb-1 font-medium md:py-4">{r.label}</div>
+              <div role="cell" className="flex gap-3 px-5 py-2 text-[15px] leading-6 text-muted-foreground md:py-4">
                 <span className="w-12 shrink-0 pt-px font-mono text-xs leading-6 md:sr-only">Socket</span>
                 <span className="min-w-0">
                   <Rich text={r.socket} />
                 </span>
               </div>
-              <div className="mx-3 mb-3 flex gap-3 rounded-lg bg-surface px-2 py-2 text-[15px] leading-6 md:m-0 md:rounded-none md:px-5 md:py-4">
+              <div role="cell" className="mx-3 mb-3 flex gap-3 rounded-lg bg-surface px-2 py-2 text-[15px] leading-6 md:m-0 md:rounded-none md:px-5 md:py-4">
                 <span className="w-12 shrink-0 pt-px font-mono text-xs leading-6 font-medium md:sr-only">apm</span>
                 <span className="min-w-0">
                   <Rich text={r.apm} />
