@@ -93,7 +93,7 @@ describe("tools", () => {
   });
 
   test("check_package returns the Markdown view and the score, signals and capabilities as data", async () => {
-    const r = await call("check_package", { name: "Left-Pad" }, { packages: { "left-pad": pkg() }, reviews: { "left-pad@1.3.0": REVIEW_CLEAN } });
+    const r = await call("check_package", { name: "left-pad" }, { packages: { "left-pad": pkg() }, reviews: { "left-pad@1.3.0": REVIEW_CLEAN } });
 
     expect(r.text).toContain("# left-pad");
     expect(r.text).toContain("## Risk signals");
@@ -107,6 +107,18 @@ describe("tools", () => {
 
     expect(r.isError).toBe(true);
     expect(r.text).toBe("No package named nope on apm or npm.");
+  });
+
+  // npm names are case-sensitive: JSONStream (1.3.5) and jsonstream (1.0.3) are two packages
+  test("lookups keep the name's case; check_name lowercases the name to claim", async () => {
+    const checked = await call("check_package", { name: "JSONStream" }, { packages: { JSONStream: pkg({ name: "JSONStream" }) } });
+
+    expect(checked.isError).toBe(false);
+    expect(checked.calls[0]).toBe("package JSONStream");
+    expect(checked.text).toContain("# JSONStream");
+    expect((await call("explain_install", { name: "JSONStream" })).calls[0]).toBe("resolve JSONStream@latest");
+    expect((await call("get_file_excerpt", { name: "JSONStream", version: "1.3.5", path: "index.js" })).calls[0]).toBe("excerpt JSONStream@1.3.5 index.js:1±20");
+    expect((await call("check_name", { name: "My-Name" })).calls).toEqual(["names my-name -"]);
   });
 
   test("check_name checks alternatives under the scope given, without its @", async () => {

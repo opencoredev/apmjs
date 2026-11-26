@@ -6,7 +6,7 @@ export const LLMS_TXT = `# apm
 
 > apm is a package registry in front of npm. Stock bun, npm and pnpm install from it unmodified. Every version of every package gets a security score out of 100 with file:line evidence for each lost point, versions can be yanked or revoked at any time, and new versions wait out a 24-hour cooldown before the safe view serves them. The apm CLI checks the score, cooldown and dependency tree, then runs your own package manager.
 
-apm never calls a version "safe". A score says what apm read in the tarball; it does not check what the code does at runtime, the code of its dependencies, or a compromised publisher. Every answer lists what was not checked.
+apm never calls a version "safe". A score says what apm read in the tarball; it does not check what the code does at runtime, the code of its dependencies, or a compromised publisher. Known vulnerabilities (published CVEs and GitHub security advisories) are not part of the score or the install verdict either: after installing, run \`apm audit\` or \`npm audit\` to list them. Every answer lists what was not checked.
 
 ## For agents
 

@@ -10,6 +10,7 @@ import { ScoreBadge } from "@/components/score-badge";
 import { SignInPanel } from "@/components/sign-in-panel";
 import { Account, AuthConfig, call, passkeyConfirmation, StagedDetail, StagedFile, timeLeft, type Signal } from "@/lib/account";
 import { isSafeTag } from "@/lib/install-note";
+import { KNOWN_VULNERABILITIES } from "@/lib/limitations";
 import { cn } from "@/lib/utils";
 
 type State =
@@ -422,6 +423,7 @@ export function StagedReview({ s, account, config, onDecided }: { s: StagedDetai
                   {s.score.notChecked.map((n) => (
                     <li key={n}>{n}</li>
                   ))}
+                  <li>{KNOWN_VULNERABILITIES}</li>
                 </ul>
               </div>
             )}

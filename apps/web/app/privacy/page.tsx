@@ -11,7 +11,7 @@ export default function PrivacyPage() {
     <article className="mx-auto flex max-w-3xl flex-col gap-8">
       <header className="flex flex-col gap-3">
         <h1 className="text-3xl font-medium tracking-tight sm:text-4xl">Privacy policy</h1>
-        <p className="text-sm text-muted-foreground">Last updated: November 23, 2026</p>
+        <p className="text-sm text-muted-foreground">Last updated: November 26, 2026</p>
         <p className="text-lg leading-7 text-pretty text-muted-foreground">
           apm is an open-source package registry and security scorer operated at apmjs.dev, registry.apmjs.dev, and docs.apmjs.dev. This page states what data we collect and why.
         </p>
@@ -26,10 +26,21 @@ export default function PrivacyPage() {
           The public pages of apmjs.dev and docs.apmjs.dev load Databuddy&apos;s analytics script, which sets no cookies. It records page views (the page address, title, and the site that linked you there), Web Vitals (load and responsiveness timings), clicks on links to other sites, and JavaScript errors on those pages, along with your screen size, language, and time zone. It also records a few actions by name: copying an install command, registry setting, setup prompt or MCP setting, opening the docs, opening a package from search or a piece of a score's evidence, starting sign-in, and how many results a search showed. These carry the package name where the action is about one package, and never the text you typed into search. On package pages, your browser also asks Databuddy which install tab to show first, using the same random visitor ID. To count visits it keeps a random visitor ID in your browser&apos;s local storage and a session ID in session storage; neither is tied to your account.
         </p>
         <p className="text-[15px] leading-7 text-muted-foreground">
-          The analytics script does not load on the sign-in, account, approval, device sign-in, publishing, or admin pages (/signin, /account, /approve, /device, /publish, /admin), and navigating to any of them from a public page loads a fresh page without the script. When your browser sends Global Privacy Control or Do Not Track, the analytics script does not load and your browser sends nothing to Databuddy.
+          Databuddy&apos;s script does not load on the sign-in, account, approval, device sign-in, publishing, or admin pages (/signin, /account, /approve, /device, /publish, /admin), and navigating to any of them from a public page loads a fresh page without it. When your browser sends Global Privacy Control or Do Not Track, Databuddy&apos;s script does not load and your browser sends nothing to Databuddy.
         </p>
         <p className="text-[15px] leading-7 text-muted-foreground">
-          When an account is created or signs in on the website, the registry counts it in Databuddy with the sign-in method (GitHub or passkey) and the account&apos;s analytics ID: a one-way hash of an internal account number, not your email address, name, or GitHub login, and Databuddy gets none of those. The ID is left out when your browser sends Global Privacy Control or Do Not Track. Signing in the CLI with apm login is not counted, and the analytics script in your browser is never given the ID, so your page views stay anonymous.
+          Cloudflare, which hosts apm, also adds the script tag for its Cloudflare Web Analytics beacon (static.cloudflareinsights.com/beacon.min.js) to every page of apmjs.dev and docs.apmjs.dev, the sign-in, account, approval, device sign-in, publishing, and admin pages included, whether or not your browser sends Global Privacy Control or Do Not Track. Cloudflare adds it as pages pass through its network; it is not part of apm&apos;s code. apm&apos;s Content Security Policy does not allow scripts from that address, so a browser that enforces the policy blocks the beacon before it runs, and it then sends nothing. Where it does run, Cloudflare states that it sets no cookies and uses no local storage, does not fingerprint visitors by IP address, user agent, or other data, and does not track individual visitors across sites. It measures how the page loaded (load timings and Core Web Vitals) and reports that to the site&apos;s own /cdn-cgi/rum address, and Cloudflare&apos;s reports count page views and visits by country, host, path, referring site, device type, browser, and operating system. See Cloudflare&apos;s{" "}
+          <a href="https://developers.cloudflare.com/web-analytics/data-metrics/data-origin-and-collection/" className="text-foreground underline underline-offset-4">
+            Web Analytics documentation
+          </a>{" "}
+          and{" "}
+          <a href="https://www.cloudflare.com/web-analytics/" className="text-foreground underline underline-offset-4">
+            privacy notes for Web Analytics
+          </a>
+          .
+        </p>
+        <p className="text-[15px] leading-7 text-muted-foreground">
+          When an account is created or signs in on the website, the registry counts it in Databuddy with the sign-in method (GitHub or passkey) and the account&apos;s analytics ID: a one-way hash of an internal account number, not your email address, name, or GitHub login, and Databuddy gets none of those. The ID is left out when your browser sends Global Privacy Control or Do Not Track. Signing in the CLI with apm login is not counted, and neither analytics script in your browser is given the ID, so your page views stay anonymous.
         </p>
         <p className="text-[15px] leading-7 text-muted-foreground">
           Separately, when an unexpected server error occurs, our Cloudflare Workers report it to Databuddy with a fixed error code, a route label, the status code, and the Cloudflare location. The report carries nothing about you or your request: no address, headers, or contents.

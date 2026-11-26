@@ -18,7 +18,7 @@ import { OpenDetailsLink } from "@/components/open-details-link";
 import { citeEvidence } from "@/lib/evidence";
 import { clickEvent } from "@/lib/databuddy-client";
 import { citedLine } from "@/lib/file-excerpt";
-import { limitationCount, sortLimitations, splitPossible, splitTestFile, summarizeLimitations, type ReadingLimit } from "@/lib/limitations";
+import { KNOWN_VULNERABILITIES, limitationCount, sortLimitations, splitPossible, splitTestFile, summarizeLimitations, type ReadingLimit } from "@/lib/limitations";
 import { fileHref, packagePath, parsePackageRoute } from "@/lib/package-route";
 import { ScoreBadge, toneOf, type Tone } from "@/components/score-badge";
 import { headlineKind, ScoreHeadline } from "@/components/score-headline";
@@ -216,6 +216,7 @@ function LimitationsList({ notChecked }: { notChecked: readonly string[] }) {
         {l.general.map((n) => (
           <li key={n}>{sentence(n)}</li>
         ))}
+        <li>{KNOWN_VULNERABILITIES}</li>
         {l.complex.length > 0 && <ComplexCode complex={l.complex} />}
         {l.unread.map((n) => (
           <li key={n}>{sentence(n)}</li>
@@ -454,7 +455,7 @@ function NoReadme({ name, source, links, unscorable = false }: { name: string; s
 }
 
 /** The one line a phone shows beside the compact score: what kind of number it is and what it leaves out. */
-const SCORE_QUALIFIER = "Heuristic score; runtime behavior and dependency code not checked.";
+const SCORE_QUALIFIER = "Heuristic score; runtime behavior, dependency code and known CVEs not checked.";
 
 /** Phones only: the score in one line near the top, naming the signal that cost the most, linking down to the full report. */
 function ScoreSummary({ score, unscorable, className }: { score: PackageInfo["score"]; unscorable: boolean; className?: string }) {

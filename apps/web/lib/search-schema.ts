@@ -110,3 +110,11 @@ const NAME_RE = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
 export function looksLikePackageName(q: string): boolean {
   return q.length > 0 && q.length <= 214 && NAME_RE.test(q);
 }
+
+/**
+ * A name to look up as given: npm names are case-sensitive and legacy ones (JSONStream, Base64) have capitals, so the
+ * name is checked in lowercase but never changed. A new name to claim must pass looksLikePackageName itself.
+ */
+export function looksLikeExistingPackageName(q: string): boolean {
+  return looksLikePackageName(q.toLowerCase());
+}

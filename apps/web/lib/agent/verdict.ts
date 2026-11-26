@@ -16,6 +16,7 @@
 // read is "unknown"; "do-not-install" is only for a revoked or yanked version and one an apm reviewer confirmed
 // malicious, the version or anything in its tree. Like the rest of the site it never calls a version "safe".
 import { installCommand, INSTALL_CLIENTS, type InstallClient } from "../install-note";
+import { KNOWN_VULNERABILITIES } from "../limitations";
 import type { Fetched } from "../registry";
 import type { PublicReview, ReviewAnswer } from "../review-schema";
 import type { DepCheck, DepRef, DepReviews, ReportCoverage, ResolveOutcome, WarningInput } from "./source";
@@ -259,6 +260,8 @@ export type Verdict = {
    * picked past the cooldown): never a reason to stop, for the agent to mention after installing. Empty when nothing.
    */
   notes: Note[];
+  /** What no verdict checks, whatever the version: known vulnerabilities. */
+  notChecked: string[];
 };
 
 const SHOWN = 3;
@@ -615,7 +618,7 @@ function decide(input: ExplainInput): Decided {
   const range = input.range ?? "latest";
   const asked = range === "latest" ? name : `${name}@${plain(range)}`;
   // every verdict that stops before the notes are worked out has none
-  const base = { name, range, notes: [] };
+  const base = { name, range, notes: [], notChecked: [KNOWN_VULNERABILITIES] };
 
   switch (resolve.kind) {
     case "unavailable":
@@ -971,8 +974,8 @@ export function reviewInput(answer: Fetched<Pick<ReviewAnswer, "status" | "revie
 
 /**
  * The verdict as a few plain lines: apm's verdict and summary first, on lines of their own, then the reasons (where
- * anything the registry passed on from a publisher sits in code spans), the evidence, the notes, the coverage and the
- * apm command.
+ * anything the registry passed on from a publisher sits in code spans), the evidence, the notes, the coverage, what no
+ * verdict checks and the apm command.
  */
 export function verdictText(v: Verdict): string {
   const lines = [`Verdict: ${v.verdict}`, v.summary, `AI review: ${v.coverage.aiReview}. Dependencies scored: ${v.coverage.dependencies}.`];
@@ -984,6 +987,8 @@ export function verdictText(v: Verdict): string {
   if (v.notes.length > 0) lines.push("", v.verdict === "install" ? "Notes (install anyway, then tell the person):" : "Notes:", ...v.notes.map((n) => `- ${n.text}`));
 
   if (v.reasons.length > 0 || v.evidence.length > 0 || v.notes.length > 0) lines.push("", UNTRUSTED_NOTE);
+
+  lines.push("", "Not checked:", ...v.notChecked.map((n) => `- ${n}`));
 
   if (v.url) lines.push("", `Details: ${v.url}`);
 

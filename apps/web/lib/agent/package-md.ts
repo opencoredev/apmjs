@@ -3,7 +3,7 @@
 import { isNotAllRead, NOT_ALL_READ_INSTALLS, scoreOnWhatWasRead, skippedSentence } from "../coverage";
 import { citeEvidence, namesFile } from "../evidence";
 import { cooldownText, installCommand, installNote, INSTALL_CLIENTS, specSuffix, type InstallSpec } from "../install-note";
-import { splitPossible, splitTestFile } from "../limitations";
+import { KNOWN_VULNERABILITIES, splitPossible, splitTestFile } from "../limitations";
 import { fileHref } from "../package-route";
 import { UNSCORABLE_INSTALLS } from "../unscored";
 import type { Facts, Fetched, PackageInfo, Signal } from "../registry";
@@ -397,6 +397,7 @@ export function packageMarkdown(input: PackageView): string {
 
   if (notChecked.length === 0) out.push("- What the code does at runtime, the code of its dependencies, or a compromised publisher.");
   else out.push(...notChecked.map((n) => `- ${inlineCode(n)}`));
+  out.push(`- ${KNOWN_VULNERABILITIES}`);
 
   const suffix = specSuffix(named);
 

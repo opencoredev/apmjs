@@ -59,10 +59,10 @@ const GROUPS: readonly Group[] = [
   {
     title: "Knowing what you install",
     rows: [
-      { label: "Safety signal", npm: "`npm audit` lists known CVEs only. Silent on new malware.", apm: "Score out of 100 with file:line evidence and a “not checked” list." },
+      { label: "Safety signal", npm: "`npm audit` lists known CVEs. Silent on new malware.", apm: "Score out of 100 with file:line evidence and a “not checked” list. Known CVEs are not in the score: `apm audit` lists them." },
       { label: "Granularity", npm: "Third-party scores rate the whole package.", apm: "Every version scored. A new `curl | sh` or risky dependency drops it." },
       { label: "Metadata", npm: "Trusts the publish request, so install scripts can hide.", apm: "Read from the tarball’s package.json. A mismatch is refused." },
-      { label: "Install check", npm: "Installs first, audit afterwards.", apm: "`apm add` and `apm x` check the whole tree first." },
+      { label: "Install check", npm: "Installs first, audit afterwards.", apm: "`apm add` and `apm x` check the whole tree first, for scores, revokes, malware and the cooldown. Known CVEs are not part of that check: run `apm audit` after." },
       { label: "Fresh releases", npm: "No cooldown by default.", apm: "24h cooldown: `apm add` warns about a version under a day old, `--strict` refuses it, and `/~safe/` leaves it out for any client, with a score floor of 40." },
     ],
   },

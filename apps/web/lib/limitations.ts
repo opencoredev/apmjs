@@ -13,6 +13,12 @@ export const GENERAL_LIMITS: readonly string[] = [
   "whether the publisher's machine or CI was compromised",
 ];
 
+/**
+ * Known vulnerabilities, on every list of what apm did not check: neither the score nor the install verdict reads a CVE
+ * or GitHub advisory database. The site's own line, not core's NOT_CHECKED, whose wording stored analyses keep.
+ */
+export const KNOWN_VULNERABILITIES = "Known vulnerabilities (published CVEs and GitHub security advisories): not part of the score or the install verdict. Run apm audit or npm audit after installing to list them.";
+
 /** General entries earlier scorers wrote. Shown as today's list, not as written. */
 const EARLIER_GENERAL: ReadonlySet<string> = new Set([
   "runtime behavior: what the code does when it runs, such as downloading or unpacking more code",
@@ -79,15 +85,15 @@ export function sortLimitations(notChecked: readonly string[]): Limitations {
   return out;
 }
 
-/** How many lines the disclosure lists: the general limits, one line for complex code, and the rest. */
+/** How many lines the disclosure lists: the general limits, known vulnerabilities, one line for complex code, and the rest. */
 export function limitationCount(l: Limitations): number {
-  return l.general.length + (l.complex.length > 0 ? 1 : 0) + l.unread.length + (l.dependencies.length > 0 ? 1 : 0) + l.other.length;
+  return l.general.length + 1 + (l.complex.length > 0 ? 1 : 0) + l.unread.length + (l.dependencies.length > 0 ? 1 : 0) + l.other.length;
 }
 
 /** The short form beside the number: the plain one-line summary, then what is specific to this version. */
 export type LimitationSummary = { headline: string; extra: string | null; total: number };
 
-const HEADLINE = "Not checked: what the code does at runtime, the code of its dependencies, or a compromised publisher.";
+const HEADLINE = "Not checked: what the code does at runtime, the code of its dependencies, a compromised publisher, or known vulnerabilities (CVEs).";
 
 export function summarizeLimitations(notChecked: readonly string[]): LimitationSummary {
   const l = sortLimitations(notChecked);

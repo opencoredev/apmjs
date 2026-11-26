@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { isNotAllRead, NOT_ALL_READ } from "../coverage";
 import { packagePath } from "../package-route";
-import { looksLikePackageName } from "../search-schema";
+import { looksLikeExistingPackageName, looksLikePackageName } from "../search-schema";
 import { scorerCapabilities, type ScorerCapabilities } from "../capabilities";
 import { installCommand, INSTALL_CLIENTS, type InstallClient } from "../install-note";
 import { publishability, publishabilityText } from "../publish-name";
@@ -25,7 +25,7 @@ export const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "202
 
 export const SERVER_INFO = { name: "apm", title: "apm package registry", version: "1.0.0" } as const;
 
-const INSTRUCTIONS = `apm scores every npm package version out of 100 with file:line evidence, and its install policy refuses versions yanked, revoked or confirmed malicious, and warns about (never refuses) a version under 24 hours old or a score under 40. Before adding a dependency, call explain_install and follow its verdict: install (run its command, then mention its notes: what apm did not finish), review-first (a real risk signal: show the reasons to the user and wait for approval), do-not-install, not-found (check the spelling; it may be a typosquat) or unknown (the registry did not answer). A score never means a version is safe; each answer says what was not checked. ${UNTRUSTED_NOTE}`;
+const INSTRUCTIONS = `apm scores every npm package version out of 100 with file:line evidence, and its install policy refuses versions yanked, revoked or confirmed malicious, and warns about (never refuses) a version under 24 hours old or a score under 40. Before adding a dependency, call explain_install and follow its verdict: install (run its command, then mention its notes: what apm did not finish), review-first (a real risk signal: show the reasons to the user and wait for approval), do-not-install, not-found (check the spelling; it may be a typosquat) or unknown (the registry did not answer). A score never means a version is safe; each answer says what was not checked. Known vulnerabilities (published CVEs and GitHub security advisories) are not part of the score or the verdict: after installing, run apm audit or npm audit to list them. ${UNTRUSTED_NOTE}`;
 
 // ---------- JSON-RPC ----------
 
@@ -52,14 +52,18 @@ export const rpcError = (id: RequestId | null, code: number, message: string): J
 
 // ---------- tools ----------
 
-const PackageName = z.string().trim().toLowerCase().refine(looksLikePackageName, "not a valid npm package name");
+/** A package to look up, as given: npm names are case-sensitive (JSONStream is not jsonstream). */
+const PackageName = z.string().trim().refine(looksLikeExistingPackageName, "not a valid npm package name");
+
+/** A name to claim: new names are lowercase. */
+const NewPackageName = z.string().trim().toLowerCase().refine(looksLikePackageName, "not a valid npm package name");
 
 const SearchInput = z.object({ query: z.string().trim().min(1).max(214).describe("Words or a package name"), limit: z.number().int().min(1).max(20).default(10).describe("How many hits to return") });
 
 const CheckPackageInput = z.object({ name: PackageName.describe("Package name, such as zod or @scope/name"), version: z.string().min(1).max(256).optional().describe("Exact version or dist-tag; the version installs get by name when left out") });
 
 const CheckNameInput = z.object({
-  name: PackageName.describe("The name to check"),
+  name: NewPackageName.describe("The name to check"),
   scope: z
     .string()
     .trim()
@@ -238,7 +242,7 @@ const checkName: Tool<typeof CheckNameInput> = {
 const explain: Tool<typeof ExplainInput> = {
   name: "explain_install",
   title: "Should I install this?",
-  description: "Before adding a dependency: runs apm's install policy (revokes, confirmed malice, the dependency tree, and the 24-hour cooldown and the score floor of 40 as warnings) and the AI review for name@version, and answers install, review-first, do-not-install, not-found or unknown, with reasons, the command to run and notes. review-first is for a real risk (a risk the scorer found, a score under 40, an open AI review flag, a version inside the cooldown apm cannot clear) or an analysis apm could not finish (only files left unread for their size or the byte budget install, as a note); what apm has not done yet installs, listed in notes. A version inside the cooldown is swapped for the newest one in range past it.",
+  description: "Before adding a dependency: runs apm's install policy (revokes, confirmed malice, the dependency tree, and the 24-hour cooldown and the score floor of 40 as warnings) and the AI review for name@version, and answers install, review-first, do-not-install, not-found or unknown, with reasons, the command to run and notes. review-first is for a real risk (a risk the scorer found, a score under 40, an open AI review flag, a version inside the cooldown apm cannot clear) or an analysis apm could not finish (only files left unread for their size or the byte budget install, as a note); what apm has not done yet installs, listed in notes. A version inside the cooldown is swapped for the newest one in range past it. Known vulnerabilities (CVEs) are not checked: apm audit or npm audit lists them after the install.",
   input: ExplainInput,
   async run({ name, version }, source) {
     const verdict = await explainFor({ name, range: version ?? null, source });
