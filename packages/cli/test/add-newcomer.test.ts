@@ -375,6 +375,13 @@ describe("detectPm", () => {
 
   test("a package.json alone means npm", () => {
     expect(detectPm(project("plain", { "package.json": manifest }), null).pm).toBe("npm");
+    expect(detectPm(project("registry-deps", { "package.json": JSON.stringify({ name: "app", dependencies: { zod: "^4.0.0", alias: "npm:zod@4", scoped: "@scope/x" }, devDependencies: { ts: ">=5 <6" } }) }), null).pm).toBe("npm");
+  });
+
+  test.each([["github:attacker/evil"], ["attacker/evil#main"], ["git+https://example.test/evil.git"], ["https://example.test/evil.tgz"]])("a git or URL dependency (%s) keeps bun, which does not build it before apm checks", (spec) => {
+    const dir = project(`built-${crypto.randomUUID()}`, { "package.json": JSON.stringify({ name: "app", devDependencies: { evil: spec } }) });
+
+    expect(detectPm(dir, null).pm).toBe(Bun.which("bun") ? "bun" : "npm");
   });
 
   test("bun.lock, bun.lockb, bunfig.toml and packageManager bun keep bun", () => {
