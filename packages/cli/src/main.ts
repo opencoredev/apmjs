@@ -112,7 +112,7 @@ function config(cwd: string): Config {
 
   if (cfg.withheld) warn(yellow(`apm: APM_TOKEN is for ${shownRegistry(cfg.withheld)}, so it is not sent to ${shownRegistry(cfg.registry)} (set by a project .npmrc or npm_config_registry)`));
 
-  if (cfg.unexpanded) warn(yellow(`apm: ${shownRegistry(cfg.registry)} was chosen by a project .npmrc or npm_config_registry, so apm did not fill in the token ${cfg.unexpanded} asks for. Set APM_REGISTRY to that registry if you trust it.`));
+  if (cfg.unexpanded) warn(yellow(`apm: ${shownRegistry(cfg.registry)} was chosen by a project .npmrc or npm_config_registry, so apm did not fill in the token ${escapedPath(cfg.unexpanded)} asks for. Set APM_REGISTRY to that registry if you trust it.`));
 
   return cfg;
 }
@@ -2540,14 +2540,14 @@ function refuseUserconfigInProject(cfg: Config): boolean {
   const setter = inside(projectRoot) ? null : projectUserconfigSetter(cwd, env());
 
   if (setter !== null) {
-    fail(`refused: apm login would save the token to ${file}, which ${setter} chose with userconfig= (npm run and npx pass it on as npm_config_userconfig).`);
+    fail(`refused: apm login would save the token to ${escapedPath(file)}, which ${escapedPath(setter)} chose with userconfig= (npm run and npx pass it on as npm_config_userconfig).`);
     say("Nothing was sent. Run apm login outside this project, or without npm_config_userconfig set.");
 
     return true;
   }
 
   if (!inside(projectRoot)) return false;
-  fail(`refused: apm login would save the token to ${file}, inside this project (npm_config_userconfig, which a project .npmrc can set through npm run or npx).`);
+  fail(`refused: apm login would save the token to ${escapedPath(file)}, inside this project (npm_config_userconfig, which a project .npmrc can set through npm run or npx).`);
   say("Nothing was sent. Run apm login outside this project, or without npm_config_userconfig set.");
 
   return true;

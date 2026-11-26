@@ -471,6 +471,17 @@ describe("finding 9: apm login only saves a well-formed token", () => {
 
     expect(own.code, own.out).toBe(0);
     expect(readFileSync(theirs, "utf8")).toContain("_authToken=apm_");
+
+    // the path a repo chose is printed escaped: its control bytes cannot pose as apm's own output
+    const forged = join(mine, "x\u001b[2Kapm: ok\u0007");
+
+    writeFileSync(join(app, ".npmrc"), `userconfig=${forged}\n`);
+    const escaped = await apm(["login", "--username", "mallory9", "--password-stdin"], { cwd: app, env: { ...laptopEnv(sb.env), APM_REGISTRY: reg.url, npm_config_userconfig: forged }, stdin: "a-long-enough-password\n" });
+
+    expect(escaped.code, escaped.out).toBe(1);
+    expect(escaped.out).not.toContain("\u001b[2K");
+    expect(escaped.out).not.toContain("\u0007");
+    expect(escaped.out).toContain("\\u{1b}[2K");
   });
 });
 
