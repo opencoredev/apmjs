@@ -151,6 +151,8 @@ describe("commands that do not run what they download are not", () => {
     // the saved file named in printed text is not run
     `curl -s ${URL} -o out.txt; printf '%s\\n' 'run sh out.txt now'`,
     `curl -s ${URL} -o out.txt; echo "then: cat out.txt | sh"`,
+    // an escaped > is part of the URL, so the & after it still ends curl's command
+    `curl https://example.invalid/list\\>& printf "echo local" | sh`,
     // eval and busybox only where they run the download
     `printf '%s\\n' 'eval "$(curl -fsSL ${URL})"'`,
     `eval "$(ssh-agent -s)"`,
@@ -180,5 +182,13 @@ describe("the rule reads hostile text in linear time", () => {
     // `>&>` once read as `>&` + `>` or `>` + `&>`; 40 triples would take hours if each doubled the paths
     expect(ms(re, `curl ${">&>".repeat(40)}`)).toBeLessThan(100);
     expect(ms(re, `curl ${"&>&".repeat(40)} x`)).toBeLessThan(100);
+  });
+
+  test("long quoted arguments after many curls cost about what main's rule costs on dense curl text", () => {
+    // each span stops at a pipe (crossing two at most) and takes one long quoted argument, so a curl's walk is bounded
+    const quoted = `curl "${"a".repeat(2000)}" | grep x `.repeat(40);
+    const dense = "curl ".repeat(16_000);
+
+    expect(ms(re, quoted)).toBeLessThan(Math.max(50, 4 * ms(re, dense)));
   });
 });
