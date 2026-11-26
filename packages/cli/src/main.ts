@@ -110,13 +110,15 @@ function env(): Record<string, string | undefined> {
 function config(cwd: string): Config {
   const cfg = loadConfig(cwd, env());
 
-  // a registry URL can carry a credential: warnings name it by origin only
-  const shown = (url: string): string => displayRegistry(url) ?? "a registry apm does not print";
-
-  if (cfg.withheld?.kind === "other-registry") warn(yellow(`apm: APM_TOKEN is for ${shown(cfg.withheld.registry)}, so it is not sent to ${shown(cfg.registry)} (set by a project .npmrc or npm_config_registry)`));
-  else if (cfg.withheld?.kind === "ambiguous") warn(yellow(`apm: APM_TOKEN is not sent: ${cfg.userconfig} names its registry ${shown(cfg.withheld.exact)} to npm 9.2 and ${shown(cfg.withheld.spaced)} to npm 11 (a "[section] " header with a trailing space); set APM_REGISTRY to the one the token is for`));
+  if (cfg.withheld?.kind === "other-registry") warn(yellow(`apm: APM_TOKEN is for ${shownRegistry(cfg.withheld.registry)}, so it is not sent to ${shownRegistry(cfg.registry)} (set by a project .npmrc or npm_config_registry)`));
+  else if (cfg.withheld?.kind === "ambiguous") warn(yellow(`apm: APM_TOKEN is not sent: ${cfg.userconfig} names its registry ${shownRegistry(cfg.withheld.exact)} to npm 9.2 and ${shownRegistry(cfg.withheld.spaced)} to npm 11 (a "[section] " header with a trailing space); set APM_REGISTRY to the one the token is for`));
 
   return cfg;
+}
+
+/** A registry URL can carry a credential in its path or query: messages name it by origin only. */
+function shownRegistry(url: string): string {
+  return displayRegistry(url) ?? "a registry apm does not print";
 }
 
 /**
@@ -2462,7 +2464,7 @@ function storeToken(cfg: Config, token: string): boolean {
   const saved = saveToken(cfg.userconfig, cfg.registry, token);
 
   if (saved.kind === "refused") {
-    fail(`login failed: line ${saved.line} of ${saved.path} sets a key with \${...} in its name, which npm expands, so apm cannot tell whether it holds an old token for ${cfg.registry}; nothing was saved. Edit that line (write the key out in full) and run apm login again`);
+    fail(`login failed: line ${saved.line} of ${saved.path} sets a key with \${...} in its name, which npm expands, so apm cannot tell whether it holds an old token for ${shownRegistry(cfg.registry)}; nothing was saved. Edit that line (write the key out in full) and run apm login again`);
 
     return false;
   }

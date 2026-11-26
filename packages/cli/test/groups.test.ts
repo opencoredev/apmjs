@@ -285,6 +285,32 @@ describe("finding 1 of a24c6aa: section headers read with the grammar of npm's o
     expect(err).toContain("http://127.0.0.1:9/");
     expect(out + err).not.toContain("SECRET_");
   });
+
+  test("the login refusal for a ${VAR} key names the registry by origin only", async () => {
+    const stub = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => Response.json({ token: "apm_newnewnewnewnewnew01" }, { status: 201 }) });
+
+    try {
+      const src = `registry=${stub.url.href}SECRET_PATH_TOKEN/?key=SECRET_QUERY_KEY\n\${HOST}:_authToken=apm_oldoldoldoldoldold01\n`;
+      const p = project({ user: src });
+
+      const proc = Bun.spawn([process.execPath, join(import.meta.dir, "..", "src", "main.ts"), "login", "--username", "me", "--password-stdin"], {
+        cwd: p.root,
+        env: { HOME: p.env.HOME, NO_COLOR: "1", PATH: "/usr/bin:/bin" },
+        stdin: new TextEncoder().encode("a-long-enough-password\n"),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+
+      expect(code, out + err).toBe(1);
+      expect(err).toContain("sets a key with");
+      expect(out + err).not.toContain("SECRET_");
+      expect(readFileSync(join(p.env.HOME, ".npmrc"), "utf8")).toBe(src);
+    } finally {
+      stub.stop(true);
+    }
+  });
 });
 
 describe("pnpm and bun", () => {
