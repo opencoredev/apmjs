@@ -43,7 +43,7 @@ apm installs it anyway: a score or a fresh publish informs, it does not block. T
 
 When the project `.npmrc` apm takes its registry from, or the `bunfig.toml` (bun, where it runs or at the root) or `.yarnrc.yml` (yarn 2 and later) that points the package manager at it, is a file git ignores, `apm add` says so in one line (`apm: git ignores .npmrc, which points installs at apm's registry, so clones and CI will not install through apm until it is committed`). It asks git only inside a git work tree, and says nothing when git is missing, fails or is slow.
 
-A version nobody has scored yet, the package or one of its dependencies, is queued for analysis. The registry waits up to about 20 s for the score, and the warning then says what it found; a cold package usually has its score after a few seconds. What is still pending then installs with a `not scored yet` warning.
+A version nobody has scored yet, the package or one of its dependencies, is queued for analysis. The registry waits up to about 20 s for the score, and the warning then says what it found. A cold package can get its score in seconds, but when the analysis queue is busy it can take minutes. What is still pending then installs with a `not scored yet` warning.
 
 With `--strict` (or `APM_STRICT=1`), each of those refuses instead, as apm did before: a version inside the cooldown (for the package itself, the newest older version is used instead), a score under the floor, an incomplete analysis, a version apm cannot score (`apm cannot score this version: …`), a dependency the registry could not look up, a version still pending after `apm add` has kept asking for 90 s (`still being analysed, try again in a minute`), and a version `apm explain` calls review-first (`strict mode refuses what apm explain calls review-first`, exit 1, before anything in your project changes). Revoked and yanked versions and versions an apm reviewer confirmed malicious are refused in every mode.
 
@@ -150,11 +150,13 @@ Says whether a name is free, taken, or free but refused (with the reason), plus 
 apm audit [--json]
 ```
 
-Checks every installed version with the same check `apm add` runs after an install, plus the upstream advisories, whatever platform each is built for: nothing installed is skipped. A revoked, yanked or confirmed malicious version is a `critical` finding, a fresh, low-scoring or unscorable one a `warning`. Exits `1` on any finding and also when anything could not be checked.
+Checks every installed version with the same check `apm add` runs after an install, plus the upstream advisories, whatever platform each is built for: every package in `node_modules` is checked. It reads only `node_modules`, so a yarn Plug'n'Play install, which has none, is reported as `"checked": 0`. A revoked, yanked or confirmed malicious version is a `critical` finding, a fresh, low-scoring or unscorable one a `warning`. Exits `1` on any finding and also when anything could not be checked.
 
 ```json
 { "ok": false, "checked": 412, "findings": [{ "id": "some-package@1.0.3", "severity": "critical", "text": "..." }], "unchecked": [] }
 ```
+
+Without a login token, each request to the registry queues at most 8 versions that have no score yet. apm sends 200 installed versions per request, and lists the other unscored ones under `unchecked` as `not checked: anonymous scan queues at most 8 unscored packages per request`. With a token (`apm login`, or `APM_TOKEN`) there is no such cap. A version still being analysed after `APM_PENDING_WAIT_MS` is listed as `not scored yet`. Either way the audit exits `1`. See [Audit in CI](/guides/ci#audit-in-ci).
 
 ## apm publish
 
@@ -247,7 +249,7 @@ Prints the user the current token belongs to, and the registry.
 | `npm_config_registry` | Used when `APM_REGISTRY` is not set. |
 | `npm_config_userconfig` | Path of the user `.npmrc`. Default `~/.npmrc`. |
 | `NO_COLOR` | Turn off colors. |
-| `APM_PENDING_WAIT_MS` | How long `apm add --strict` and `apm x --strict` keep asking about versions still being analysed. Default `90000`. |
+| `APM_PENDING_WAIT_MS` | How long `apm add --strict`, `apm x --strict` and `apm audit` keep asking about versions still being analysed. Default `90000`. |
 | `APM_STRICT` | `1` makes `apm add`, `apm x` and `apm explain` strict, as `--strict` does. |
 
 Without `APM_REGISTRY` or `npm_config_registry`, apm reads `registry=` from the nearest project `.npmrc`, then your user `.npmrc`, then uses `https://registry.apmjs.dev/`. The token is the `_authToken` line for that exact registry host; a `${VAR}` value is read from the environment.

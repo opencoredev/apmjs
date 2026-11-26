@@ -68,7 +68,7 @@ It never takes a registry from package data, so a tarball URL in a lockfile cann
 
 ## Versions still being analysed
 
-A version nobody has scored yet is queued for analysis. The scanner treats it as pending, never as clean: it asks again every few seconds for up to 60 s, printing which packages it is waiting for. A cold package usually gets its score in a few seconds, and the install then goes ahead, with a warning if the score is under 40. Anything still pending after 60 s is a warning ("not scored yet"), and with `APM_SCANNER_STRICT=1` it cancels the install:
+A version nobody has scored yet is queued for analysis. The scanner treats it as pending, never as clean: it asks again every few seconds for up to 60 s, printing which packages it is waiting for. A cold package can get its score in seconds, but when the analysis queue is busy it can take minutes. Once it has a score, the install goes ahead, with a warning if the score is under 40. Anything still pending after 60 s is a warning ("not scored yet"), and with `APM_SCANNER_STRICT=1` it cancels the install:
 
 ```text
 apm scanner: waiting for 1 package(s) the registry is still analysing (0s of 60s): left-pad@1.3.0

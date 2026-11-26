@@ -1,11 +1,15 @@
 ---
 title: Quick start
 description: Point bun, npm or pnpm at apm, then add a package with the apm CLI.
+search:
+  keywords: [windows, wsl, powershell, which apm, microsoft apm, agent package manager, atom apm, homebrew]
 ---
 
 By the end of this page your package manager installs through apm, and `apm add` checks a package before it installs it.
 
 The registry is `https://registry.apmjs.dev/`. It serves every npm package, and adds a score, yank and revoke on top.
+
+Moving a project that already installs from npm? [Move an existing project to apm](/guides/migrate) covers lockfiles, CI, teammates and how to switch back.
 
 ## 1. Point your package manager at apm
 
@@ -47,6 +51,14 @@ For a strict mode with stock npm or pnpm, use `registry=https://registry.apmjs.d
 :::
 
 ## 2. Get the apm CLI
+
+:::note[Windows]
+The apm CLI runs on macOS and Linux. On Windows, run it in WSL (Windows Subsystem for Linux): open a WSL shell and use the install script below there. There is no native Windows CLI yet; in Git Bash or MSYS the script stops with "Windows is not supported yet". [Step 1](#1-point-your-package-manager-at-apm) needs no CLI, so npm, pnpm and bun on Windows still install through apm.
+:::
+
+:::note[Which apm is this?]
+This apm installs only from `https://apmjs.dev/install` or `brew install opencoredev/tap/apm`. Other tools share the name: the npm packages `apm` and `apmjs` (an AMD package manager) are unrelated, plain `brew install apm` installs Microsoft's Agent Package Manager from homebrew/core, and the Atom editor's package manager was also called `apm`.
+:::
 
 Install it with one command. The install script downloads one prebuilt binary for macOS or Linux (x64 or arm64, and musl systems such as Alpine on x64). Running it needs no git, Bun or Node.
 
@@ -121,7 +133,7 @@ shasum -a 256 ~/.apm/bin/apm     # sha256sum on Linux
 
 The script, the checksums and the binaries all come from apmjs.dev. The check proves the binary is the one released with the script you read; it does not prove who released it.
 
-`--version X` or `APM_VERSION=X` installs another released version: `curl -fsSL https://apmjs.dev/install | sh -s -- --version 0.1.8`. `APM_INSTALL=<dir>` installs to `<dir>/bin/apm`. Windows is not supported yet. On Alpine, apm needs `libstdc++` and `libgcc` (`apk add libstdc++ libgcc`).
+`--version X` or `APM_VERSION=X` installs another released version: `curl -fsSL https://apmjs.dev/install | sh -s -- --version 0.1.8`. `APM_INSTALL=<dir>` installs to `<dir>/bin/apm`. On Alpine, apm needs `libstdc++` and `libgcc` (`apk add libstdc++ libgcc`).
 
 apm uses the package manager your project already uses: it reads the lockfile, then the `packageManager` field in `package.json`, then a `bunfig.toml` (bun). A project with none of them, such as a fresh `npm init -y`, gets npm. Pass `--pm bun` (or `--pm pnpm`) to choose another.
 
@@ -145,6 +157,8 @@ apm asks the registry for the newest version in the range or tag you ask for (`l
         v4/core/compile.js:184: const factory = new F(...constantNames, factoryCode);
 ```
 
+`apm add` asks your package manager for the exact version it checked, so with their default settings bun and pnpm write `"zod": "4.6.7"` to `package.json`, where `bun add zod` and `pnpm add zod` write a range (`"^4.6.7"`). npm writes a range either way.
+
 A score informs; it does not block. If the package or one it brings in scores under 40, was not fully analysed, has no score, or could not be looked up, apm prints a warning with the score, the top reasons (file and line) and a link, then installs. Run `apm add --strict` (or set `APM_STRICT=1`) to refuse those instead.
 
 If a package is refused, apm says why and whether `--force` would help. A package or dependency published in the last 24 hours installs with a warning. `--strict` refuses it instead; for the package you name, it skips fresh versions and may pick an older one that passes. `apm explain` looks for an older version in range past the cooldown and says whether to install it. `--force` lifts the cooldown for the named package only, and in strict mode its score floor. Revoked and yanked versions, and versions apm reviewers confirmed malicious, stay blocked.
@@ -154,5 +168,6 @@ If a package is refused, apm says why and whether `--force` would help. A packag
 ## Next steps
 
 - See every signal and its evidence: `apm score <package>`, or the version page on `https://apmjs.dev`.
+- Move a whole project to apm, or back: [Move an existing project to apm](/guides/migrate).
 - Publish a package: [Publish a package](/guides/publishing).
 - Make CI fail on anything it could not check: [Bun scanner in CI](/guides/bun-scanner#strict-mode-for-ci).
