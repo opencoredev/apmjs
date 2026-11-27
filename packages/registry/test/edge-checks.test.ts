@@ -782,8 +782,20 @@ describe("downloads answered from a view", () => {
     expect(asked).toHaveLength(QUEUED_MAX);
     release.open();
     await settle();
-    // every waiting one was asked about, first come first, never more than QUEUED_MAX at once; the last three skipped
-    expect(asked).toEqual(Array.from({ length: QUEUED_MAX + WAITING_MAX }, (_, i) => `1.0.${i}`));
+    // every waiting one was asked about, never more than QUEUED_MAX at once; the last three skipped
+    const accepted = Array.from({ length: QUEUED_MAX + WAITING_MAX }, (_, i) => `1.0.${i}`);
+
+    expect(asked.toSorted()).toEqual(accepted.toSorted());
+    // first come first, as far as a turn promises: each waiting download polls on its own timer, and a free ask goes to
+    // whichever of the first (free asks) in line looks first, so the order within that window is the timers'. An exact
+    // order failed about 1 run in 17 (PR #22's CI, run 45548436985). No ask ever passed QUEUED_MAX waiting before it.
+    expect(asked.slice(0, QUEUED_MAX)).toEqual(accepted.slice(0, QUEUED_MAX));
+    asked.forEach((version, k) => {
+      const seen = new Set(asked.slice(0, k));
+      const passed = accepted.slice(0, accepted.indexOf(version)).filter((v) => !seen.has(v));
+
+      expect(passed.length).toBeLessThan(QUEUED_MAX);
+    });
     expect(most).toBe(QUEUED_MAX);
     release = gate();
     release.open();
