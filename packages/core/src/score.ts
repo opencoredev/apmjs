@@ -1099,6 +1099,20 @@ function depNames(manifest: AnalyzeInput["manifest"], fields: readonly string[])
 }
 
 /**
+ * The text rules' findings in a hook command, less the shell and network ones only its curl and wget mentions gave when
+ * none of those fetches (withoutInertNetTools): every other finding is the command's as written, cited as before.
+ */
+function withoutInertNetFindings(cmd: string): ReturnType<typeof scanText> {
+  const found = scanText(cmd, "plain");
+  const masked = withoutInertNetTools(cmd);
+
+  if (masked === cmd) return found;
+  const left = new Set(scanText(masked, "plain").map((f) => f.id));
+
+  return found.filter((f) => (f.id !== "shell-exec" && f.id !== "network") || left.has(f.id));
+}
+
+/**
  * Signals from the lifecycle scripts: what runs at install, at a git install, and on the publisher's machine. Returns
  * the evidence it cited from commands that run at install, so the risk signals can tell install-time use apart.
  */
@@ -1122,7 +1136,7 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
         risky = true;
       }
 
-      for (const f of scanText(withoutInertNetTools(c.text), "plain")) {
+      for (const f of withoutInertNetFindings(c.text)) {
         const ev = `${label}${f.how === "as written" ? "" : ` (${f.how})`}`;
         found.add(f.id, ev, f.confidence);
 

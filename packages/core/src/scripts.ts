@@ -683,8 +683,8 @@ export type DownloadContext = {
   localBins?: ReadonlySet<string>;
 };
 
-// curl and wget, as cmd.exe and a path find them
-const NET_TOOL_WORD = /^(?:[^\s'"]*[/\\])?(?:curl|wget)(?:\.exe)?$/i;
+// curl and wget found on the PATH, as sh and cmd.exe find them: a path may name any program, the package's own included
+const NET_TOOL_WORD = /^(?:curl|wget)(?:\.exe)?$/i;
 const NET_TOOL_MENTION = /\b(?:curl|wget)\b/i;
 const NET_TOOL_MENTIONS = /\b(?:curl|wget)\b/gi;
 
@@ -710,8 +710,13 @@ export function netToolsInert(cmd: string): boolean {
   // the next word is a redirection's file, which the command is not handed
   let target = false;
 
+  // a redirection's file that names curl or wget is neither a call nor printed text
+  let targetMention = false;
+
   const flush = (): void => {
     if (word !== null && !target) seg.words.push(word);
+
+    if (word !== null && target) targetMention ||= NET_TOOL_MENTION.test(word);
 
     if (word !== null) target = false;
     word = null;
@@ -758,6 +763,8 @@ export function netToolsInert(cmd: string): boolean {
   if (quote !== null) return false;
   end(false);
 
+  if (targetMention) return false;
+
   return segments.every(({ words, piped, redirected }) => {
     if (!words.some((w) => NET_TOOL_MENTION.test(w))) return true;
     const [head = "", ...args] = words;
@@ -768,10 +775,7 @@ export function netToolsInert(cmd: string): boolean {
   });
 }
 
-/**
- * `cmd` with every curl and wget mention blanked when netToolsInert holds, so the text rules read no network or shell
- * in them; else `cmd` as it is.
- */
+/** `cmd` with every curl and wget mention blanked when netToolsInert holds, else `cmd` as it is. */
 export function withoutInertNetTools(cmd: string): string {
   return netToolsInert(cmd) ? cmd.replace(NET_TOOL_MENTIONS, (m) => "_".repeat(m.length)) : cmd;
 }

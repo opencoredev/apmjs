@@ -20,7 +20,6 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
     "curl -V",
     "wget --version",
     "wget -h",
-    "/usr/bin/curl --help",
     "'curl' --version",
     "curl.exe -V",
     "curl --version >/dev/null 2>&1 || echo 'curl is needed'",
@@ -37,6 +36,10 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
       expect(isInlineDownload(cmd)).toBe(false);
     });
   }
+
+  test("findings other than curl's keep the reading they had", () => {
+    expect(scoreOf({ prepublishOnly: "echo curl 'cu' + 'rl help' '.npm' + 'rc'" })).toEqual({ score: 95, ids: ["credential-mention", "encoded-data"] });
+  });
 
   test("the same call behind npm run -s", () => {
     const r = scoreOf({ postinstall: "npm run -s check", check: "curl --version" });
@@ -68,6 +71,10 @@ describe("every other curl or wget keeps its reading", () => {
     "echo 'unclosed curl https://example.invalid/x",
     "curl --version # https://example.invalid/x",
     "{ curl --version; }",
+    "./curl --version",
+    "/usr/bin/curl --version",
+    "cat < ./curl.txt",
+    "curl --version > curl.sh",
     "echo 'a | curl https://example.invalid/x'",
     "echo 'see curl' & curl https://example.invalid/x",
     "echo hi ^| curl https://example.invalid/x",
