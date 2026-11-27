@@ -246,8 +246,13 @@ function tarballOf(name: string): Uint8Array {
 }
 
 function fakeNpm() {
-  // the first read of a `slow-` package is held SLOW_LEAD_MS before npm answers; later reads answer at once
+  // the first read of a `slow-` package is held SLOW_LEAD_MS before npm answers, or until a test's gate opens
+  // (holdLead); later reads answer at once, or when a test's gate for the package opens (holdLater)
   const held = new Set<string>();
+  const leadGates = new Map<string, Promise<void>>();
+  // called when the first read of a held package reaches npm (holdLead's `reached`)
+  const leadArrived = new Map<string, () => void>();
+  const gates = new Map<string, Promise<void>>();
   // packument reads per package name
   const reads = new Map<string, number>();
 
@@ -269,7 +274,10 @@ function fakeNpm() {
 
       if (name.startsWith("slow-") && !held.has(name)) {
         held.add(name);
-        await Bun.sleep(SLOW_LEAD_MS);
+        leadArrived.get(name)?.();
+        await (leadGates.get(name) ?? Bun.sleep(SLOW_LEAD_MS));
+      } else {
+        await gates.get(name);
       }
 
       const bytes = tarballOf(name);
@@ -287,7 +295,36 @@ function fakeNpm() {
     },
   });
 
-  return { url: server.url.href, reads, stop: () => server.stop(true) };
+  /** A gate in `on` for `name`, and the function that opens it. */
+  const gate = (on: Map<string, Promise<void>>, name: string): (() => void) => {
+    let open = (): void => undefined;
+
+    on.set(
+      name,
+      new Promise<void>((resolve) => {
+        open = resolve;
+      }),
+    );
+
+    return () => open();
+  };
+
+  return {
+    url: server.url.href,
+    reads,
+    /**
+     * Holds the first read of `name` (a `slow-` package) until `open` is called, not SLOW_LEAD_MS; `reached` settles
+     * once that read is at npm, so a test starts its waiters behind a leader that holds the single flight.
+     */
+    holdLead: (name: string) => {
+      const reached = new Promise<void>((resolve) => leadArrived.set(name, resolve));
+
+      return { open: gate(leadGates, name), reached };
+    },
+    /** Holds every later read of `name` until the returned function opens it. */
+    holdLater: (name: string) => gate(gates, name),
+    stop: () => server.stop(true),
+  };
 }
 
 const SLOW_LEAD_MS = 6_000;
@@ -436,22 +473,82 @@ describe("a wait for another request's read of the same packument (single flight
     expect((await lead).value?.kind).toBe("found");
   }, 30_000);
 
+  test("ends at its bound on the wall clock when the isolate is busy, not after its polls' slip adds up", async () => {
+    useCache({ match: async () => undefined, put: async (_k, res) => void (await res.arrayBuffer()) });
+    const layers = Layer.provide(Upstream.layer(npm.url, 60_000, () => undefined), Layer.mergeAll(Store.postgres(db.url), noBlobs));
+
+    const read = (pool: MemoryPool) =>
+      Effect.runPromise(
+        Effect.flatMap(Upstream, (up) => up.installCopy({ name: "slow-busy", served: "http://registry.test/", lease: pool.request(), read: Effect.succeed("stamp"), stampOf: (stamp) => stamp })).pipe(
+          Effect.map(({ copy }) => (copy?.kind === "read" ? copy.listing : null)),
+          Effect.provide(layers),
+          Effect.scoped,
+        ),
+      );
+
+    const { open: openLead, reached } = npm.holdLead("slow-busy");
+    const lead = timedRun(() => read(new MemoryPool()));
+
+    // the leader's read is at npm, so it holds the single flight before the waiter starts
+    await reached;
+
+    // the isolate is busy 40 ms in every 50: each 25 ms poll takes about twice that or more, so 120 polls counted as
+    // 3 s were 7 s and more of waiting (counted in polls, as on main, this test's waiter took 9.7 s)
+    const busy = setInterval(() => {
+      const until = performance.now() + 40;
+
+      while (performance.now() < until) {
+        // keep the event loop busy
+      }
+    }, 10);
+
+    try {
+      const waiter = await timedRun(() => read(new MemoryPool()));
+
+      expect(waiter.value?.kind).toBe("found");
+      expect(waiter.ms).toBeGreaterThan(2_900);
+      expect(waiter.ms).toBeLessThan(4_500);
+    } finally {
+      clearInterval(busy);
+      openLead();
+    }
+
+    expect((await lead).value?.kind).toBe("found");
+  }, 30_000);
+
   test("waiters behind a stuck leader make one more npm read between them; the rest are told to retry (503, Retry-After)", async () => {
     useCache({ match: async () => undefined, put: async (_k, res) => void (await res.arrayBuffer()) });
+    // npm's reads are held on gates the test opens, not on timers. The extra read answered at once used to reach the
+    // isolate's cache while a waiter whose own wait had not run out was still looking, and that waiter was served from
+    // it (a 200, which is right), so the three answers depended on how far the waiters' timers drifted under load. It
+    // is held until the other two have answered, and so is the leader's, so those two answered without either read.
+    const { open: openLead, reached } = npm.holdLead("slow-many");
+    const openExtra = npm.holdLater("slow-many");
     const lead = get("/slow-many", INSTALL_ACCEPT);
 
-    await Bun.sleep(200);
+    await reached;
     // three requests that come while the leader's read is held: each waits SINGLE_FLIGHT_WAIT_MS, then one reads npm
-    const waiters = await Promise.all([get("/slow-many", INSTALL_ACCEPT), get("/slow-many", INSTALL_ACCEPT), get("/slow-many", INSTALL_ACCEPT)]);
+    let answered = 0;
+
+    const waiter = () =>
+      get("/slow-many", INSTALL_ACCEPT).then((w) => {
+        // two answered while the leader's read was still held, so neither waited on it; the third makes its own read
+        // (two reads in all). Both reads go on now, well inside npm's 10 s deadline for the leader's.
+        if (++answered === 2) {
+          openExtra();
+          openLead();
+        }
+
+        return w;
+      });
+
+    const waiters = await Promise.all([waiter(), waiter(), waiter()]);
 
     // on 11cbf13 every waiter read npm itself: four requests, four reads
     expect(npm.reads.get("slow-many")).toBe(2);
     expect(waiters.map((w) => w.status).sort()).toEqual([200, 503, 503]);
 
-    for (const w of waiters) {
-      if (w.status === 503) expect(Number(w.retryAfter)).toBeGreaterThan(0);
-      expect(w.ms).toBeLessThan(SLOW_LEAD_MS - 1_000);
-    }
+    for (const w of waiters) if (w.status === 503) expect(Number(w.retryAfter)).toBeGreaterThan(0);
 
     expect((await lead).status).toBe(200);
     expect(npm.reads.get("slow-many")).toBe(2);

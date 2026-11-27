@@ -1376,6 +1376,9 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           Effect.gen(function* () {
             const probes = probeCacheFor(lease.pool, baseUrl, ttlMs);
             const flight = `${baseUrl} ${name}`;
+            // the wait is measured on the wall clock (the registry's clock is one tests move): counted in polls, each
+            // poll's slip under load added up, and a 3 s wait took 6 to 10 s on a busy machine
+            const waitStart = Date.now();
             let waited = 0;
 
             for (;;) {
@@ -1402,7 +1405,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               if (out !== null) {
                 if (waited < SINGLE_FLIGHT_WAIT_MS) {
                   yield* Effect.sleep(Duration.millis(SINGLE_FLIGHT_POLL_MS));
-                  waited += SINGLE_FLIGHT_POLL_MS;
+                  waited = Date.now() - waitStart;
                   continue;
                 }
 
