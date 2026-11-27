@@ -28,6 +28,10 @@ const MAX_REACH_WORK = MAX_ANALYSIS_WORK / 8;
 /** Where the review ranks what it shows that main's rules pass over (ordered): after everything they show. */
 const REACHED_TIER = 7;
 
+// a heredoc, or a builtin that moves the shell or reads another file's commands: a hook's words then may not be the shell's
+// expansions in the package's folder
+const SHELL_MOVES = /<<|(?:^|[\s;&|'"(])(?:cd|pushd|popd|source|\.)(?=[\s;&|'")]|$)/;
+
 /** Files larger than this are not decoded at all; they are listed as not read. */
 export const MAX_DECODED_BYTES = 16 * 1024 * 1024;
 
@@ -246,24 +250,30 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
 
   // what `?` and bracket globs (`node ./pay?oad.txt`) expand to, in words with no quoting or expansion so each is the
   // shell's: read after all of the above, with slots, a meter and a tier of their own, so they only take what it leaves.
-  // Nothing when a hook may turn pathname expansion off (`set -f`), and no pattern with a POSIX class (`[[:digit:]]`)
+  // Nothing when a hook may turn pathname expansion off (`set -f`), move the shell (`cd sub`) or hold a heredoc, and no
+  // absolute pattern, one outside ASCII or one with a POSIX class (`[[:digit:]]`)
   const later = new Set<string>();
+  const meter = new Meter(MAX_REACH_WORK);
 
   try {
-    metered(new Meter(MAX_REACH_WORK), () => {
+    metered(meter, () => {
       const patterns = new Map<string, { depth: number; prefix: string }>();
 
       for (const h of measureManifest(scripts, { charged: false }).kind === "ok" ? expandHooks(scripts) : []) {
         if (h.kind !== "install") continue;
 
         for (const c of h.commands) {
+          meter.charge("text", Math.ceil(c.text.length / 16) + 1);
+
+          if (SHELL_MOVES.test(c.text)) return;
+
           for (const t of shellWords(c.text)) {
             if (t === null || t === "(" || t === ")" || t === "cut") continue;
 
             if (t.word === "set") return;
             const w = stripDot(t.word);
 
-            if (t.pattern && !t.quoted && !t.expanded && !/\[[:=.]/.test(w) && patterns.size < MAX_GLOBS && w.length <= MAX_GLOB_CHARS) {
+            if (t.pattern && !t.quoted && !t.expanded && !t.word.startsWith("/") && /^[\x20-\x7e]*$/.test(w) && !/\[[:=.]/.test(w) && patterns.size < MAX_GLOBS && w.length <= MAX_GLOB_CHARS) {
               patterns.set(w, { depth: w.split("/").length, prefix: w.slice(0, w.search(/[*?[]/)) });
             }
           }
@@ -271,6 +281,7 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
       }
 
       for (const f of patterns.size > 0 ? files : []) {
+        meter.charge("text", Math.ceil((f.path.length * (patterns.size + 1)) / 32) + 1);
         const depth = f.path.split("/").length;
 
         for (const [pattern, g] of patterns) {

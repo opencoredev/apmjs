@@ -485,41 +485,71 @@ type ShellWord = Exclude<ShellToken, null | "(" | ")" | "cut">;
 // a shell the hook runs a script file with
 const SHELL_PROGRAM = /^(?:sh|bash|dash|zsh)$/;
 
+// what a command may hold for shellOperands to read it: printable ASCII with no expansion, substitution, redirection,
+// grouping, escape, comment or pattern, so every word is the one the shell hands over and every command runs where written
+const PLAIN_COMMAND = /^[A-Za-z0-9 _.,:;&|+@%/'"=-]*$/;
+
+// a builtin that moves the shell, runs text it builds, or names another program: any of them anywhere, quoted or not
+const MOVES = /(?:^|[\s;&|'"])(?:cd|pushd|popd|source|\.|exec|eval|command|builtin|alias|function|hash)(?=[\s;&|'"]|$)/;
+
 /**
- * The script files `cmd` hands a shell as its operand (`sh ./setup.sh`, `FOO=1 bash setup.sh`), read over the words the
- * shell hands each simple command: the shell's name and its operand both as written, with no option between them, and
- * nothing when the reading is cut. A word in quotes or a printed example (`printf 'sh ./x.sh'`) is an argument, not this.
+ * The script files `cmd` hands a shell as its operand (`sh ./setup.sh`, `bash 'setup script.sh'`): a simple command whose
+ * first word is the shell's name and whose second is not an option, read only when the command is plain (PLAIN_COMMAND)
+ * and holds no builtin that changes where or what runs (MOVES). A command that starts with an assignment is not read, as
+ * the assignment may change which shell runs. Only the first two words of each command are kept.
  */
 export function shellOperands(cmd: string): string[] {
-  chargeText("text", cmd.length, 2);
+  chargeText("text", cmd.length, 3);
+
+  if (!PLAIN_COMMAND.test(cmd) || MOVES.test(cmd)) return [];
   const out: string[] = [];
-  let words: ShellWord[] = [];
-
-  const take = (): void => {
-    let i = 0;
-
-    while (/^[A-Za-z_]\w*=/.test(words[i]?.word ?? "") && words[i]?.quoted === false) i++;
-    const program = words[i];
-    const operand = words[i + 1];
-
-    if (program === undefined || operand === undefined) return;
-
-    if ([program, operand].some((w) => w.expanded || w.glob || w.pattern) || !SHELL_PROGRAM.test(program.word) || operand.word.startsWith("-")) return;
-    out.push(operand.word);
-  };
+  let at = 0;
+  let shell = false;
 
   for (const t of shellWords(cmd)) {
-    if (t === "cut") return [];
+    if (t === "cut" || t === "(" || t === ")") return [];
 
-    if (t === null || t === "(" || t === ")") {
-      take();
-      words = [];
-    } else words.push(t);
+    if (t === null) {
+      at = 0;
+      shell = false;
+      continue;
+    }
+
+    if (at === 0) shell = SHELL_PROGRAM.test(t.word);
+    else if (at === 1 && shell && !t.word.startsWith("-")) out.push(t.word);
+    at++;
   }
 
-  take();
-
   return out;
+}
+
+// a downloader that fetches from a URL
+const DOWNLOADER = /^(?:curl|wget)$/;
+
+/**
+ * Whether a shell script runs curl or wget on a URL as a command of its own (`curl -s https://x | sh`), read over the words
+ * the shell hands each simple command: a word that only prints, names or quotes a downloader is not this.
+ */
+export function fetchesInCommandPosition(text: string): boolean {
+  chargeText("text", text.length, 3);
+  let at = 0;
+  let downloader = false;
+
+  for (const t of shellWords(text)) {
+    if (t === "cut") return false;
+
+    if (t === null || t === "(" || t === ")") {
+      at = 0;
+      downloader = false;
+      continue;
+    }
+
+    if (at === 0) downloader = DOWNLOADER.test(t.word) && !t.expanded;
+    else if (downloader && /^https?:\/\//.test(t.word)) return true;
+    at++;
+  }
+
+  return false;
 }
 
 // the most words one of those shapes has: npm, its options and their values, run, `--` and the name

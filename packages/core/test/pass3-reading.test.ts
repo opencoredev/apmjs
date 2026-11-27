@@ -20,6 +20,14 @@ describe("what only the shell reading runs gets its install-time checks", () => 
     const setup = file("setup.sh", `#!/bin/sh\n${DROPPER}\n`);
 
     expect(scoreOf({ main: "index.js", scripts: { postinstall: "npm run '-s' setup", setup: "sh ./setup.sh" } }, [file("index.js", "1;\n"), setup])).toContain("install-download");
+
+    const spaced = file("setup script.sh", `#!/bin/sh\n${DROPPER}\n`);
+
+    expect(scoreOf({ main: "index.js", scripts: { postinstall: "npm run '-s' setup", setup: "sh './setup script.sh'" } }, [file("index.js", "1;\n"), spaced])).toContain("install-download");
+  });
+
+  test("a shell script that only prints a downloader's name is not a download", () => {
+    expect(scoreOf({ main: "index.js", scripts: { postinstall: "npm run '-s' setup", setup: "sh ./setup.sh" } }, [file("index.js", "1;\n"), file("setup.sh", "#!/bin/sh\nprintf '%s\\n' iwr curl\n")])).not.toContain("install-download");
   });
 
   test("a file it only names or prints, or one the walk did not hold, gets no check", () => {
@@ -31,14 +39,28 @@ describe("what only the shell reading runs gets its install-time checks", () => 
       return analyze({ name: "probe-pkg", manifest, files: [file("package.json", JSON.stringify(manifest)), file("index.js", "1;\n"), setup], publisher: "a", previousPublishers: [], maxScannedBytes });
     };
 
-    const runs = [ofDemo("printf '%s\\n' ./setup.sh"), ofDemo("printf '%s\\n' 'example: sh ./setup.sh'"), ofDemo("sh ./setup.sh", 0)];
+    const runs = [
+      ofDemo("printf '%s\\n' ./setup.sh"),
+      ofDemo("printf '%s\\n' 'example: sh ./setup.sh'"),
+      ofDemo("sh ./setup.sh", 0),
+      ofDemo("cat <<'DOC'\nsh ./setup.sh\nDOC"),
+      ofDemo("printf '%s\\n' >\"$(printf log)\" sh ./setup.sh"),
+      ofDemo("sh\u00a0./setup.sh || :"),
+      ofDemo("example() { :; sh ./setup.sh; }; printf DONE"),
+      ofDemo("PATH=./bin sh ./setup.sh"),
+      ofDemo("cd sub; sh ./setup.sh"),
+      ofDemo("sh ./setup || :"),
+      ofDemo("sh ../setup.sh"),
+    ];
 
     for (const a of runs) expect(findingsOf(a).flatMap((s) => s.evidence).some((e) => e.startsWith("setup.sh: run by an install script"))).toBe(false);
   });
 
   test("only a shell's operand counts, as the shell hands it over", () => {
-    expect(shellOperands("FOO=1 sh ./a.sh; bash b.sh && 'sh' c.sh")).toEqual(["./a.sh", "b.sh", "c.sh"]);
-    expect(shellOperands("printf '%s\\n' 'sh ./a.sh'; sh -c ./b.sh; sh \"$X\"; 'A=1' sh ./c.sh; echo sh ./d.sh")).toEqual([]);
+    expect(shellOperands("sh ./a.sh; bash b.sh && 'sh' c.sh")).toEqual(["./a.sh", "b.sh", "c.sh"]);
+    expect(shellOperands("printf '%s\\n' 'sh ./a.sh'; sh -c ./b.sh; FOO=1 sh ./c.sh; echo sh ./d.sh")).toEqual([]);
+    expect(shellOperands("sh \"$X\"")).toEqual([]);
+    expect(shellOperands("'.' ./move.sh; sh ./a.sh")).toEqual([]);
   });
 });
 
