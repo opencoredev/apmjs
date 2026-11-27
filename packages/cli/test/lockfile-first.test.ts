@@ -825,7 +825,7 @@ describe.each(PMS)("apm x with the %s stand-in", (pm) => {
     expect(r.code, r.text).toBe(0);
     expect(r.out).toBe("checked helper b\n");
     // apm's own lines are all on stderr
-    expect(r.text.slice(r.out.length)).toContain("apm: checked the");
+    expect(r.text.slice(r.out.length)).toContain("✓ checked ");
   });
 });
 

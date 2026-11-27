@@ -154,12 +154,78 @@ EOF
 }
 
 die() {
-  printf 'apm install: %s\\n' "$1" >&2
+  if ! terminal 2; then
+    printf 'apm install: %s\\n' "$1" >&2
+    exit 1
+  fi
+  measure
+  e="error:"
+  if colors 2; then e="$(printf '\\033[1;31m')error:$(printf '\\033[0m')"; fi
+  printf '\\n' >&2
+  wrap "  $e " "         " "$1" >&2
   exit 1
+}
+
+# Is file descriptor $1 a person's terminal? CI (CI set, other than false or 0) gets the plain lines even on one.
+terminal() {
+  [ -t "$1" ] || return 1
+  case "\${CI:-}" in "" | false | 0) ;; *) return 1 ;; esac
+}
+
+# Can file descriptor $1 take color? Only a terminal, and not with NO_COLOR set (no-color.org) or TERM=dumb.
+colors() {
+  terminal "$1" && [ -z "\${NO_COLOR:-}" ] && [ "\${TERM:-}" != dumb ]
+}
+
+# The terminal's width, read from the terminal itself (under curl | sh, stdin is this script), else $COLUMNS, else 80.
+measure() {
+  [ -z "\${cols:-}" ] || return 0
+  cols=$(stty size 2>/dev/null </dev/tty | awk '{ print $2 }')
+  case "$cols" in "" | *[!0-9]* | 0) cols="\${COLUMNS:-80}" ;; esac
+  case "$cols" in "" | *[!0-9]*) cols=80 ;; esac
+  [ "$cols" -ge 20 ] || cols=20
+}
+
+# Prints $3 wrapped to the terminal's width: its first line after $1, the rest after $2, which is as wide as $1 looks.
+# A word longer than a line, such as a URL or a hash, gets a line of its own and is never broken.
+wrap() {
+  printf '%s\\n' "$3" | awk -v w="$((cols - \${#2}))" -v p="$1" -v rest="$2" '{
+    line = ""
+    for (i = 1; i <= NF; i++) {
+      if (line == "") line = $i
+      else if (length(line) + 1 + length($i) <= w) line = line " " $i
+      else { print p line; p = rest; line = $i }
+    }
+    print p line
+  }'
+}
+
+# A step that is done, shown only to a person at a terminal.
+step() {
+  [ -z "$tty" ] || wrap "  \${g}✓\${x} " "    " "$1"
+}
+
+# A value (a hash, a path) whole on a line of its own under a step: never wrapped, so it can be copied.
+value() {
+  [ -z "$tty" ] || printf '    %s\\n' "$1"
 }
 
 # Everything runs from main, called on the last line, so a download cut short runs nothing.
 main() {
+  # A person at a terminal gets a header, steps and next steps; pipes, CI and agents get the plain lines at the end.
+  tty="" cols="" b="" d="" g="" c="" x=""
+  if terminal 1; then
+    tty=1
+    measure
+    if colors 1; then
+      b=$(printf '\\033[1m') d=$(printf '\\033[2m') g=$(printf '\\033[32m') c=$(printf '\\033[36m') x=$(printf '\\033[0m')
+    fi
+    printf '\\n  %sapm installer%s' "$b" "$x"
+    # the site stays on the header's line when it fits
+    if [ $((17 + \${#site})) -le "$cols" ]; then printf '  '; else printf '\\n  '; fi
+    printf '%s%s%s\\n\\n' "$d" "$site" "$x"
+  fi
+
   while [ $# -gt 0 ]; do
     case "$1" in
       --version) [ $# -ge 2 ] || die "--version needs a value"; version="$2"; shift 2 ;;
@@ -190,6 +256,7 @@ main() {
     target="$target-musl"
     hint=" On musl it needs libstdc++ and libgcc (Alpine: apk add libstdc++ libgcc)."
   fi
+  step "Detected $target"
 
   want=$(sums | awk -v v="$version" -v t="$target" '$1 == v && $2 == t { print $3 }')
   if [ -z "$want" ]; then
@@ -217,11 +284,14 @@ main() {
   trap 'exit 1' HUP INT TERM
 
   url="$site/cli/$version/apm-$target"
+  [ -z "$tty" ] || wrap "  \${c}↓\${x} " "    " "Downloading apm $version from \${site#*://}"
   curl -fsSL -o "$tmp" "$url" || die "could not download $url"
   got=$($sha "$tmp" | awk '{ print $1 }')
   if [ "$got" != "$want" ]; then
     die "SHA-256 mismatch for $url: expected $want, got $got. Nothing was installed."
   fi
+  step "Checked SHA-256 against this script"
+  value "$got"
   chmod 755 "$tmp"
   ran=$("$tmp" --version 2>/dev/null) || die "the downloaded apm did not run on this machine.$hint Nothing was installed."
   [ "$ran" = "$version" ] || die "the downloaded apm reports version $ran, not $version. Nothing was installed."
@@ -232,12 +302,32 @@ main() {
     die "$dir/apm is not the file that was checked; something changed it during the install. Run this again."
   fi
 
-  printf 'apm %s (%s) installed to %s\\n' "$version" "$target" "$dir/apm"
-  printf 'SHA-256 %s, checked against this script\\n' "$got"
+  if [ -z "$tty" ]; then
+    printf 'apm %s (%s) installed to %s\\n' "$version" "$target" "$dir/apm"
+    printf 'SHA-256 %s, checked against this script\\n' "$got"
+    case ":\${PATH:-}:" in
+      *":$dir:"*) ;;
+      *) printf '\\n%s is not on your PATH. Add this line to ~/.zshrc, ~/.bashrc or ~/.profile:\\n  export PATH="%s:$PATH"\\n' "$dir" "$dir" ;;
+    esac
+    return
+  fi
+  step "Installed apm $version"
+  value "$dir/apm"
   case ":\${PATH:-}:" in
     *":$dir:"*) ;;
-    *) printf '\\n%s is not on your PATH. Add this line to ~/.zshrc, ~/.bashrc or ~/.profile:\\n  export PATH="%s:$PATH"\\n' "$dir" "$dir" ;;
+    *)
+      printf '\\n'
+      wrap "  " "  " "This folder is not on your PATH:"
+      value "$dir"
+      wrap "  " "  " "Run this, and add it to ~/.zshrc, ~/.bashrc or ~/.profile to keep it:"
+      printf '    %sexport PATH="%s:$PATH"%s\\n' "$c" "$dir" "$x"
+      ;;
   esac
+  printf '\\n'
+  wrap "  " "  " "Next, check that it runs:"
+  printf '    %sapm --version%s\\n' "$c" "$x"
+  wrap "  " "  " "Then add a package, in a project folder:"
+  printf '    %sapm add <pkg>%s\\n\\n' "$c" "$x"
 }
 
 main "$@"

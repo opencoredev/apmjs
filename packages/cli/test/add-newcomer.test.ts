@@ -333,7 +333,7 @@ describe("apm add for a newcomer", () => {
     const cwd = folder("pm/npm-init", { "package.json": manifest });
     const r = await apm(["add", "good"], { cwd });
 
-    expect(r.text).toContain("(bun: default (bun is installed; no lockfile or packageManager names another, so pass --pm npm to use npm);");
+    expect(r.text).toContain("\n  bun: default (bun is installed; no lockfile or packageManager names another, so pass --pm npm to use npm);");
   });
 });
 
