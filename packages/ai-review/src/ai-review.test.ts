@@ -217,11 +217,6 @@ describe("review input", () => {
       { scripts: { postinstall: "./install.exe" }, path: "install.exe", body: script },
       { scripts: { postinstall: "node './setup.txt'" }, path: "setup.txt", body: payload },
       { scripts: { postinstall: "node ./pay*.txt" }, path: "payload.txt", body: payload },
-      { scripts: { postinstall: "node ./pay?oad.txt" }, path: "payload.txt", body: payload },
-      { scripts: { postinstall: "node ./pay[a-z]oad.txt" }, path: "payload.txt", body: payload },
-      { scripts: { postinstall: "node ./pay[!x]oad.txt" }, path: "payload.txt", body: payload },
-      { scripts: { postinstall: "node lib/?/[ps]ayload.txt" }, path: "lib/a/payload.txt", body: payload },
-      { scripts: { postinstall: "node ./x[1].js" }, path: "x[1].js", body: payload },
       { scripts: { postinstall: "node $PWD/payload.txt" }, path: "payload.txt", body: payload },
       { scripts: { postinstall: "npm run setup", setup: "node ./payload.txt" }, path: "payload.txt", body: payload },
     ];
@@ -241,15 +236,6 @@ describe("review input", () => {
     ]);
 
     expect(buildFilesInput({ name: "stand-in", version: "1.0.0", pkg: elf }).notRead).toContainEqual({ kind: "file", path: "bin/setup", reason: "binary" });
-  });
-
-  test("? and bracket globs add only what the shell expands, after the * globs", () => {
-    const shown = (postinstall: string, files: Record<string, string>) =>
-      buildFilesInput({ name: "stand-in", version: "1.0.0", pkg: pkgOf({ "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", scripts: { postinstall } }), ...files }) }).read;
-
-    expect(shown("printf '%s\\n' ./'pay[1]'*.txt", { "pay[1]-demo.txt": "a", "pay1-demo.txt": "b" })).toContain("pay[1]-demo.txt");
-    expect(shown("printf '%s\\n' ./?hidden.txt", { ".hidden.txt": "a" })).not.toContain(".hidden.txt");
-    expect(shown("printf '%s\\n' ./a? ./b? ./c? ./d? ./e? ./f? ./g? ./h? ./prior*.txt", { "prior-file.txt": "a" })).toContain("prior-file.txt");
   });
 
   test("a guessed install target never hides code main showed, and real code that starts like a PE header is shown", () => {

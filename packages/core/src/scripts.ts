@@ -25,7 +25,7 @@ export const LIFECYCLE = {
 
 /**
  * One command a hook runs, after following script references. `from` says how it was reached. `added`: only the shell
- * reading reaches it (expandHooks' third or fourth pass), so a reading budget takes it after every command the first two read.
+ * reading reaches it (expandHooks' third pass), so a reading budget takes it after every command the first two read.
  */
 export type HookCommand = { from: string; text: string; viaEval: boolean; added: boolean };
 
@@ -140,8 +140,8 @@ function firstInlineEval(cmd: string): boolean {
 // node in executable position, found on the PATH: a path may name any program, the package's own included
 const NODE_WORD = /^node(?:js)?$/;
 
-// what inline code must hold for the argv reading to count it: the network and process words isInlineDownload reads
-const NODE_CODE_RISK = /https?|fetch|\bnet\b|child_process|exec/;
+// what inline code must do for the argv reading to count it: load a network or process module, or fetch
+const NODE_CODE_RISK = /\b(?:require|import)\s*\(\s*['"`](?:node:)?(?:https?|http2|net|tls|dgram|child_process)['"`]\s*\)|\bfetch\s*\(|\bprocess\s*\.\s*binding\s*\(/;
 
 /** Work units one command's argv reading may spend, on a meter of its own (nodeArgvEval). */
 const MAX_NODE_ARGV_WORK = MAX_ANALYSIS_WORK / 64;
@@ -190,17 +190,18 @@ function nodeArgvEvals(words: readonly ShellWord[]): boolean {
   while (/^[A-Za-z_]\w*=/.test(words[i]?.word ?? "")) i++;
   const node = words[i];
 
-  if (node === undefined || node.expanded || node.glob || !NODE_WORD.test(node.word)) return false;
-  // inline code that holds a network or process word: only that is what this reading adds, so text elsewhere in the
-  // command (a title, another command) never makes a harmless eval count
-  let risky = false;
+  if (node === undefined || node.expanded || node.glob || node.pattern || !NODE_WORD.test(node.word)) return false;
+  // the code node runs, the last -e or -p's: only code that loads a network or process module is what this reading
+  // adds, so text elsewhere in the command (a title, another command) never makes a harmless eval count
+  let code: string | null = null;
+  const risky = (): boolean => code !== null && NODE_CODE_RISK.test(code);
 
   for (i++; i < words.length; i++) {
     const w = words[i];
 
-    if (w === undefined || w.expanded || w.glob) return false;
+    if (w === undefined || w.expanded || w.glob || w.pattern) return false;
 
-    if (w.word === "--" || w.word === "-" || !w.word.startsWith("-")) return risky;
+    if (w.word === "--" || w.word === "-" || !w.word.startsWith("-")) return risky();
     const { name, inline } = nodeOption(w.word);
 
     if (NODE_EXIT.has(name)) return false;
@@ -214,23 +215,25 @@ function nodeArgvEvals(words: readonly ShellWord[]): boolean {
       } else {
         const next = words[++i];
 
-        if (next === undefined || (!NODE_EVAL.has(name) && (next.expanded || next.glob))) return false;
+        if (next === undefined || (!NODE_EVAL.has(name) && (next.expanded || next.glob || next.pattern))) return false;
         value = next.word;
       }
 
-      // node reads an option-shaped word after -e or -p as an option (`-p --version` prints the version)
-      if (NODE_EVAL.has(name) && value.startsWith("-")) return false;
-      risky ||= NODE_EVAL.has(name) && NODE_CODE_RISK.test(value);
+      // node reads an option-shaped word after an option as an option of its own (`-p --version` prints the version,
+      // `--conditions --version` is a missing value)
+      if (value.startsWith("-")) return false;
+
+      if (NODE_EVAL.has(name)) code = value;
     } else if (!NODE_BOOLEAN.has(name) || inline) return false;
   }
 
-  return risky;
+  return risky();
 }
 
 /** Whether any simple command of `cmd`, its substitutions' included, is a node that nodeArgvEvals reads running risky code. */
 function nodeArgvEval(cmd: string): boolean {
-  // a heredoc's body is text, not commands, and a space outside ASCII may join words the shell keeps apart
-  if (!/node/.test(cmd) || !/-(?:e|p|-eval|-print)/.test(cmd) || /<<|[^\x00-\x7f]/.test(cmd)) return false;
+  // a heredoc's body is text, not commands, and a control or non-ASCII character may join words the shell keeps apart
+  if (!/node/.test(cmd) || !/-(?:e|p|-eval|-print)/.test(cmd) || /<<|[^\x20-\x7e]/.test(cmd)) return false;
 
   // on a meter of its own: running it out leaves the decision to the first reading, and never spends the analysis' work
   try {
@@ -288,8 +291,8 @@ function scriptsOf(manifest: ScriptsManifest): Scripts {
  */
 type ScriptRef = { name: string; alone: boolean };
 
-/** expandHooks' passes: main's reading, the flag-aware regex's additions, the shell reading's, the wrapped runs'. */
-type Pass = 1 | 2 | 3 | 4;
+/** expandHooks' passes: main's reading, the flag-aware regex's additions, the shell reading's additions. */
+type Pass = 1 | 2 | 3;
 
 /**
  * Where the last word of `cmd` starts that could leave npm's ignore-scripts other than set: -1 when none does, and
@@ -409,34 +412,18 @@ function shellReferences(cmd: string, scripts: Scripts): ScriptRef[] {
   return [...doubted, ...shell];
 }
 
-/**
- * Scripts wrappedRunReferences finds a command run that no earlier reading read in that invocation, each with whether
- * npm runs it alone: an invocation an earlier reading read is left to it, as shellReferences leaves the regex's.
- */
-function wrappedReferences(cmd: string, scripts: Scripts): ScriptRef[] {
-  const read = new Set<string>(mainReferences(cmd, scripts));
-  const earlier = new Set<string>();
-
-  for (const m of cmd.matchAll(RUN_REF)) earlier.add(`${m.index + m[0].length}\0${m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5]}`);
-
-  for (const r of shellRunReferences(cmd, scripts)) earlier.add(`${r.end}\0${r.name}`);
-
-  return wrappedRunReferences(cmd, scripts).flatMap((r) => (read.has(r.name) || earlier.has(`${r.end}\0${r.name}`) ? [] : [{ name: r.name, alone: r.alone }]));
-}
-
 const COMMAND_END = new Set([";", "&", "|", "(", ")", "`", "\n"]);
 
 /**
  * The words of `cmd` as the shell hands them over, quotes and escapes removed (`'-s'`, `\\-s` and `""-s` are all
- * `-s`, `'a b'` is one word), each with where it ends in `cmd`, whether an unquoted `*` makes it a glob, whether an unquoted
- * `?` or `[` does (`pattern`), whether any of it is quoted or escaped (`quoted`), and `null`
+ * `-s`, `'a b'` is one word), each with where it ends in `cmd`, whether an unquoted `*` makes it a glob, whether an unquoted `?` or `[` does (`pattern`), and `null`
  * where a command ends: `;`, `&`, `|`, a newline or a group's parenthesis. A command substitution (`$(` or a backtick)
  * is `"("`, its own commands, then `")"`, and the word around it goes on after it; `expanded` marks a word whose text
  * the shell builds from a substitution or a variable, which is not the word as written. A comment is skipped. Nesting past
  * MAX_SHELL_NESTING ends the reading with `"cut"`, the command it is in unfinished. One pass; a quote left open runs to
  * the end of `cmd`.
  */
-export type ShellToken = { word: string; end: number; glob: boolean; pattern: boolean; quoted: boolean; expanded: boolean } | null | "(" | ")" | "cut";
+export type ShellToken = { word: string; end: number; glob: boolean; pattern: boolean; expanded: boolean } | null | "(" | ")" | "cut";
 
 
 /** The deepest nesting of quotes, substitutions and groups the shell words are read through. */
@@ -479,8 +466,8 @@ export function* shellWords(cmd: string): Generator<ShellToken> {
     return ")";
   };
 
-  const flush = function* (): Generator<ShellWord> {
-    if (word !== null && !target) yield { word, end: i, glob, pattern, quoted, expanded };
+  const flush = function* (): Generator<{ word: string; end: number; glob: boolean; pattern: boolean; expanded: boolean }> {
+    if (word !== null && !target) yield { word, end: i, glob, pattern, expanded };
 
     if (word !== null) target = false;
     word = null;
@@ -678,187 +665,6 @@ function npmRun(words: readonly ShellWord[], scripts: Scripts): { name: string; 
 }
 
 /**
- * The script one simple command runs through a package manager, read from the words the shell hands it, in the shapes
- * quoting and value words hid from the first two readings and nothing more: the manager word, after any of the wrappers
- * and assignments runPrefix reads, then only the options below (quoted, escaped or not), `run` or `run-script`, an
- * optional `--`, the name, and any words after it. Anything else, a word the shell builds before the name, a heredoc,
- * npm config in the environment, or any command after a `cd`, is left to the first two readings. `alone`: npm runs it
- * without its pre and post scripts (setsIgnoreScripts). `end` is where the manager's word ends.
- */
-function wrappedRunReferences(cmd: string, scripts: Scripts): { name: string; end: number; alone: boolean }[] {
-  // the manager's word is in the text as written unless quotes or escapes split it, and a directory change anywhere, a
-  // sourced file or a heredoc may move what runs
-  if (!/npm|yarn|bun|['"\\]/.test(cmd) || /<<(?!<)|npm_config_|\b(?:cd|chdir|pushd|popd|source)\b|(?:^|[\s;&|(])\.\s/i.test(cmd)) return [];
-  const out: { name: string; end: number; alone: boolean }[] = [];
-  // the command being read: its words while it may still be one of the shapes, else only its first (`skip`)
-  const outer: { words: ShellWord[]; skip: boolean }[] = [];
-  let words: ShellWord[] = [];
-  let skip = false;
-  // a `cd` moves the shell to another directory, whose package.json then holds the scripts npm runs
-  let moved = false;
-
-  const settle = (): void => {
-    const ref = moved || skip ? null : managerRun(words, scripts);
-
-    if (ref !== null) out.push(ref);
-    moved ||= CHANGES_DIRECTORY.has(words[0]?.word ?? "");
-    words = [];
-    skip = false;
-  };
-
-  const add = (t: ShellWord): void => {
-    if (skip) return;
-
-    if (words.length === 0 || (startsRun(words[0]?.word ?? "") && words.length < MAX_WRAPPED_RUN_WORDS)) words.push(t);
-    else skip = true;
-  };
-
-  for (const t of shellWords(cmd)) {
-    // past the nesting limit the command being read is unfinished, so only the commands before it count
-    if (t === "cut") return out;
-
-    if (t === "(") {
-      outer.push({ words, skip });
-      words = [];
-      skip = false;
-    } else if (t === ")") {
-      settle();
-      ({ words, skip } = outer.pop() ?? { words: [], skip: false });
-    } else if (t === null) settle();
-    else add(t);
-  }
-
-  settle();
-
-  return out;
-}
-
-// the most words one of those shapes has: wrappers and assignments, the manager, its options and their values, run,
-// `--`, the name and the words after it
-const MAX_WRAPPED_RUN_WORDS = 32;
-
-const MANAGERS = new Set(["npm", "yarn", "pnpm", "bun"]);
-
-// commands before the manager that run it with the same words, as sh dispatches them: `env` with only assignments, and
-// `cross-env`, which takes only assignments before the command
-const WRAPPERS = new Set(["env", "cross-env"]);
-const ASSIGNMENT = /^[A-Za-z_]\w*=/;
-
-/** Whether a command starting with `w` may be one of the shapes managerRun reads. */
-function startsRun(w: string): boolean {
-  return MANAGERS.has(w) || WRAPPERS.has(w) || ASSIGNMENT.test(w);
-}
-
-/** Where the manager's word is in `words` past the assignments and wrappers before it, or -1. */
-function runPrefix(words: readonly ShellWord[]): number {
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i]?.word ?? "";
-
-    if (MANAGERS.has(w)) return i;
-
-    // an option of the wrapper's own may change what it runs, or how (`env -C`, `env -S`)
-    if (!ASSIGNMENT.test(w) && !WRAPPERS.has(w)) return -1;
-  }
-
-  return -1;
-}
-
-// yarn's, pnpm's and bun's, none of which may change which package's script runs or that it runs
-const OTHER_RUN_OPTIONS: Record<string, ReadonlySet<string>> = {
-  yarn: new Set(["-s", "--silent"]),
-  pnpm: new Set(["-s", "--silent", "--if-present"]),
-  bun: new Set(["--silent", "--if-present", "--bun"]),
-};
-
-/** The script `words` run when they are one of the shapes wrappedRunReferences reads, else null. */
-function managerRun(words: readonly ShellWord[], scripts: Scripts): { name: string; end: number; alone: boolean } | null {
-  // a word the shell builds or expands may be any word, an option of the manager's or a wrapper's included
-  if (words.some((w) => w.expanded || w.glob)) return null;
-  const at = runPrefix(words);
-  const manager = words[at];
-
-  if (manager === undefined) return null;
-  const rest = words.slice(at + 1);
-  const found = manager.word === "npm" ? npmRunName(rest) : otherRunName(manager.word, rest);
-
-  // npm reads its options after the name too (`--help`, `--prefix`, `--no-ignore-scripts`): only `--` and the
-  // script's own arguments may follow the name
-  if (found === null) return null;
-  const after = rest[found.at + 1];
-
-  if ((after !== undefined && after.word !== "--") || !Object.hasOwn(scripts, found.name)) return null;
-
-  return { name: found.name, end: manager.end, alone: manager.word === "npm" && setsIgnoreScripts(found.before) };
-}
-
-/** The name in npm's words after `npm`, where it is, and npm's words before it; null when they are not one of the shapes. */
-function npmRunName(rest: readonly ShellWord[]): { name: string; at: number; before: string[] } | null {
-  const before: string[] = [];
-  let run = false;
-
-  for (let i = 0; i < rest.length; i++) {
-    const t = rest[i];
-    const w = t?.word ?? "";
-    const next = rest[i + 1]?.word ?? "";
-
-    if (t === undefined || t.expanded || /[*?[]/.test(w)) {
-      // the shell builds it, or may expand it to other words, and npm runs what it becomes
-      return null;
-    } else if (run && before.at(-1) === "--") {
-      // after `--` the next word is the name, whatever it looks like
-      return { name: w, at: i, before };
-    } else if (RUN_OPTIONS.has(w) || /^--loglevel=\w+$/.test(w)) {
-      before.push(w);
-    } else if ((w === "--prefix" && OWN_DIRECTORY.test(next)) || (w === "--loglevel" && /^\w+$/.test(next))) {
-      before.push(w, next);
-      i++;
-    } else if (!run && (w === "run" || w === "run-script")) {
-      run = true;
-      before.push(w);
-    } else if (run && w === "--") {
-      before.push(w);
-    } else {
-      // nopt takes a `true` or `false` after a long boolean as its value, so it may not be the name
-      const takenAsValue = /^(?:true|false)$/.test(w) && /^--(?:silent|ignore-scripts)$/.test(before.at(-1) ?? "");
-
-      return run && !takenAsValue && !w.startsWith("-") ? { name: w, at: i, before } : null;
-    }
-  }
-
-  return null;
-}
-
-/** The name in yarn's, pnpm's or bun's words after the manager, read as npmRunName reads npm's. */
-function otherRunName(manager: string, rest: readonly ShellWord[]): { name: string; at: number; before: string[] } | null {
-  const options = OTHER_RUN_OPTIONS[manager] ?? new Set<string>();
-  let run = false;
-  let ended = false;
-
-  for (let i = 0; i < rest.length; i++) {
-    const t = rest[i];
-    const w = t?.word ?? "";
-
-    if (t === undefined || t.expanded || /[*?[]/.test(w)) return null;
-
-    if (ended || !w.startsWith("-")) {
-      if (!ended && !run && w === "run") {
-        run = true;
-        continue;
-      }
-
-      // only `run` names a script and nothing else: `yarn bin` and `pnpm root` are the managers' own commands, and
-      // `bun run ./x.ts` runs a file
-      return run && !(manager === "bun" && /^\.|\//.test(w)) ? { name: w, at: i, before: [] } : null;
-    }
-
-    if (w === "--" && run) ended = true;
-    else if (!options.has(w)) return null;
-  }
-
-  return null;
-}
-
-/**
  * Every lifecycle hook in the manifest with the commands it reaches, read in two passes so main's coverage holds by
  * construction. The first is main's traversal exactly: main's references only, with every pre and post script, its depth
  * rule and its MAX_COMMANDS budget, so it reads the commands main reads and is cut where main is. The second goes back
@@ -879,20 +685,14 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
     const addedScripts: string[] = [];
     // what the first two passes read, for the next to read its references in
     const read: { text: string; depth: number }[] = [];
-    // what the third pass read, for the fourth
-    const read3: { text: string; depth: number }[] = [];
     let cut: string | null = null;
-    // what the third and the fourth pass each added, each against its own MAX_COMMANDS
     let added = 0;
-    let added4 = 0;
 
     /** Whether a command at this depth may be read, or the reading is cut, and why. */
     const admits = (from: string, depth: number, pass: Pass): boolean => {
       // the third pass only adds to what the first two read: past its own limits it stops, as if it had not read on, and
       // the hook is no less complete than fe2e641 reads it
       if (pass === 3) return depth <= MAX_DEPTH && added < MAX_COMMANDS;
-
-      if (pass === 4) return depth <= MAX_DEPTH && added4 < MAX_COMMANDS;
 
       if (depth > MAX_DEPTH) {
         cut ??= `${from}: commands nested more than ${MAX_DEPTH} levels deep (sh -c, decoded text, npm run)`;
@@ -919,12 +719,12 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
 
           // the third pass follows scripts at the depth that runs them: `followed` ends a cycle and its own command count the
           // walk, so the depth cap is left to nested shells and decoded text
-          const next = pass >= 3 ? depth : depth + 1;
+          const next = pass === 3 ? depth : depth + 1;
 
           if (body === undefined || followed.has(n) || (pass !== 1 && !admits(from, next, pass))) continue;
           followed.add(n);
 
-          if (pass >= 3) addedScripts.push(n);
+          if (pass === 3) addedScripts.push(n);
           visit(body, from, next, false, pass);
         }
       }
@@ -934,16 +734,11 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
       if (!admits(from, depth, pass)) return;
 
       const evals = viaEval || inlineEval(text);
-      commands.push({ from, text, viaEval: evals, added: pass >= 3 });
+      commands.push({ from, text, viaEval: evals, added: pass === 3 });
 
-      if (pass === 3) {
-        added++;
-        read3.push({ text, depth });
-      }
+      if (pass === 3) added++;
 
-      if (pass === 4) added4++;
-
-      if (pass < 3) read.push({ text, depth });
+      if (pass !== 3) read.push({ text, depth });
 
       for (const m of text.matchAll(SH_C)) visit((m[1] ?? m[2] ?? "").replace(/\\(.)/g, "$1"), `${from} (sh -c)`, depth + 1, evals, pass);
 
@@ -951,7 +746,7 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
 
       const main = mainReferences(text, scripts).map((name) => ({ name, alone: false }));
 
-      follow(pass === 1 ? main : [...main, ...flagReferences(text, scripts), ...(pass >= 3 ? shellReferences(text, scripts) : []), ...(pass === 4 ? wrappedReferences(text, scripts) : [])], depth, pass);
+      follow(pass === 1 ? main : [...main, ...flagReferences(text, scripts), ...(pass === 3 ? shellReferences(text, scripts) : [])], depth, pass);
     };
 
     visit(own, `scripts.${hook}`, 0, false, 1);
@@ -969,16 +764,6 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
     try {
       withMeter(new Meter(MAX_SHELL_READING_WORK), () => {
         for (const { text, depth } of read) follow(shellReferences(text, scripts), depth, 3);
-      });
-    } catch (e) {
-      if (!(e instanceof MeterExhausted)) throw e;
-    }
-
-    // the fourth, the wrapped runs, only after the third has read all it reads, on a meter and a count of its own, so it
-    // never takes what the third would read
-    try {
-      withMeter(new Meter(MAX_SHELL_READING_WORK), () => {
-        for (const { text, depth } of [...read, ...read3]) follow(wrappedReferences(text, scripts), depth, 4);
       });
     } catch (e) {
       if (!(e instanceof MeterExhausted)) throw e;

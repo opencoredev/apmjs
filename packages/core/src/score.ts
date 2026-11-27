@@ -1519,14 +1519,7 @@ export function planLayers(input: { manifest: AnalyzeInput["manifest"]; files: r
   walk();
   invoked = all;
 
-  // a file the walk passed over as one it could not hold is held now that only the shell reading runs it
-  for (const p of all) {
-    if (baseline.has(p)) continue;
-
-    if (!held.has(p) && !extra.has(p)) seenX.delete(p);
-    queueX.push(p);
-  }
-
+  for (const p of all) if (!baseline.has(p)) queueX.push(p);
   walk();
 
   return { production: held, extra };
@@ -1894,18 +1887,8 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   // what install hooks run that only the shell reading reaches (HookCommand.added): the extra layer's, after production's
   // whole walk
   const later = new Set<string>();
-  // of those, what an interpreter or the shell runs (`sh ./setup.sh`), not every word that names a file
-  const laterRun = new Set<string>();
 
   for (const c of installCommands) {
-    if (c.added) {
-      for (const w of scriptTargetsBefore(c.text)) {
-        const f = resolveIn(byPath, w);
-
-        if (f && f.path !== "package.json") laterRun.add(f.path);
-      }
-    }
-
     for (const w of [...scriptTargetsBefore(c.text), ...commandWords(c.text)]) {
       const f = resolveIn(byPath, w);
 
@@ -2612,19 +2595,7 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   // meter of its own, with the scoring of what it adds: running it out stops only this reading, never one before it
   try {
     withMeter(new Meter(MAX_ADDED_TARGET_WORK), () => {
-      for (const p of later) {
-        const f = byPath.get(p);
-
-        if (!seen.has(p)) reach(p);
-        else if (f !== undefined && laterRun.has(p) && readWhole.has(f) && !installTargets.has(p)) {
-          // production's walk read its whole text, but not as what an install hook runs: its install-time check is made here
-          chargeText("text", f.data.length, 2);
-          const text = new TextDecoder().decode(f.data);
-
-          if (isShellScript(f, text) && isInlineDownload(text)) add("install-download", `${f.path}: run by an install script and downloads code`);
-        }
-      }
-
+      for (const p of later) if (!seen.has(p)) reach(p);
       readExtra();
       charge("score", scoringUnits() - baselineUnits);
     });
