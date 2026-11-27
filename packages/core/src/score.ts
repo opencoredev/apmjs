@@ -1134,9 +1134,6 @@ const DEPENDENCY_FIELDS = ["dependencies", "optionalDependencies", "peerDependen
 // root files npm, yarn and pnpm read as the project's own configuration
 const PROJECT_CONFIG = new Set(["binding.gyp", ".npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmfile.cjs", ".pnpmfile.mjs", "pnpm-workspace.yaml"]);
 
-// the manifest fields that decide what an install runs and with what on its PATH
-const MANIFEST_RUN_FIELDS = ["scripts", "bin", "directories", ...DEPENDENCY_FIELDS] as const;
-
 /** A path as a case-insensitive filesystem that drops each segment's trailing dots and spaces looks it up. */
 function lookupPath(path: string): string {
   return path
@@ -1171,7 +1168,8 @@ function archiveManifestMatches(
   // one root manifest under case-insensitive, trailing-dot-and-space-dropping extraction, so no other entry can be the
   // one a filesystem keeps
   if (files.some((f) => f !== pj && lookupPath(f.path) === "package.json")) return false;
-  const pick = (m: object): string => JSON.stringify(MANIFEST_RUN_FIELDS.map((k): unknown => Reflect.get(m, k)));
+  // the fields that decide what an install runs and with what on its PATH
+  const pick = (m: AnalyzeInput["manifest"]): string => JSON.stringify([m.scripts, m.bin, m.directories, ...DEPENDENCY_FIELDS.map((k) => m[k])]);
 
   try {
     const archive: unknown = JSON.parse(new TextDecoder().decode(pj.data));
