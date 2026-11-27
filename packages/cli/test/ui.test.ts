@@ -115,6 +115,18 @@ describe("terminal layout", () => {
     expect(Bun.stringWidth(cut)).toBe(80);
   });
 
+  test("invisible characters and color codes count against the layout budget, however narrow the line", () => {
+    const hostile = `${"\x1b[31m\u200b\x1b[1m".repeat(400_000)}${"word ".repeat(2000)}\x1b]8;;https://example.test\x07link`;
+    const started = performance.now();
+    const wrapped = wrap(hostile, 80);
+    const cut = truncate(hostile, 80);
+
+    expect(performance.now() - started).toBeLessThan(2000);
+    expect(wrapped.length).toBeLessThan(10_000);
+    expect(cut.length).toBeLessThan(10_000);
+    expect(wrapped).not.toContain("\x1b]");
+  });
+
   test("a narrow terminal keeps room for text: a deep indent gives way", () => {
     const out = wrap("    advisory  MAL-2026-20430 (OSSF malicious-packages feed)", 20);
 

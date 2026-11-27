@@ -64,7 +64,7 @@ export function truncate(text: string, width: number): string {
 
   // a link or other escape that is not a color is dropped: cut short, it could stay open past the line. Only the
   // part that can show is split into characters, however long the text
-  for (const p of piecesOf(Bun.sliceAnsi(text, 0, width + 1))) {
+  for (const p of piecesOf(Bun.sliceAnsi(bounded(text), 0, width + 1))) {
     if (p.kind === "escape") {
       if (SGR.test(p.text)) kept.push(p);
     } else if (used + p.width <= width - 1) {
@@ -120,8 +120,25 @@ export function reflow(text: string): string {
   return out.join("\n");
 }
 
-/** The most characters of one line apm lays out for a terminal; the rest is cut with an ellipsis. */
+/** The most code units of one line apm lays out for a terminal, escapes and invisible characters included. */
 const MAX_LAID_OUT = 8000;
+
+/** The most color codes a wrapped line carries open across a break: older ones are let go first. */
+const MAX_OPEN = 16;
+
+/**
+ * `text` cut to MAX_LAID_OUT code units with an ellipsis when longer, keeping only its colors: registry text can be
+ * megabytes (a yank reason), and a link or other escape cut short could stay open past the line.
+ */
+function bounded(text: string): string {
+  if (text.length <= MAX_LAID_OUT) return text;
+
+  const kept = piecesOf(text.slice(0, MAX_LAID_OUT)).filter((p) =>
+    p.kind === "escape" ? SGR.test(p.text) : !p.text.includes(ESC),
+  );
+
+  return `${kept.map((p) => p.text).join("")}…${RESET}`;
+}
 
 /** The fewest columns a wrapped line keeps for its text: a deeper indent is given up first. */
 const MIN_TEXT = 16;
@@ -131,9 +148,9 @@ const MIN_TEXT = 16;
  * Each continuation is indented under the text it continues, and the colors open at a break are closed and reopened.
  */
 export function wrap(full: string, width: number): string {
-  if (widthOf(full) <= width) return full;
-  // registry text can be megabytes (a yank reason): a terminal is shown its first screens, in time linear in what it shows
-  const line = full.length > MAX_LAID_OUT ? `${Bun.sliceAnsi(full, 0, MAX_LAID_OUT)}…${RESET}` : full;
+  const line = bounded(full);
+
+  if (widthOf(line) <= width) return line;
   const plain = Bun.stripANSI(line);
   const room = Math.max(0, width - MIN_TEXT);
   const indent = Math.min(/^ */.exec(plain)?.[0].length ?? 0, room);
@@ -157,7 +174,7 @@ export function wrap(full: string, width: number): string {
     if (p.kind !== "escape" || !SGR.test(p.text)) return;
 
     if (p.text === RESET || p.text === `${ESC}[m`) open = [];
-    else open.push(p.text);
+    else open = [...open, p.text].slice(-MAX_OPEN);
   };
 
   const breakLine = (): void => {
