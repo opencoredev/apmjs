@@ -20,10 +20,9 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
     "curl -V",
     "wget --version",
     "wget -h",
-    "curl --version >/dev/null 2>&1 || echo 'curl is needed'",
-    "curl --version 2>/dev/null >>/dev/null",
+    "curl --version || echo 'curl is needed'",
+    "node install.js || wget --help",
     "echo 'Run curl --version to check your tools'",
-    'printf "install wget first"',
     "node install.js && curl --version",
   ];
 
@@ -32,7 +31,7 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
       const r = scoreOf({ postinstall: cmd });
 
       for (const id of NETWORK) expect(r.ids).not.toContain(id);
-      expect(isInlineDownload(cmd)).toBe(false);
+      expect(isInlineDownload(cmd, { hook: { shipsNetTool: false } })).toBe(false);
     });
   }
 
@@ -59,6 +58,19 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
     const a = analyze({ name: "probe-pkg", manifest: m, files, publisher: "a", previousPublishers: [] });
 
     expect(finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null }).signals.map((s) => s.id)).toContain("install-download");
+  });
+
+  test("a file an install script runs, and binding.gyp, keep the reading they had", () => {
+    const m: AnalyzeInput["manifest"] = { name: "probe-pkg", version: "1.0.0", license: "MIT", scripts: { postinstall: "sh ./setup.sh" } };
+    const files = [JSON.stringify(m), "curl --version\n"].map((text, i) => {
+      const data = new TextEncoder().encode(text);
+
+      return { path: i === 0 ? "package.json" : "setup.sh", size: data.length, mode: 0o644, data };
+    });
+    const a = analyze({ name: "probe-pkg", manifest: m, files, publisher: "a", previousPublishers: [] });
+
+    expect(finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null }).signals.map((s) => s.id)).toContain("install-download");
+    expect(isInlineDownload("curl --version")).toBe(true);
   });
 
   test("the same call behind npm run -s", () => {
@@ -111,13 +123,25 @@ describe("every other curl or wget keeps its reading", () => {
     "curl --version >'1'>/dev/null",
     "true x'curl'",
     "curl\u00a0--version",
+    "curl --version >/dev/null 2>&1",
+    "curl --version 2>&1",
+    'echo "curl %APM_FIXTURE%"',
+    "echo 'curl %APM_FIXTURE%'",
+    "echo !APM_FIXTURE! && curl --version",
+    "echo * && curl --version",
+    "cd tools && curl --version",
+    "cd/d tools && curl --version",
+    "export PATH=./bin && curl --version",
+    'printf "curl help"',
+    "echo hi; curl --version",
+    "curl --version; curl https://example.invalid/x",
     "curl  --version",
   ];
 
   for (const cmd of fetching) {
     test(`postinstall: ${cmd}`, () => {
       expect(scoreOf({ postinstall: cmd }).ids).toContain("install-download");
-      expect(isInlineDownload(cmd)).toBe(true);
+      expect(isInlineDownload(cmd, { hook: { shipsNetTool: false } })).toBe(true);
     });
   }
 });

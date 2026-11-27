@@ -1143,7 +1143,7 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
     for (const c of h.commands) {
       const label = `package.json ${c.from}: ${c.text.slice(0, 80)}`;
 
-      if (h.kind !== "publish" && isInlineDownload(c.text, { viaEval: c.viaEval, localBins: h.kind === "git" ? gitInstalled : installed, shipsNetTool })) {
+      if (h.kind !== "publish" && isInlineDownload(c.text, { viaEval: c.viaEval, localBins: h.kind === "git" ? gitInstalled : installed, hook: { shipsNetTool } })) {
         found.add("install-download", label);
         risky = true;
       }

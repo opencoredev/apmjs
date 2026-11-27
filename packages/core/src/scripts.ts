@@ -681,20 +681,24 @@ export type DownloadContext = {
   viaEval?: boolean;
   /** Packages installed alongside this one: running their bins with npx downloads nothing. */
   localBins?: ReadonlySet<string>;
-  /** The package has a file at its root named like curl or wget (netToolsInert). */
-  shipsNetTool?: boolean;
+  /** A lifecycle hook's command, which npm runs from the package's root: `shipsNetTool` as netToolsInert reads it. */
+  hook?: { shipsNetTool: boolean };
 };
 
 const NET_TOOL_MENTION = /\b(?:curl|wget)\b/i;
 const NET_TOOL_MENTIONS = /\b(?:curl|wget)\b/gi;
 
-// one simple command whose curl or wget fetches nothing, written in plain ASCII words one space apart: a call that only
-// prints help or a version, with at most output to the null device, or an echo or printf of one quoted literal
-const NET_TOOL_INFO_CALL = /^(?:curl|wget) (?:--version|-V|--help|-h)(?: (?:>|2>|>>|2>>)\/dev\/null| 2>&1)*$/;
-const PRINTED_LITERAL = /^(?:echo|printf) (?:'[^'|&;<>\n]*'|"[^"$`\\|&;<>\n]*")$/;
+// one simple command whose curl or wget fetches nothing, in plain words one space apart: a call that only prints help
+// or a version, or an echo of one single-quoted literal of plain characters
+const NET_TOOL_INFO_CALL = /^(?:curl|wget) (?:--version|-V|--help|-h)$/;
+const PRINTED_LITERAL = /^echo '[A-Za-z0-9 ._,:/@+-]*'$/;
 
-// the commands between `&&`, `||` and `;`
-const LIST_SEPARATOR = /&&|\|\||;/;
+// the commands between `&&` and `||`, which sh and cmd.exe both read as lists
+const LIST_SEPARATOR = /&&|\|\|/;
+
+// a command of plain words that the shell runs as written and that leaves the directory and the PATH where they were
+const PLAIN_COMMAND = /^[A-Za-z0-9 ._/:@+,-]*$/;
+const CHANGES_LOOKUP = /^(?:cd|chdir|pushd|popd)(?![A-Za-z0-9])/i;
 
 /** `s` without the ASCII spaces around it. */
 function trimSpaces(s: string): string {
@@ -708,16 +712,12 @@ function trimSpaces(s: string): string {
   return s.slice(a, b);
 }
 
-// a character that makes the words the shell runs other than the words written: quotes, expansion, escapes, pipes,
-// redirection, grouping, comments, cmd.exe's escapes and variables, and anything outside plain ASCII
-const UNPLAIN = /['"$`\\|&<>(){}#^%]|[^\x20-\x7e]/;
-
 /**
- * Whether every curl or wget mention in `cmd` is a call that fetches nothing (`curl --version`, `wget --help`) or a
- * literal an `echo` or `printf` prints (`echo 'run curl --version'`), read only in those exact shapes: `cmd` is a
- * list of simple commands joined by `&&`, `||` or `;`, each one of those shapes or a command in plain words that
- * mentions neither tool. `shipsNetTool`: the package has a file at its root named like curl or wget, which cmd.exe
- * runs before the one on the PATH. Anything else is read as fetching, as before.
+ * Whether every curl or wget mention in a hook command is a call that fetches nothing (`curl --version`) or a
+ * literal an echo prints (`echo 'run curl --version'`), read only in those exact shapes: `cmd` is a list of
+ * commands joined by `&&` or `||`, each one of those shapes or a command of plain words that mentions neither
+ * tool and moves no lookup. `shipsNetTool`: the package has a file at its root named like curl or wget, which
+ * cmd.exe runs before the one on the PATH. Anything else is read as fetching, as before.
  */
 export function netToolsInert(cmd: string, shipsNetTool = false): boolean {
   if (shipsNetTool || !NET_TOOL_MENTION.test(cmd)) return false;
@@ -725,7 +725,7 @@ export function netToolsInert(cmd: string, shipsNetTool = false): boolean {
   return cmd
     .split(LIST_SEPARATOR)
     .map(trimSpaces)
-    .every((c) => NET_TOOL_INFO_CALL.test(c) || PRINTED_LITERAL.test(c) || (!UNPLAIN.test(c) && !NET_TOOL_MENTION.test(c)));
+    .every((c) => NET_TOOL_INFO_CALL.test(c) || PRINTED_LITERAL.test(c) || (PLAIN_COMMAND.test(c) && !CHANGES_LOOKUP.test(c) && !NET_TOOL_MENTION.test(c)));
 }
 
 /** `cmd` with every curl and wget mention blanked when netToolsInert holds, else `cmd` as it is. */
@@ -735,7 +735,7 @@ export function withoutInertNetTools(cmd: string, shipsNetTool = false): string 
 
 /** The canonical dropper shape: a command that fetches remote code, or fetches a package and runs it. */
 export function isInlineDownload(cmd: string, ctx: DownloadContext = {}): boolean {
-  if (/\b(?:curl|wget|iwr|Invoke-WebRequest)\b/i.test(withoutInertNetTools(cmd, ctx.shipsNetTool))) return true;
+  if (/\b(?:curl|wget|iwr|Invoke-WebRequest)\b/i.test(ctx.hook ? withoutInertNetTools(cmd, ctx.hook.shipsNetTool) : cmd)) return true;
 
   if (/\|\s*(?:ba|z)?sh\b/.test(cmd)) return true;
 
