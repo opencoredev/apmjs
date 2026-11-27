@@ -59,8 +59,8 @@ describe("apm add, as first-time users met it", () => {
     expect(r.out).toContain("! expresss@1.0.0");
     expect(r.out).toContain('WARNING expresss@1.0.0 has a name like a popular package\'s: one edit away from "express"');
     expect(r.out).toContain("did you mean express?");
-    expect(r.out).not.toContain("apm: no warnings");
-    expect(r.out).toContain("apm: no other warnings; the name expresss looks like a popular package's (above)");
+    expect(r.out).not.toContain("✓ no warnings");
+    expect(r.out).toContain("! no other warnings; the name expresss looks like a popular package's (above)");
     expect(installedVersion(app, "expresss")).toBe("1.0.0");
   });
 

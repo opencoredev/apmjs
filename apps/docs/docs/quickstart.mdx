@@ -92,7 +92,7 @@ apm --version
 
 ### What the install script checks
 
-When a version is released, the SHA-256 of each of its binaries is written into the script. The script downloads the binary for your machine from `https://apmjs.dev/cli/<version>/`, compares its SHA-256 with that list, and installs nothing if they differ. It also runs the binary once and installs it only if it reports that version. It prints the fingerprint it checked:
+When a version is released, the SHA-256 of each of its binaries is written into the script. The script downloads the binary for your machine from `https://apmjs.dev/cli/<version>/`, compares its SHA-256 with that list, and installs nothing if they differ. It also runs the binary once and installs it only if it reports that version. In a terminal it shows each step and the SHA-256 it checked. Piped or in CI, it prints the fingerprint it checked as two plain lines:
 
 ```
 apm 0.1.9 (darwin-arm64) installed to /Users/you/.apm/bin/apm

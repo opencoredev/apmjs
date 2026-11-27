@@ -154,12 +154,40 @@ EOF
 }
 
 die() {
-  printf 'apm install: %s\\n' "$1" >&2
+  if [ ! -t 2 ]; then
+    printf 'apm install: %s\\n' "$1" >&2
+  elif colors 2; then
+    printf '\\n  \\033[1;31merror:\\033[0m %s\\n' "$1" >&2
+  else
+    printf '\\n  error: %s\\n' "$1" >&2
+  fi
   exit 1
+}
+
+# Can file descriptor $1 take color? Only a terminal, and not with NO_COLOR set (no-color.org) or TERM=dumb.
+colors() {
+  [ -t "$1" ] && [ -z "\${NO_COLOR:-}" ] && [ "\${TERM:-}" != dumb ]
+}
+
+# A step that is done, shown only to a person at a terminal.
+step() {
+  [ -z "$tty" ] || printf '  %s✓%s %s\\n' "$g" "$x" "$1"
 }
 
 # Everything runs from main, called on the last line, so a download cut short runs nothing.
 main() {
+  # A person at a terminal gets a header, steps and next steps; pipes, CI and agents get the plain lines at the end.
+  tty="" b="" d="" g="" c="" x="" up=""
+  if [ -t 1 ]; then
+    tty=1
+    # moves back over the "Downloading" line to mark it done
+    [ "\${TERM:-}" = dumb ] || up=$(printf '\\033[1A\\033[2K')
+    if colors 1; then
+      b=$(printf '\\033[1m') d=$(printf '\\033[2m') g=$(printf '\\033[32m') c=$(printf '\\033[36m') x=$(printf '\\033[0m')
+    fi
+    printf '\\n  %sapm installer%s  %s%s%s\\n\\n' "$b" "$x" "$d" "$site" "$x"
+  fi
+
   while [ $# -gt 0 ]; do
     case "$1" in
       --version) [ $# -ge 2 ] || die "--version needs a value"; version="$2"; shift 2 ;;
@@ -190,6 +218,7 @@ main() {
     target="$target-musl"
     hint=" On musl it needs libstdc++ and libgcc (Alpine: apk add libstdc++ libgcc)."
   fi
+  step "Detected $target"
 
   want=$(sums | awk -v v="$version" -v t="$target" '$1 == v && $2 == t { print $3 }')
   if [ -z "$want" ]; then
@@ -217,11 +246,16 @@ main() {
   trap 'exit 1' HUP INT TERM
 
   url="$site/cli/$version/apm-$target"
+  [ -z "$tty" ] || printf '  %s↓%s Downloading apm %s from %s\\n' "$c" "$x" "$version" "\${site#*://}"
   curl -fsSL -o "$tmp" "$url" || die "could not download $url"
+  [ -z "$tty" ] || printf '%s' "$up"
+  step "Downloaded apm $version"
   got=$($sha "$tmp" | awk '{ print $1 }')
   if [ "$got" != "$want" ]; then
     die "SHA-256 mismatch for $url: expected $want, got $got. Nothing was installed."
   fi
+  step "Checked SHA-256 against this script"
+  [ -z "$tty" ] || printf '    %s%s%s\\n' "$d" "$got" "$x"
   chmod 755 "$tmp"
   ran=$("$tmp" --version 2>/dev/null) || die "the downloaded apm did not run on this machine.$hint Nothing was installed."
   [ "$ran" = "$version" ] || die "the downloaded apm reports version $ran, not $version. Nothing was installed."
@@ -232,12 +266,23 @@ main() {
     die "$dir/apm is not the file that was checked; something changed it during the install. Run this again."
   fi
 
-  printf 'apm %s (%s) installed to %s\\n' "$version" "$target" "$dir/apm"
-  printf 'SHA-256 %s, checked against this script\\n' "$got"
+  if [ -z "$tty" ]; then
+    printf 'apm %s (%s) installed to %s\\n' "$version" "$target" "$dir/apm"
+    printf 'SHA-256 %s, checked against this script\\n' "$got"
+    case ":\${PATH:-}:" in
+      *":$dir:"*) ;;
+      *) printf '\\n%s is not on your PATH. Add this line to ~/.zshrc, ~/.bashrc or ~/.profile:\\n  export PATH="%s:$PATH"\\n' "$dir" "$dir" ;;
+    esac
+    return
+  fi
+  step "Installed apm $version to $dir/apm"
   case ":\${PATH:-}:" in
     *":$dir:"*) ;;
-    *) printf '\\n%s is not on your PATH. Add this line to ~/.zshrc, ~/.bashrc or ~/.profile:\\n  export PATH="%s:$PATH"\\n' "$dir" "$dir" ;;
+    *) printf '\\n  %s is not on your PATH.\\n  Run this, and add it to ~/.zshrc, ~/.bashrc or ~/.profile to keep it:\\n\\n    %sexport PATH="%s:$PATH"%s\\n' "$dir" "$c" "$dir" "$x" ;;
   esac
+  printf '\\n  %sNext%s\\n' "$b" "$x"
+  printf '    %sapm --version%s   %scheck that it runs%s\\n' "$c" "$x" "$d" "$x"
+  printf '    %sapm add <pkg>%s   %sadd a package, in a project folder%s\\n\\n' "$c" "$x" "$d" "$x"
 }
 
 main "$@"

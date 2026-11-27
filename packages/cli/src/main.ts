@@ -26,6 +26,7 @@ import { makeTemp, removeTemp } from "./sandbox.ts";
 import { CLI_VERSION } from "./version.ts";
 import { manifestChecks, registryChecks, VALID_NAME_RULE, type BuildMetadata, type Existing, type PublishCheck, type RegistryView } from "./publish-checks.ts";
 import { argsError, bareInstallArgs, commandOf, helpTopic } from "./commands.ts";
+import { columnsOf, reflow, truncate, wrap } from "./ui.ts";
 
 function flag(a: Args, k: string): string | null {
   const v = a.flags.get(k);
@@ -44,22 +45,47 @@ const yellow = paint("33");
 const dim = paint("2");
 const bold = paint("1");
 
+/** When apm started, for the time an add took. */
+const STARTED = performance.now();
+
 let jsonMode = false;
 let jsonDone = false;
 let lastError: string | null = null;
 let lastWarn: string | null = null;
-function say(line = ""): void {
-  (jsonMode ? process.stderr : process.stdout).write(`${line}\n`);
+/** `line` as a terminal shows it: wrapped under its own indent (`cut`: truncated, for code and evidence), whole on a pipe. */
+function fit(line: string, stream: NodeJS.WriteStream, how: "wrap" | "cut"): string {
+  const columns = columnsOf(stream);
+
+  if (columns === null) return line;
+
+  return line
+    .split("\n")
+    .map((l) => (how === "cut" ? truncate(l, columns) : wrap(l, columns)))
+    .join("\n");
+}
+
+/** A command apm runs, dim, and why on the line under it. */
+function sayRun(command: string, why: string | null = null): void {
+  say(dim(`→ ${command}`));
+
+  if (why !== null) say(dim(`  ${why}`));
+}
+
+function say(line = "", how: "wrap" | "cut" = "wrap"): void {
+  const stream = jsonMode ? process.stderr : process.stdout;
+
+  stream.write(`${fit(line, stream, how)}\n`);
 }
 function warn(line: string): void {
   lastWarn = line;
-  process.stderr.write(`${line}\n`);
+  process.stderr.write(`${fit(line, process.stderr, "wrap")}\n`);
 }
 
-/** A failure: printed to stderr, and kept for the --json result. */
+/** A failure: printed to stderr with a mark, and kept for the --json result as it was given. */
 function fail(line: string): void {
   lastError = line;
-  warn(red(line));
+  lastWarn = red(line);
+  process.stderr.write(`${fit(`${red("✗")} ${red(line)}`, process.stderr, "wrap")}\n`);
 }
 
 /** With --json every apm command prints exactly one JSON document on stdout; the first one wins. */
@@ -73,34 +99,83 @@ function gradeColor(score: number): (s: string) => string {
   return score >= 75 ? green : score >= 40 ? yellow : red;
 }
 
-/** `refusal`: why the version is refused whatever it scores (known malicious), said before its score. */
-function printCard(title: string, report: Report | null, opts: { maxEvidence?: number; refusal?: string } = {}): void {
-  if (opts.refusal !== undefined) say(`${bold(title)}  ${red(opts.refusal)}`);
-
+/**
+ * A package's card: one line with its verdict mark, name, score and how many risk signals it has, then each signal
+ * with its evidence. Evidence several signals share is printed once, under the first. `capabilities`: "full" lists each
+ * with its evidence (apm score, the publish preview), "line" names them on one line (apm add, apm x).
+ */
+function printCard(title: string, report: Report | null, opts: { maxEvidence?: number; capabilities?: "full" | "line" } = {}): void {
   if (!report) {
-    if (opts.refusal === undefined) say(`${bold(title)}  ${dim("score unknown (not analyzed)")}`);
+    say(`${bold(title)}  ${dim("score unknown (not analyzed)")}`);
     return;
   }
   const c = gradeColor(report.score);
-
-  if (opts.refusal === undefined) say(`${bold(title)}  ${c(`score ${report.score}/100 (${report.grade})`)}`);
-  else say(`  ${dim(`its score, ${report.score}/100 (${report.grade}), does not count: apm refuses it whatever it scores`)}`);
   const bad = report.signals.filter((s) => s.points < 0);
   const info = report.signals.filter((s) => s.points >= 0);
-  if (bad.length === 0 && opts.refusal === undefined) say(`  ${green("✓")} no risk signals found`);
+  const summary = bad.length === 0 ? green("no risk signals") : yellow(`${bad.length} risk ${bad.length === 1 ? "signal" : "signals"}`);
+
+  say(`${bold(title)}  ${c(`score ${report.score}/100 (${report.grade})`)}  ${dim("·")} ${summary}`);
+  const shown = new Set<string>();
+
   for (const s of bad) {
     const pts = String(s.points).padStart(4);
     // a signal's id, label and evidence are registry text: one line each, no terminal controls
     say(`  ${s.confidence === "possible" ? dim(pts) : red(pts)} ${oneLine(s.id)}${s.confidence === "possible" ? " (possible)" : ""}  ${dim(oneLine(s.label))}`);
-    for (const e of s.evidence.slice(0, opts.maxEvidence ?? 2)) say(`        ${dim(oneLine(e))}`);
+
+    for (const e of s.evidence.slice(0, opts.maxEvidence ?? 2).map(oneLine)) {
+      if (shown.has(e)) continue;
+      shown.add(e);
+      say(`        ${dim(e)}`, "cut");
+    }
   }
-  for (const s of info) say(`  ${dim(`   · ${oneLine(s.id)}  ${oneLine(s.label)}${s.evidence[0] ? ` (${oneLine(s.evidence[0])})` : ""}`)}`);
-  printCapabilities(report.capabilities);
+  for (const s of info) say(`  ${dim(`   · ${oneLine(s.id)}  ${oneLine(s.label)}${s.evidence[0] ? ` (${oneLine(s.evidence[0])})` : ""}`)}`, "cut");
+
+  if (opts.capabilities === "line") printCapabilityLine(report.capabilities);
+  else printCapabilities(report.capabilities);
+}
+
+/** The id of the advisory a malicious skip reason names, as "(MAL-2026-20430)" at its end. */
+function advisoryOf(reason: string): string | null {
+  return /\(((?:MAL|GHSA|OSV|PYSEC)-[0-9A-Za-z-]+)\)\s*$/.exec(reason)?.[1] ?? null;
+}
+
+/**
+ * The card of a version refused whatever it scores (known malicious): the refusal, the advisory that lists it, the one
+ * signal that costs the most with its evidence, the other signals on one line, and the score that does not count.
+ */
+function printRefusal(input: { title: string; report: Report | null; reason: string }): void {
+  const { report } = input;
+  const reason = oneLine(input.reason);
+  const advisory = advisoryOf(reason);
+  const feed = reason.startsWith("known malicious");
+
+  say(`${bold(input.title)}  ${red(bold("refused"))} ${dim("·")} ${red(feed ? "known malicious" : "confirmed malicious")}`);
+  say(advisory !== null ? `    ${dim("advisory")}  ${bold(advisory)} ${dim(`(${feed ? "OSSF malicious-packages feed" : "apm reviewer"})`)}` : `    ${dim("source")}    ${reason}`);
+
+  if (report === null) return;
+  const bad = report.signals.filter((s) => s.points < 0).toSorted((a, b) => a.points - b.points);
+  const [top, ...rest] = bad;
+
+  if (top !== undefined) {
+    say(`    ${dim("reason")}    ${oneLine(top.label)}`);
+    const evidence = top.evidence[0];
+
+    if (evidence !== undefined) say(`              ${dim(oneLine(evidence))}`, "cut");
+  }
+
+  if (rest.length > 0) say(`    ${dim("signals")}   ${bad.map((s) => `${red(String(s.points))} ${oneLine(s.id)}`).join(dim(" · "))}`);
+  say(`    ${dim("score")}     ${dim(`its score, ${report.score}/100 (${report.grade}), does not count: apm refuses it whatever it scores`)}`);
 }
 
 /** What the package can do, with its declaration and the variables read outside it. Never scored on its own. */
 function printCapabilities(list: readonly Capability[]): void {
-  for (const line of capabilityLines(list, { bold, dim, green, yellow })) say(line);
+  for (const line of capabilityLines(list, { bold, dim, green, yellow })) say(line, "cut");
+}
+
+/** The capabilities on one line, the ones its declaration leaves out in yellow. Never scored on its own. */
+function printCapabilityLine(list: readonly Capability[]): void {
+  if (list.length === 0) return;
+  say(`  ${dim("can")}  ${list.map((c) => (c.status === "undeclared" ? yellow(c.id) : c.id)).join(dim(" · "))}  ${dim("(what it can do; not scored)")}`);
 }
 
 // ---------- shared ----------
@@ -587,7 +662,8 @@ function printResolved(r: Resolved): void {
   const malicious = r.blocked === null ? undefined : r.skipped.find((s) => s.version === r.version && MALICIOUS_SKIPS.some((m) => s.reason.startsWith(m)));
   const mark = r.blocked ? red("✗") : r.warnings.length > 0 || lookalike !== null || r.explained !== null ? yellow("!") : green("✓");
 
-  printCard(`${mark} ${r.name}@${r.version ?? "?"}`, r.report, malicious === undefined ? {} : { refusal: `refused: ${oneLine(malicious.reason)}` });
+  if (malicious === undefined) printCard(`${mark} ${r.name}@${r.version ?? "?"}`, r.report, { capabilities: "line" });
+  else printRefusal({ title: `${mark} ${r.name}@${r.version ?? "?"}`, report: r.report, reason: malicious.reason });
 
   // a skip reason can carry an owner's yank or revoke words: one line, no terminal controls or bidi overrides
   for (const s of r.skipped.filter((x) => x !== malicious).slice(0, 5)) say(`  ${dim(oneLine(`skipped ${s.version}: ${s.reason}${s.revokeReason ? ` (${s.revokeReason})` : ""}`))}`);
@@ -701,11 +777,17 @@ function printPlatformFamilies(warnings: readonly InstallWarning[], binaries: re
 
   if (shown.length > 0) say();
 
-  for (const [family, members] of shown) {
-    const flagged = grouped.get(family) ?? [];
-    const head = `${members.size} platform ${members.size === 1 ? "binary" : "binaries"} (${family})`;
+  const quiet = shown.filter(([f]) => !grouped.has(f));
 
-    say(flagged.length > 0 ? `${yellow(bold("WARNING"))} ${head}: ${reasonCounts(flagged)}` : dim(`${head}: no warnings`));
+  for (const [family, members] of shown.filter(([f]) => grouped.has(f))) {
+    say(`${yellow(bold("WARNING"))} ${members.size} platform ${members.size === 1 ? "binary" : "binaries"} (${family}): ${reasonCounts(grouped.get(family) ?? [])}`);
+  }
+
+  // the families with nothing to say share one line
+  if (quiet.length > 0) {
+    const n = quiet.reduce((sum, [, members]) => sum + members.size, 0);
+
+    say(dim(`${n} platform ${n === 1 ? "binary" : "binaries"} (${quiet.map(([f]) => f).join(", ")}): no warnings`));
   }
 
   return rest;
@@ -839,7 +921,7 @@ async function checkLock(input: { api: Api; graph: LockGraph; strict: boolean; r
   const total = checkedCount(graph);
 
   say();
-  say(dim(`apm: checked the ${total} package${total === 1 ? "" : "s"} ${input.headline}`));
+  say(`${green("✓")} checked ${total} package${total === 1 ? "" : "s"} ${dim(input.headline)}`);
 
   if (graph.bundled.length > 0) {
     const n = graph.bundled.length;
@@ -878,9 +960,19 @@ async function checkLock(input: { api: Api; graph: LockGraph; strict: boolean; r
 
   const lookalikes = input.results.filter((r) => lookalikeOf(r.report) !== null).map((r) => r.name);
 
-  if (!refused && verdict.warnings.length === 0) say(lookalikes.length > 0 ? yellow(`apm: no other warnings; the name ${lookalikes.join(", ")} looks like a popular package's (above)`) : dim("apm: no warnings"));
+  if (!refused && verdict.warnings.length === 0) say(lookalikes.length > 0 ? `${yellow("!")} ${yellow(`no other warnings; the name ${lookalikes.join(", ")} looks like a popular package's (above)`)}` : `${green("✓")} no warnings`);
 
   return { graph, blocked, warnings: verdict.warnings, refused };
+}
+
+/** The closing line of an add that went through: what was added, how much was checked, the warnings and the time. */
+function sayAdded(input: { results: readonly Resolved[]; check: LockCheck }): void {
+  const checked = checkedCount(input.check.graph);
+  const warnings = input.check.warnings.length + input.results.reduce((n, r) => n + r.warnings.length + (r.explained === null ? 0 : 1), 0);
+  const seconds = ((performance.now() - STARTED) / 1000).toFixed(1);
+
+  say();
+  say(`${green("✓")} ${bold(`added ${input.results.map((r) => `${r.name}@${r.version ?? "?"}`).join(", ")}`)}  ${dim(`${checked} ${checked === 1 ? "package" : "packages"} checked ·`)} ${warnings === 0 ? dim("no warnings") : yellow(`${warnings} ${warnings === 1 ? "warning" : "warnings"}`)} ${dim(`· ${seconds}s`)}`);
 }
 
 /** The --json report of a check, at the stage it stopped. */
@@ -1023,7 +1115,7 @@ async function releaseScripts(input: { pm: LockPm; root: string; members: readon
       if (again.length === 0) return { code: 0, reinstalled: false, notRun };
       const cmd = ["bun", "install", "--frozen-lockfile", ...omission.args, ...registryArgs("bun", input.registry, input.scopes)];
 
-      say(dim(`→ ${cmd.join(" ")}  (installs ${again.map(idOf).join(", ")} again, running their install scripts; bun also runs your package.json's own install scripts)`));
+      sayRun(`${cmd.join(" ")}`, `installs ${again.map(idOf).join(", ")} again, running their install scripts; bun also runs your package.json's own install scripts`);
 
       return { code: (await runCmd(cmd, opts)).code, reinstalled: true, notRun };
     }
@@ -1120,7 +1212,7 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
       return 1;
     }
 
-    say(dim(`→ ${cmd.join(" ")}  (${pm}: ${det.why}; in a copy of your project, which installs nothing)`));
+    sayRun(`${cmd.join(" ")}`, `${pm}: ${det.why}; in a copy of your project, which installs nothing`);
     const run = await runCmd(cmd, { cwd: join(copy.dir, layout.member), env: pmEnv(registry, input.scopes), stdoutToStderr: true });
 
     if (run.code !== 0) {
@@ -1258,7 +1350,7 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
     say();
 
     if (group.kind === "omit") say(dim(`apm: ${group.why}: ${pm} leaves devDependencies out of this install; apm checked them all the same`));
-    say(dim(`→ ${install.join(" ")}  (wrote the checked ${t.manifest} and ${t.lockfile}; installing exactly that, every install script held back)`));
+    sayRun(`${install.join(" ")}`, `wrote the checked ${t.manifest} and ${t.lockfile}; installing exactly that, every install script held back`);
     const installed = await runCmd(install, { cwd: layout.root, env: pmEnv(registry, scopes), stdoutToStderr: jsonMode });
 
     if (installed.code !== 0) {
@@ -1275,7 +1367,8 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
 
     if (input.ignoreScripts) {
       removeTemp(backup.dir);
-      say(dim(`apm: node_modules is the checked ${t.lockfile}; no install script ran (--ignore-scripts)`));
+      say(`${green("✓")} ${dim(`node_modules is the checked ${t.lockfile}; no install script ran (--ignore-scripts)`)}`);
+      sayAdded({ results, check });
       emitJson({ ok: true, det, results, installed: reportOf(check, { touched: true, stage: "done" }) });
 
       return 0;
@@ -1283,7 +1376,7 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
 
     stage = "scripts";
     scripts = "maybe";
-    say(dim(`apm: node_modules is the checked ${t.lockfile}; running install scripts`));
+    say(`${green("✓")} ${dim(`node_modules is the checked ${t.lockfile}; running install scripts`)}`);
     // bun installs packages again to run their scripts: what node_modules held just before is the baseline the second
     // check holds it to, so nothing new beside it passes as left from before (review of 2b7767f, finding 6)
     const beforeRelease = pm === "bun" ? installedPackages(layout.root, memberDirs).found : [];
@@ -1308,6 +1401,7 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
     const own = ownInstallScripts(join(layout.root, layout.member));
 
     if (own.length > 0 && !released.reinstalled) say(dim(`apm: your package.json's own ${own.join(", ")} script${own.length === 1 ? "" : "s"} did not run; run ${own.map((s) => `${pm} run ${s}`).join(" and ")} if you need ${own.length === 1 ? "it" : "them"}`));
+    sayAdded({ results, check });
     emitJson({ ok: true, det, results, installed: reportOf(check, { touched: true, stage: "done" }) });
 
     return 0;
@@ -1375,7 +1469,7 @@ async function addWithBerry(input: YarnInput & { copy: Copy }): Promise<BerryOut
   const t = targets(layout);
   const cmd = lockOnlyArgs("yarn", results.map((r) => `${r.name}@${r.version}`), { dev: has(a, "dev") });
 
-  say(dim(`→ ${cmd.join(" ")}  (in a copy of your project, which installs nothing)`));
+  sayRun(`${cmd.join(" ")}`, `in a copy of your project, which installs nothing`);
   const run = await runCmd(cmd, { cwd: join(copy.dir, layout.member), env: pmEnv(registry, scopes), stdoutToStderr: true });
 
   if (run.code !== 0) return { kind: "fallback", why: `yarn could not compute the lockfile (exit ${run.code})` };
@@ -1458,6 +1552,7 @@ async function addWithBerry(input: YarnInput & { copy: Copy }): Promise<BerryOut
   }
 
   removeTemp(backup.dir);
+  sayAdded({ results, check });
   emitJson({ ok: true, det, results, installed: reportOf(check, { touched: true, stage: "done" }) });
 
   return { kind: "done", code: 0 };
@@ -1495,7 +1590,7 @@ async function addWithYarn(input: YarnInput): Promise<number> {
   warn(yellow(`apm: ${why}, so apm cannot check this add before yarn installs it and runs its install scripts. apm checks node_modules afterwards.`));
   const cmd = [...addArgs("yarn", pinned, { dev: has(a, "dev"), ignoreScripts: false })];
 
-  say(dim(`→ ${cmd.join(" ")}  (${det.why})`));
+  sayRun(`${cmd.join(" ")}`, `${det.why}`);
   const run = await runCmd(cmd, { cwd: join(layout.root, layout.member), env: pmEnv(registry, scopes), stdoutToStderr: jsonMode });
 
   if (run.code !== 0) {
@@ -1516,6 +1611,7 @@ async function addWithYarn(input: YarnInput): Promise<number> {
     return 1;
   }
 
+  sayAdded({ results, check });
   emitJson({ ok: true, det, results, installed: reportOf(check, { source: "node_modules", touched: true, stage: "done" }) });
 
   return 0;
@@ -1643,7 +1739,7 @@ async function installWithoutScripts(input: { cwd: string; det: Detection & { pm
 
   const install = frozenInstallArgs(pm, { keepNodeModules: existsSync(join(layout.root, "node_modules")) });
 
-  say(dim(`→ ${install.join(" ")}  (the ${t.lockfile} ${pm} computed, registry versions only; no install script runs)`));
+  sayRun(`${install.join(" ")}`, `the ${t.lockfile} ${pm} computed, registry versions only; no install script runs`);
   const code = (await runCmd(install, { cwd: layout.root, env: environment, stdoutToStderr: jsonMode })).code;
   const after = existsSync(join(layout.root, t.lockfile)) ? new Uint8Array(readFileSync(join(layout.root, t.lockfile))) : null;
 
@@ -1848,7 +1944,8 @@ async function checkedRemoval(input: { cwd: string; det: Detection & { pm: LockP
     if (copyConfig !== null) return refuse(pnpmConfigRefused(copyConfig));
     const cmd = [...installLockOnlyArgs(pm), ...(pm === "npm" ? ["--package-lock=true"] : pm === "pnpm" ? ["--no-frozen-lockfile", "--config.lockfile=true", "--config.ignore-pnpmfile=true"] : [])];
 
-    say(dim(`apm: removing ${names.join(", ")}; → ${cmd.join(" ")}  (${pm}: ${det.why}; in a copy of your project, which installs nothing into your project)`));
+    say(dim(`apm: removing ${names.join(", ")}`));
+    sayRun(cmd.join(" "), `${pm}: ${det.why}; in a copy of your project, which installs nothing into your project`);
     // bun 1.2 unpacks packages into its cache while it computes a lockfile, so the copy gets a cache of its own, deleted with it
     const run = await runCmd(cmd, { cwd: join(copy.dir, layout.member), env: pm === "bun" ? { ...environment, BUN_INSTALL_CACHE_DIR: join(copy.dir, ".apm-bun-cache") } : environment, stdoutToStderr: true });
 
@@ -1898,7 +1995,7 @@ async function checkedRemoval(input: { cwd: string; det: Detection & { pm: LockP
   // no install script runs: a removal adds nothing, and what it lays out again is what the lockfile already pins
   const native = pm === "npm" ? ["npm", "uninstall", "--package-lock=true", "--ignore-scripts", ...names] : pm === "pnpm" ? ["pnpm", "remove", "--config.lockfile=true", "--config.ignore-pnpmfile=true", "--config.ignore-scripts=true", ...names] : ["bun", "remove", "--ignore-scripts", ...names];
 
-  say(dim(`→ ${native.join(" ")}  (it takes out only packages ${t.lockfile} has)`));
+  sayRun(`${native.join(" ")}`, `it takes out only packages ${t.lockfile} has`);
   const code = (await runCmd(native, { cwd: join(layout.root, layout.member), env: environment, stdoutToStderr: jsonMode })).code;
 
   if (code !== 0) return code;
@@ -1912,6 +2009,9 @@ async function checkedRemoval(input: { cwd: string; det: Detection & { pm: LockP
 
     return 1;
   }
+
+  say();
+  say(`${green("✓")} ${bold(`removed ${names.join(", ")}`)}  ${dim(`${t.lockfile} is the one apm checked; nothing new was installed`)}`);
 
   return 0;
 }
@@ -2073,7 +2173,7 @@ async function cmdAdd(a: Args): Promise<number> {
 
   if (blocked.length > 0) {
     say();
-    for (const b of blocked) say(red(`refused: ${b.blocked ?? `${b.name}: nothing to install`}`));
+    for (const b of blocked) say(`${red("✗")} ${red(`refused: ${b.blocked ?? `${b.name}: nothing to install`}`)}`);
     refusalAdvice(blocked, "add", strict);
     emitJson({ ok: false, det, results });
 
@@ -2193,7 +2293,7 @@ async function cmdX(a: Args): Promise<number> {
     writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "apm-x", version: "0.0.0", private: true }));
     const compute = [...lockOnlyArgs(xpm, [`${r.name}@${r.version}`], { dev: false }), ...registryArgs(xpm, cfg.registry, treeScope)];
 
-    say(dim(`→ ${compute.join(" ")}  (in a directory of its own, which installs nothing)`));
+    sayRun(`${compute.join(" ")}`, `in a directory of its own, which installs nothing`);
     const computed = await runCmd(compute, { cwd: dir, env: pmEnv(cfg.registry, treeScope), stdoutToStderr: true });
 
     if (computed.code !== 0) {
@@ -2228,7 +2328,7 @@ async function cmdX(a: Args): Promise<number> {
 
     const install = [...frozenInstallArgs(xpm, { keepNodeModules: false }), ...registryArgs(xpm, cfg.registry, scopes)];
 
-    say(dim(`→ ${install.join(" ")}  (the checked lockfile, every install script held back)`));
+    sayRun(`${install.join(" ")}`, `the checked lockfile, every install script held back`);
     const installed = await runCmd(install, { cwd: dir, env: pmEnv(cfg.registry, scopes), stdoutToStderr: true });
 
     if (installed.code !== 0) {
@@ -3331,8 +3431,10 @@ const ownsJson = JSON_COMMANDS.has(args.cmd) && !((args.cmd === "install" || arg
 jsonMode = has(args, "json");
 
 if (help !== null) {
-  // help goes to stdout with or without --json, and nothing else runs
-  process.stdout.write(`${help}\n`);
+  // help goes to stdout with or without --json, and nothing else runs; a terminal gets its commands in bold, wrapped
+  const laid = columnsOf(process.stdout) === null ? help : reflow(help);
+
+  process.stdout.write(`${fit(useColor ? laid.replace(/^( {2}apm [^\n]*?)(?= {2,}|$)/gm, (c) => bold(c)).replace(/^(usage:|Flags:|Registry:)/gm, (h) => bold(h)) : laid, process.stdout, "wrap")}\n`);
 } else {
   try {
     process.exitCode = await main(args);
