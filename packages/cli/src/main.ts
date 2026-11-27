@@ -48,6 +48,9 @@ const bold = paint("1");
 /** When apm started, for the time an add took. */
 const STARTED = performance.now();
 
+/** The notices the checks of what was installed printed (a package not read, one left from before, a script not run), for the add's closing line. */
+let laterNotices = 0;
+
 let jsonMode = false;
 let jsonDone = false;
 let lastError: string | null = null;
@@ -1007,7 +1010,7 @@ function sayAdded(input: { results: readonly Resolved[]; check: LockCheck }): vo
     return n + (r.explained === null ? 0 : 1) + (lookalikeOf(r.report) === null ? 0 : 1) + own.length;
   }, 0);
 
-  const warnings = keys.size + notices;
+  const warnings = keys.size + notices + laterNotices;
   const seconds = ((performance.now() - STARTED) / 1000).toFixed(1);
 
   say();
@@ -1039,6 +1042,8 @@ type Held = { kind: "refused" } | { kind: "held"; fresh: Placed[]; installed: { 
 async function checkInstall(input: { api: Api; pm: LockPm; root: string; lockfile: string; checked: Uint8Array; nodes: readonly LockNode[]; importers: readonly LockImporter[]; members: readonly Member[]; before: readonly Found[]; omitted: Omitted; strict: boolean; refuse: (line: string) => void }): Promise<Held> {
   const { pm, strict, refuse } = input;
   const verified = verifyInstall({ pm, root: input.root, lockfile: input.lockfile, checked: input.checked, nodes: input.nodes, importers: input.importers, members: input.members, before: input.before, omitted: input.omitted });
+
+  laterNotices += verified.unreadable.length + verified.extraneous.length;
 
   for (const u of verified.unreadable.slice(0, 5)) say(`  ${yellow("!")} not read: ${u.id} (${u.reason})`);
 
@@ -1078,6 +1083,8 @@ async function checkInstall(input: { api: Api; pm: LockPm; root: string; lockfil
     for (const b of verdict.blocked) refuse(`${idOf(b)}, bundled in ${under.get(idOf(b)) ?? "a checked package"}: ${b.reason}`);
 
     if (verdict.blocked.length > 0) return { kind: "refused" };
+
+    laterNotices += verdict.warnings.length;
 
     for (const w of verdict.warnings) say(`  ${yellow("!")} ${idOf(w)}: ${w.text}`);
 
@@ -1196,7 +1203,8 @@ function afterApplyFailure(input: { layout: Layout; backup: Backup; pm: Pm; scri
   say("To put your project back as it was before apm add, run:");
 
   for (const c of commands) sayCommand({ command: c, first: "  " });
-  say(dim(`(or, with git: git checkout -- ${t.manifest} ${t.lockfile}, then ${reinstall})`));
+  say(dim("Or, with git:"));
+  sayCommand({ command: `git checkout -- ${t.manifest} ${t.lockfile} && ${reinstall}`, first: "  ", paint: dim });
 
   return commands;
 }
@@ -1421,6 +1429,8 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
     const beforeRelease = pm === "bun" ? installedPackages(layout.root, memberDirs).found : [];
     const released = await releaseScripts({ pm, root: layout.root, members: memberDirs, fresh: held.fresh, installed: held.installed, registry, scopes, group, quiet: false });
 
+    laterNotices += released.notRun.length;
+
     for (const line of released.notRun) say(`  ${yellow("!")} not run: ${line}`);
 
     if (released.code !== 0) {
@@ -1640,11 +1650,14 @@ async function addWithYarn(input: YarnInput): Promise<number> {
 
   const after = nodeModulesGraph(installedPackages(layout.root));
 
+  laterNotices += after.unreadable.length;
+
   for (const u of after.unreadable.slice(0, 5)) say(`  ${yellow("!")} not read: ${u.id} (${u.reason})`);
   const check = await checkLock({ api, graph: after.graph, strict: false, results, headline: "in node_modules after yarn installed them and ran their install scripts", policy: checkPolicy(a, results) });
 
   if (check.blocked.length > 0) {
-    say(`yarn installed these and ran their install scripts before apm could check them. To take this add back: git checkout -- ${t.manifest} ${t.lockfile} && yarn install`);
+    say("yarn installed these and ran their install scripts before apm could check them. To take this add back, run:");
+    sayCommand({ command: `git checkout -- ${t.manifest} ${t.lockfile} && yarn install`, first: "  " });
     emitJson({ ok: false, det, results, error: lastError, installed: reportOf(check, { source: "node_modules", touched: true, stage: "done" }) });
 
     return 1;
