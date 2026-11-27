@@ -280,8 +280,13 @@ const pageLookup = (name: string, lease: Lease, need: PageNeed) =>
     if (!upstream) return null;
     const probe = yield* pageProbe({ upstream, name, need, lease, first: { kind: "read", kept: row.kept, analyses: row.analyses, whole: row.whole } });
 
+    if (probe.kind === "unknown") return "unknown" as const;
+
     return probe.kind === "found" ? { src: upstreamSource(probe.pkg), maintainers: probe.pkg.maintainers } : null;
   });
+
+/** What a page route answers when pageLookup is "unknown": npm did not answer, or the package did not fit the request. */
+const PAGE_UNKNOWN = "apm could not read this package in time. Try again shortly.";
 
 /** Upstream.probe's wanted for a reader of no score: whether npm has the package, and its versions. */
 const NO_SCORES: Wanted = () => new Map();
@@ -1464,6 +1469,8 @@ const packageResponse = (name: string) =>
     const lease = yield* RequestMemory;
     const found = yield* pageLookup(name, lease, { kind: "page" });
 
+    if (found === "unknown") return fail(503, PAGE_UNKNOWN);
+
     if (!found) return fail(404, "Not found");
     const { src, maintainers } = found;
 
@@ -1563,7 +1570,10 @@ const packageExists = (path: string) =>
 const versionResponse = (name: string, version: string) =>
   Effect.gen(function* () {
     const at = yield* now;
-    const src = (yield* pageLookup(name, yield* RequestMemory, { kind: "version", version }))?.src;
+    const found = yield* pageLookup(name, yield* RequestMemory, { kind: "version", version });
+
+    if (found === "unknown") return fail(503, PAGE_UNKNOWN);
+    const src = found?.src;
 
     if (!src) return fail(404, "Not found");
     const v0 = src.versions.find((x) => x.version === version);
@@ -1633,7 +1643,10 @@ type WorkedOut =
   // `waiting`: the latest version, when the current scorer has no result for it yet (the queue may score it); `seeds`:
   // the other versions a dist-tag names or published recently with no result yet (analysis.ts, versionsToSeed)
   | { kind: "upstream"; score: LatestScore; waiting: string | null; seeds: string[] }
-  | { kind: "unavailable" };
+  // npm did not answer
+  | { kind: "unavailable" }
+  // npm answered, but the package or its scores did not fit the request: what is kept may be out of date
+  | { kind: "omitted" };
 
 /**
  * Popular latest versions one sweep queues for the current scorer (refreshLatestScores): the home page's dozen, after a
@@ -1671,8 +1684,10 @@ const workOutLatestScore = (name: string, known: boolean) =>
       if (!local && !known && !(yield* store.upstreamScored(name))) return { kind: "unanalysed", score: none } satisfies WorkedOut;
       const src = yield* lookupWithin(name, lease, latestWanted(at));
 
-      // its scores did not fit: not one with no score
-      if (src === "unknown" || src === "over-budget" || src?.kind === "unread") return { kind: "unavailable" } satisfies WorkedOut;
+      if (src === "unknown") return { kind: "unavailable" } satisfies WorkedOut;
+
+      // its scores did not fit: not one with no score, nor one npm could not be asked about
+      if (src === "over-budget" || src?.kind === "unread") return { kind: "omitted" } satisfies WorkedOut;
       const latest = src ? src.versions.find((v) => v.version === src.distTags.latest) : undefined;
       // an upstream version carries its stored analysis already (upstream.get reads them); none means not scored yet
       const r = latest ? reportFor(latest, at) : null;
@@ -1726,6 +1741,9 @@ const popularScoresResponse = (url: URL) =>
 
             case "unavailable":
               return Effect.succeed(hit?.score ?? { name, version: null, score: null, grade: null });
+            // an expired kept score is not sent as the current one when npm answered and only the read did not fit
+            case "omitted":
+              return Effect.succeed({ name, version: null, score: null, grade: null });
             default: {
               const _exhaustive: never = w;
 
@@ -1815,6 +1833,7 @@ export const refreshLatestScores = Effect.gen(function* () {
             }
 
             case "unavailable":
+            case "omitted":
               return Effect.succeed(0);
             default: {
               const _exhaustive: never = w;
@@ -2873,9 +2892,13 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
 
       if (picked.kind === "unread") {
         // its score did not fit the request: unchecked, never pending or clean. It stays listed, so the OSSF feed and
-        // apm's reviewers still decide on it, and what it installs is walked
+        // apm's reviewers still decide on it, and what it installs is walked. Its age needs no score: a fresh one still
+        // warns of the cooldown
         miss(dep, picked.reason, item.via);
         limited = true;
+        const fresh = cooldownWarning({ name: dep.name, version: picked.v.version, ageMs: at - picked.v.published_at, cooldownMs: policy.cooldownMs, url: versionUrl(webUrl, dep.name, picked.v.version), via: item.via });
+
+        if (fresh) warnings.push(fresh);
         children.set(key, installedChildren(picked.v.manifest));
 
         for (const e of installEdges(picked.v.manifest)) queue.push({ dep: e.spec, edge: e.edge, via: [...item.via, key], installedAs: [...item.installedAs, dep.key], level: item.level + 1 });
@@ -4562,7 +4585,10 @@ export const apmRoute = (req: Request, url: URL, caller: Caller) =>
       const sp = splitPath(`/${rest.slice("score/".length)}`);
 
       if (!sp) return fail(404, "Not found");
-      const src = (yield* pageLookup(sp.name, yield* RequestMemory, { kind: "history", spec: sp.rest[0] }))?.src;
+      const found = yield* pageLookup(sp.name, yield* RequestMemory, { kind: "history", spec: sp.rest[0] });
+
+      if (found === "unknown") return fail(503, PAGE_UNKNOWN);
+      const src = found?.src;
 
       if (!src) return fail(404, "Not found");
       const spec = sp.rest[0];

@@ -1474,6 +1474,62 @@ describe("what needs no score is checked of a version whose analysis does not fi
     return Effect.runPromise(program.pipe(Effect.provide(rigLayers(input)), Effect.scoped));
   }
 
+  /** apmRoute's answer to an anonymous GET of `path`, with rigLayers. */
+  async function apmGet(input: { url: string; npm: string; path: string; store?: (s: StoreApi) => StoreApi }) {
+    const auth = Auth.layer({ databaseUrl: input.url, options: { secret: "test-secret-that-is-long-enough-for-better-auth" }, baseURL: "http://web.test/" });
+    const req = new Request(`http://registry.test${input.path}`);
+    const program = Effect.flatMap(apmRoute(req, new URL(req.url), { kind: "anon" }), (res) => Effect.promise(async () => ({ status: res?.status ?? 0, text: (await res?.text()) ?? "" })));
+
+    return Effect.runPromise(program.pipe(Effect.provide(Layer.provideMerge(auth, rigLayers(input))), Effect.scoped));
+  }
+
+  // Review of dd7a461. Finding 1: an unread dependency was let go before its age was checked, so a fresh one lost the
+  // cooldown warning. Finding 2: popular-scores sent an expired kept score as current when only the read did not fit.
+  // Finding 3: the version and score answers were a 404 for a version npm lists when its analysis did not fit
+  test("a fresh dependency whose analysis does not fit still warns of the cooldown", () =>
+    withRig(async ({ url, npm, sql }) => {
+      for (const [n, v] of [["app", "1.0.0"], ["dep", "1.0.0"], ["risky", "1.0.0"]] as const) await scored(sql, n, v);
+      npm.times.set("dep@1.0.0", NOW - MINUTE);
+
+      for (const store of [undefined, capped(0, "app")]) {
+        const r = await resolve({ url, npm: npm.url, name: "app", store });
+
+        expect(r.body.warnings?.filter((w) => w.name === "dep").map((w) => w.kind)).toContain("cooldown");
+      }
+
+      // and the capped resolve did leave dep unread
+      expect((await resolve({ url, npm: npm.url, name: "app", store: capped(0, "app") })).text).toContain(OVER_BUDGET_TEXT);
+    }));
+
+  test("popular-scores does not send an expired kept score as current when the analysis does not fit", () =>
+    withRig(async ({ url, npm, sql }) => {
+      await scored(sql, "dep", "2.0.0");
+      const stale = { name: "dep", version: "2.0.0", score: 37, grade: "F" };
+
+      await Effect.runPromise(Effect.flatMap(Store, (s) => s.keepLatestScore({ score: stale, at: NOW - 30 * DAY, capacity: 100 })).pipe(Effect.provide(Store.postgres(url)), Effect.scoped));
+      const Scores = z.object({ packages: z.array(z.object({ name: z.string(), score: z.number().nullable() })) }).loose();
+      const ask = async (store?: (s: StoreApi) => StoreApi) => Scores.parse(JSON.parse((await apmGet({ url, npm: npm.url, path: "/-/apm/v1/popular-scores?names=dep", store })).text)).packages[0];
+
+      expect((await ask(capped(0)))?.score).toBeNull();
+      const current = await ask();
+
+      expect(current?.score).not.toBeNull();
+      expect(current?.score).not.toBe(37);
+    }));
+
+  test("the version and score answers are a retryable 503, not a 404, when the version's analysis does not fit", () =>
+    withRig(async ({ url, npm, sql }) => {
+      await scored(sql, "dep", "1.0.0");
+
+      for (const path of ["/-/apm/v1/packages/dep/versions/1.0.0", "/-/apm/v1/score/dep/1.0.0"]) {
+        expect((await apmGet({ url, npm: npm.url, path, store: capped(0) })).status).toBe(503);
+        expect((await apmGet({ url, npm: npm.url, path })).status).toBe(200);
+      }
+
+      // a version npm does not list is still a 404
+      expect((await apmGet({ url, npm: npm.url, path: "/-/apm/v1/packages/dep/versions/9.9.9" })).status).toBe(404);
+    }));
+
   test("a dependency the OSSF feed lists is refused in every mode, whether its analysis fit or not", () =>
     withRig(async ({ url, npm, sql }) => {
       for (const [n, v] of [["app", "1.0.0"], ["dep", "1.0.0"], ["risky", "1.0.0"]] as const) await scored(sql, n, v);
