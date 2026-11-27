@@ -1128,6 +1128,23 @@ function withoutInertNetFindings(cmd: string, shipsNetTool: boolean): ReturnType
  * Signals from the lifecycle scripts: what runs at install, at a git install, and on the publisher's machine. Returns
  * the evidence it cited from commands that run at install, so the risk signals can tell install-time use apart.
  */
+/**
+ * Whether the archive's own package.json was read whole and holds the scripts and bins `manifest` does, so what the
+ * hooks are read from is what npm installs.
+ */
+function archiveManifestMatches(pj: TarEntry | undefined, notHeld: ReadonlySet<TarEntry>, manifest: AnalyzeInput["manifest"]): boolean {
+  if (pj === undefined || notHeld.has(pj) || pj.data.length !== pj.size) return false;
+  const pick = (m: Record<string, unknown>): string => JSON.stringify([m.scripts, m.bin, m.directories]);
+
+  try {
+    const archive: unknown = JSON.parse(new TextDecoder().decode(pj.data));
+
+    return isRecord(archive) && pick(archive) === pick(manifest);
+  } catch {
+    return false;
+  }
+}
+
 // a lifecycle step npm may run on an install from the registry or from git, or its pre or post script
 const LIFECYCLE_STEP = /^(?:pre|post)?(?:install|preinstall|postinstall|prepare|prepack|postpack|prepublish|prepublishOnly|publish|dependencies)$/;
 
@@ -1866,7 +1883,7 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   // a root file named like curl or wget, a binding.gyp, whose build npm may run at install, or a bin of the package's
   // own, which npm links onto the PATH before its install scripts run, keeps the reading
   const ownBins = manifest.bin !== undefined || (isRecord(manifest.directories) && manifest.directories.bin !== undefined);
-  const hookEvidence = analyzeHooks(found, manifest, hooks, ownBins || files.some((f) => /^(?:curl|wget)(?:\.[^/]*)?$/i.test(f.path) || /^binding\.gyp$/i.test(f.path)));
+  const hookEvidence = analyzeHooks(found, manifest, hooks, ownBins || !archiveManifestMatches(byPath.get("package.json"), notHeld, manifest) || files.some((f) => /^(?:curl|wget)(?:\.[^/]*)?$/i.test(f.path) || /^binding\.gyp$/i.test(f.path)));
 
   // what runs on the installing machine: install hooks, and the git hooks npm runs when it installs from git
   // every hook's commands before what only the shell reading adds to any of them (HookCommand.added)

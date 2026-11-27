@@ -91,6 +91,16 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
     }
   });
 
+  test("a hook read only from registry metadata keeps the reading", () => {
+    const m: AnalyzeInput["manifest"] = { name: "probe-pkg", version: "1.0.0", license: "MIT", scripts: { postinstall: "curl --version" } };
+    const data = new TextEncoder().encode(JSON.stringify(m));
+    const pj = { path: "package.json", size: data.length, mode: 0o644, data };
+    const unread = analyze({ name: "probe-pkg", manifest: m, files: [pj], publisher: "a", previousPublishers: [], notHeld: new Set([pj]) });
+    const other = analyze({ name: "probe-pkg", manifest: m, files: [{ ...pj, data: new TextEncoder().encode(JSON.stringify({ ...m, scripts: { postinstall: "node x.js" } })) }], publisher: "a", previousPublishers: [] });
+
+    for (const a of [unread, other]) expect(finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null }).signals.map((s) => s.id)).toContain("install-download");
+  });
+
   test("a package with bins of its own keeps the reading, since npm puts them on the PATH first", () => {
     for (const bin of [{ curl: "marker.js" }, "marker.js"]) {
       const m: AnalyzeInput["manifest"] = { name: "curl", version: "1.0.0", license: "MIT", bin, scripts: { postinstall: "curl --version" } };
