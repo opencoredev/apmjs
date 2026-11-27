@@ -3,8 +3,8 @@
 import { describe, expect, test } from "bun:test";
 import { analyze, finalize, isInlineDownload, Meter, type Analysis, type AnalyzeInput } from "../src/index.ts";
 
-function scoreOf(scripts: Record<string, string>) {
-  const m: AnalyzeInput["manifest"] = { name: "probe-pkg", version: "1.0.0", license: "MIT", scripts };
+function scoreOf(scripts: Record<string, string>, extra: Partial<AnalyzeInput["manifest"]> = {}) {
+  const m: AnalyzeInput["manifest"] = { name: "probe-pkg", version: "1.0.0", license: "MIT", scripts, ...extra };
   const data = new TextEncoder().encode(JSON.stringify(m));
   const a: Analysis = analyze({ name: "probe-pkg", manifest: m, files: [{ path: "package.json", size: data.length, mode: 0o644, data }], publisher: "a", previousPublishers: [] });
   const r = finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null });
@@ -131,6 +131,7 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
     expect(scoreOf({ prepare: "echo 'curl is optional'" }).ids).toContain("install-download");
 
     expect(scoreOf({ preinstall: "\u00a0", postinstall: "curl --version" }).ids).toContain("install-download");
+    for (const deps of ["dependencies", "optionalDependencies", "peerDependencies"]) expect(scoreOf({ postinstall: "curl --version" }, { [deps]: { "probe-tool": "1.0.0" } }).ids).toContain("install-download");
     expect(scoreOf({ preinstall: "", postinstall: "curl --version" }).ids).not.toContain("install-download");
 
     const befores: Record<string, string>[] = [{ prepublish: "node make-marker.js" }, { preprepare: "node make-marker.js" }];
