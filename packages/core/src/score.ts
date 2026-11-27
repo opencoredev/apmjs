@@ -10,7 +10,7 @@ import { boundedManifest, MANIFEST_LIMITS, measureManifest } from "./manifest.ts
 import { MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { charge, chargeText, inPhase, MAX_ANALYSIS_WORK, Meter, MeterExhausted, PHASE_NAMES, withMeter, type Phase } from "./meter.ts";
 import { isEstablishedName, typoConflicts, type NameHistory } from "./names.ts";
-import { commandWords, commandWordsWithin, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook, type HookKind, type ShellWords } from "./scripts.ts";
+import { commandWords, commandWordsWithin, expandHooks, gypCommands, isInlineDownload, otherScripts, shellOperands, type ExpandedHook, type HookKind, type ShellWords } from "./scripts.ts";
 import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type Lang, type ExecutedCode, type FlowFinding, type Hidden, type Imports, type TextFinding } from "./source.ts";
 import { scanTextRules } from "./textrules.ts";
 import { keptBytes, MAX_KEPT_VIEW_BYTES, scanBinaryImports, scanBinaryText, type BinaryTextScan } from "./binary-text.ts";
@@ -1522,6 +1522,16 @@ export function planLayers(input: { manifest: AnalyzeInput["manifest"]; files: r
   for (const p of all) if (!baseline.has(p)) queueX.push(p);
   walk();
 
+  // with what that plan left of the budget, a file the first walk passed over as one nothing ran is held now that only
+  // the shell reading runs it
+  for (const p of all) {
+    if (baseline.has(p) || held.has(p) || extra.has(p) || !seenX.has(p)) continue;
+    seenX.delete(p);
+    queueX.push(p);
+  }
+
+  walk();
+
   return { production: held, extra };
 }
 
@@ -2595,7 +2605,33 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   // meter of its own, with the scoring of what it adds: running it out stops only this reading, never one before it
   try {
     withMeter(new Meter(MAX_ADDED_TARGET_WORK), () => {
-      for (const p of later) if (!seen.has(p)) reach(p);
+      // of those, the scripts a shell runs as its operand (`sh ./setup.sh`), read over the words the shell hands it, not
+      // every word that names a file
+      const laterRun = new Set<string>();
+
+      for (const c of installCommands) {
+        if (!c.added) continue;
+
+        for (const w of shellOperands(c.text)) {
+          const f = resolveIn(byPath, w);
+
+          if (f && f.path !== "package.json") laterRun.add(f.path);
+        }
+      }
+
+      for (const p of later) {
+        const f = byPath.get(p);
+
+        if (!seen.has(p)) reach(p);
+        else if (f !== undefined && laterRun.has(p) && readWhole.has(f) && !installTargets.has(p)) {
+          // production's walk read its whole text, but not as what an install hook runs: its install-time check is made here
+          chargeText("text", f.data.length, 2);
+          const text = new TextDecoder().decode(f.data);
+
+          if (isShellScript(f, text) && isInlineDownload(text)) add("install-download", `${f.path}: run by an install script and downloads code`);
+        }
+      }
+
       readExtra();
       charge("score", scoringUnits() - baselineUnits);
     });

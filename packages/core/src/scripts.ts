@@ -280,14 +280,14 @@ const COMMAND_END = new Set([";", "&", "|", "(", ")", "`", "\n"]);
 
 /**
  * The words of `cmd` as the shell hands them over, quotes and escapes removed (`'-s'`, `\\-s` and `""-s` are all
- * `-s`, `'a b'` is one word), each with where it ends in `cmd` and whether an unquoted `*` makes it a glob, and `null`
+ * `-s`, `'a b'` is one word), each with where it ends in `cmd`, whether an unquoted `*` makes it a glob, whether an unquoted `?` or `[` does (`pattern`), whether any of it is quoted or escaped (`quoted`), and `null`
  * where a command ends: `;`, `&`, `|`, a newline or a group's parenthesis. A command substitution (`$(` or a backtick)
  * is `"("`, its own commands, then `")"`, and the word around it goes on after it; `expanded` marks a word whose text
  * the shell builds from a substitution or a variable, which is not the word as written. A comment is skipped. Nesting past
  * MAX_SHELL_NESTING ends the reading with `"cut"`, the command it is in unfinished. One pass; a quote left open runs to
  * the end of `cmd`.
  */
-export type ShellToken = { word: string; end: number; glob: boolean; expanded: boolean } | null | "(" | ")" | "cut";
+export type ShellToken = { word: string; end: number; glob: boolean; pattern: boolean; quoted: boolean; expanded: boolean } | null | "(" | ")" | "cut";
 
 
 /** The deepest nesting of quotes, substitutions and groups the shell words are read through. */
@@ -296,6 +296,7 @@ const MAX_SHELL_NESTING = 64;
 export function* shellWords(cmd: string): Generator<ShellToken> {
   let word: string | null = null;
   let glob = false;
+  let pattern = false;
   // the next word is a redirection's file (`> log`, `2>/dev/null`), which the command is not handed
   let target = false;
   // the word being read has a quoted or escaped character, so it is never a redirection's descriptor
@@ -304,13 +305,14 @@ export function* shellWords(cmd: string): Generator<ShellToken> {
   // what closes each context the reading is in: `"` a double-quoted string, `)` or a backtick a command substitution, `G`
   // a group, and the word each substitution interrupts
   const open: string[] = [];
-  const around: { word: string | null; glob: boolean; quoted: boolean; target: boolean; expanded: boolean }[] = [];
+  const around: { word: string | null; glob: boolean; pattern: boolean; quoted: boolean; target: boolean; expanded: boolean }[] = [];
   let expanded = false;
 
   const enter = (c: string): "(" => {
-    around.push({ word, glob, quoted, target, expanded });
+    around.push({ word, glob, pattern, quoted, target, expanded });
     word = null;
     glob = false;
+    pattern = false;
     quoted = false;
     target = false;
     expanded = false;
@@ -321,19 +323,20 @@ export function* shellWords(cmd: string): Generator<ShellToken> {
 
   const leave = (): ")" => {
     open.pop();
-    ({ word, glob, quoted, target } = around.pop() ?? { word: null, glob: false, quoted: false, target: false, expanded: false });
+    ({ word, glob, pattern, quoted, target } = around.pop() ?? { word: null, glob: false, pattern: false, quoted: false, target: false, expanded: false });
     word ??= "";
     expanded = true;
 
     return ")";
   };
 
-  const flush = function* (): Generator<{ word: string; end: number; glob: boolean; expanded: boolean }> {
-    if (word !== null && !target) yield { word, end: i, glob, expanded };
+  const flush = function* (): Generator<{ word: string; end: number; glob: boolean; pattern: boolean; quoted: boolean; expanded: boolean }> {
+    if (word !== null && !target) yield { word, end: i, glob, pattern, quoted, expanded };
 
     if (word !== null) target = false;
     word = null;
     glob = false;
+    pattern = false;
     quoted = false;
     expanded = false;
   };
@@ -413,6 +416,7 @@ export function* shellWords(cmd: string): Generator<ShellToken> {
     } else if (/\s/.test(c)) yield* flush();
     else {
       glob ||= c === "*";
+      pattern ||= c === "?" || c === "[";
       expanded ||= c === "$";
       word = (word ?? "") + c;
     }
@@ -477,6 +481,46 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
 }
 
 type ShellWord = Exclude<ShellToken, null | "(" | ")" | "cut">;
+
+// a shell the hook runs a script file with
+const SHELL_PROGRAM = /^(?:sh|bash|dash|zsh)$/;
+
+/**
+ * The script files `cmd` hands a shell as its operand (`sh ./setup.sh`, `FOO=1 bash setup.sh`), read over the words the
+ * shell hands each simple command: the shell's name and its operand both as written, with no option between them, and
+ * nothing when the reading is cut. A word in quotes or a printed example (`printf 'sh ./x.sh'`) is an argument, not this.
+ */
+export function shellOperands(cmd: string): string[] {
+  chargeText("text", cmd.length, 2);
+  const out: string[] = [];
+  let words: ShellWord[] = [];
+
+  const take = (): void => {
+    let i = 0;
+
+    while (/^[A-Za-z_]\w*=/.test(words[i]?.word ?? "") && words[i]?.quoted === false) i++;
+    const program = words[i];
+    const operand = words[i + 1];
+
+    if (program === undefined || operand === undefined) return;
+
+    if ([program, operand].some((w) => w.expanded || w.glob || w.pattern) || !SHELL_PROGRAM.test(program.word) || operand.word.startsWith("-")) return;
+    out.push(operand.word);
+  };
+
+  for (const t of shellWords(cmd)) {
+    if (t === "cut") return [];
+
+    if (t === null || t === "(" || t === ")") {
+      take();
+      words = [];
+    } else words.push(t);
+  }
+
+  take();
+
+  return out;
+}
 
 // the most words one of those shapes has: npm, its options and their values, run, `--` and the name
 const MAX_RUN_WORDS = 16;

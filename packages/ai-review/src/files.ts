@@ -4,7 +4,7 @@
 // not seeing a file it worried about, so the order puts what runs first: install-script targets, then
 // Node entry points, then files where apm's rule-based signals fired, then whatever those entries reach
 // through relative imports, then browser entries, then the rest of the code by depth and size.
-import { analyze, expandHooks, MAX_ANALYSIS_WORK, measureManifest, Meter, MeterExhausted, metered, runTargets, shellWords, type TarEntry, findingsOf, wildcardMatch } from "@apm/core";
+import { analyze, expandHooks, MAX_ANALYSIS_WORK, measureManifest, Meter, MeterExhausted, metered, runTargets, shellWords, type TarEntry, findingsOf, shellGlobMatch, wildcardMatch } from "@apm/core";
 import { installScripts, type Manifest } from "./manifest.ts";
 
 const CODE = /\.(?:[cm]?jsx?|[cm]?tsx?|sh|bash|zsh|ps1|psm1|bat|cmd|py|vbs|php|rb|pl|vue|svelte|coffee)$/;
@@ -191,8 +191,11 @@ export function ruleSignalFiles(manifest: Manifest, files: readonly TarEntry[]):
   return out;
 }
 
-/** `reached`: an install hook names the file only as the shell reading reads its commands (readingOrder). */
-export type Tier = { tier: number; sub: number; reached: boolean };
+/**
+ * `reached`: an install hook names the file only as the shell reading reads its commands (readingOrder); `later`: only a
+ * `?` or bracket glob in one does.
+ */
+export type Tier = { tier: number; sub: number; reached: boolean; later: boolean };
 
 /** Ranks files for reading; lower is earlier. */
 export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f: TarEntry) => Tier {
@@ -241,6 +244,45 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
     reached.clear();
   }
 
+  // what `?` and bracket globs (`node ./pay?oad.txt`) expand to, in words with no quoting or expansion so each is the
+  // shell's: read after all of the above, with slots, a meter and a tier of their own, so they only take what it leaves.
+  // Nothing when a hook may turn pathname expansion off (`set -f`), and no pattern with a POSIX class (`[[:digit:]]`)
+  const later = new Set<string>();
+
+  try {
+    metered(new Meter(MAX_REACH_WORK), () => {
+      const patterns = new Map<string, { depth: number; prefix: string }>();
+
+      for (const h of measureManifest(scripts, { charged: false }).kind === "ok" ? expandHooks(scripts) : []) {
+        if (h.kind !== "install") continue;
+
+        for (const c of h.commands) {
+          for (const t of shellWords(c.text)) {
+            if (t === null || t === "(" || t === ")" || t === "cut") continue;
+
+            if (t.word === "set") return;
+            const w = stripDot(t.word);
+
+            if (t.pattern && !t.quoted && !t.expanded && !/\[[:=.]/.test(w) && patterns.size < MAX_GLOBS && w.length <= MAX_GLOB_CHARS) {
+              patterns.set(w, { depth: w.split("/").length, prefix: w.slice(0, w.search(/[*?[]/)) });
+            }
+          }
+        }
+      }
+
+      for (const f of patterns.size > 0 ? files : []) {
+        const depth = f.path.split("/").length;
+
+        for (const [pattern, g] of patterns) {
+          if (!reached.has(f.path) && depth === g.depth && f.path.startsWith(g.prefix) && shellGlobMatch(f.path, pattern)) later.add(f.path);
+        }
+      }
+    });
+  } catch (e) {
+    if (!(e instanceof MeterExhausted)) throw e;
+    later.clear();
+  }
+
   const nodeEntries = new Set([...manifest.main, ...manifest.bin, ...manifest.module, ...manifest.exports].map(resolved));
 
   // npm's default entry when `main` is absent
@@ -268,7 +310,7 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
     return { tier: 6, sub: p.split("/").length };
   };
 
-  return (f) => ({ ...tierOf(f), reached: reached.has(f.path) });
+  return (f) => ({ ...tierOf(f), reached: reached.has(f.path), later: later.has(f.path) });
 }
 
 /**
@@ -288,7 +330,9 @@ export function ordered(manifest: Manifest, all: readonly TarEntry[], pick: read
 
     if (isReviewable(f) || (r.tier <= 1 && kindOf(f) !== "binary")) return [{ f, r, p: prefer(f) ? 0 : 1 }];
 
-    return (r.tier <= 1 || r.reached || (CODE_ANY_CASE.test(f.path) && !NOT_CODE.test(f.path))) && !isMachineCode(f.data) ? [{ f, r: { ...r, tier: REACHED_TIER }, p: prefer(f) ? 0 : 1 }] : [];
+    const known = r.tier <= 1 || r.reached || (CODE_ANY_CASE.test(f.path) && !NOT_CODE.test(f.path));
+
+    return (known || r.later) && !isMachineCode(f.data) ? [{ f, r: { ...r, tier: known ? REACHED_TIER : REACHED_TIER + 1 }, p: prefer(f) ? 0 : 1 }] : [];
   });
 
   keyed.sort((a, b) => a.r.tier - b.r.tier || a.r.sub - b.r.sub || a.p - b.p || a.f.size - b.f.size || (a.f.path < b.f.path ? -1 : 1));
