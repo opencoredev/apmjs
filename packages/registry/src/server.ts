@@ -14,7 +14,7 @@ import { holdForEdges } from "./edge-checks.ts";
 import { Clock } from "./clock.ts";
 import { confirmedText, confirmedVersions } from "./confirmed.ts";
 import { RegistryConfig, type NamePolicy } from "./config.ts";
-import { Store, type PackageRecord, type StagedLoad, type StoredScope, type VersionRecord } from "./db.ts";
+import { Store, storableJson, type PackageRecord, type StagedLoad, type StoredScope, type VersionRecord } from "./db.ts";
 import { refuse, type BlobError, type HttpFailure, type InfraError, type StoreError } from "./errors.ts";
 import { randomId, sha1Hex, sha256Hex, sha512, tarballKey } from "./hash.ts";
 import { notify } from "./hooks.ts";
@@ -396,6 +396,15 @@ const handlePublish = (req: Request, name: string, caller: Caller, ext: Extensio
     if (perm) return fail(perm.status, perm.error);
 
     if (!body._attachments || Object.keys(body._attachments).length === 0) {
+      // each key is read from the database and written to the event log: one that is no version (a NUL in it, say) is
+      // refused here, as publish refuses it, before a factor is spent; it failed the read with a 500
+      const badKey = Object.keys(body.versions).find((v) => !isValidVersion(v));
+
+      if (badKey !== undefined) return fail(400, `Invalid version ${JSON.stringify(badKey)}: apm accepts strict semver only (1.2.3, 1.2.3-beta.1).`);
+
+      // a deprecation message Postgres cannot store failed the update with a 500
+      if (Object.values(body.versions).some((m) => !storableText(JSON.stringify(deprecationOf(m))))) return fail(422, `A deprecation message cannot hold ${UNSTORABLE}.`);
+
       // the versions and messages that would change are what a second factor authorizes; no change needs none
       const [first, ...rest] = yield* deprecationChanges(name, body);
 
@@ -475,6 +484,11 @@ const handlePublish = (req: Request, name: string, caller: Caller, ext: Extensio
 
     // the cap above read the request's manifest; this one reads the manifest apm stores and serves (the tarball's)
     if (utf8Bytes(JSON.stringify(cleanManifest)) > MAX_MANIFEST_BYTES) return fail(413, `package.json is over ${MAX_MANIFEST_BYTES / (1024 * 1024)} MB.`);
+
+    // JSON.parse accepts what Postgres refuses in jsonb and text: the insert failed and the publish answered 500
+    if (!storableText(JSON.stringify(cleanManifest))) return fail(422, `package.json holds ${UNSTORABLE}, which apm cannot store. Remove it and publish again.`);
+
+    if (readme !== null && !storableText(JSON.stringify(readme))) return fail(422, `The readme holds ${UNSTORABLE}, which apm cannot store. Remove it and publish again.`);
     const tag = Object.keys(body["dist-tags"])[0] ?? "latest";
     const shasum = sha1Hex(tarball);
     const digest = sha512(tarball);
@@ -772,6 +786,13 @@ function deprecationOf(manifest: { readonly deprecated?: unknown }): string | nu
   const dep = z.string().min(1).safeParse(manifest.deprecated);
 
   return dep.success ? dep.data : null;
+}
+
+const UNSTORABLE = "a NUL character or an unpaired surrogate";
+
+/** Whether Postgres can store this JSON text in jsonb or text: storableJson changes exactly what it cannot. */
+export function storableText(json: string): boolean {
+  return storableJson(json) === json;
 }
 
 /** What a metadata PUT (npm deprecate) would change: each existing version whose message differs. */

@@ -79,6 +79,7 @@ import {
   searchPaging,
   servedVersions,
   splitPath,
+  storableText,
   tagTarget,
   tarballUrl,
   tarballVersion,
@@ -1062,7 +1063,11 @@ const revokeVersion = (v: VersionRecord, actor: string, reason: string, opts: { 
     const fresh = at - v.published_at <= FRESH_MS;
     const dependents = yield* store.dependentsOf(v.package);
     const step = transition(v.status, { kind: "revoke", final: opts.forceFinal === true || fresh });
-    const status = step.kind === "move" ? step.to : "revoked";
+
+    // already revoke-pending (or revoked): nothing moves. An incident sweep reaches a pending version too, and taking
+    // every refusal as final skipped the 24 h window `apm revoke` gives an older version
+    if (step.kind !== "move") return v.status;
+    const status = step.to;
     const final = status === "revoked";
     yield* store.setStatus(v.package, v.version, { status, reason, at, by: actor });
     yield* store.deleteAdvisoriesFor(v.package, v.version);
@@ -1087,11 +1092,14 @@ const revokeVersion = (v: VersionRecord, actor: string, reason: string, opts: { 
     return status;
   });
 
+// every string here reaches a text or jsonb column (a status reason, an advisory, the event log, a confirmation's
+// action): one Postgres cannot store is refused with the body, not a 500 from the write, and before a factor is spent
+const Stored = z.string().refine((s) => storableText(JSON.stringify(s)), "must not hold a NUL character or an unpaired surrogate");
 const Password = z.string().min(1).optional();
 const Otp = z.string().min(1).optional();
-const StateBody = z.object({ name: z.string(), version: z.string(), reason: z.string().optional(), password: Password, otp: Otp });
-const IncidentBody = z.object({ since: z.string(), reason: z.string().optional(), password: Password, otp: Otp, dryRun: z.boolean().optional() });
-const OwnerBody = z.object({ name: z.string(), user: z.string(), password: Password, otp: Otp });
+const StateBody = z.object({ name: Stored, version: Stored, reason: Stored.optional(), password: Password, otp: Otp });
+const IncidentBody = z.object({ since: Stored, reason: Stored.optional(), password: Password, otp: Otp, dryRun: z.boolean().optional() });
+const OwnerBody = z.object({ name: Stored, user: Stored, password: Password, otp: Otp });
 
 /** Destructive actions need a fresh second factor for this exact action on top of the bearer token (a password only in legacy mode). */
 const reauth = (caller: Caller, proof: { password?: string | undefined; otp?: string | undefined }, action: LiveAction) =>
@@ -1236,7 +1244,8 @@ const handleIncident = (req: Request, caller: Caller) =>
     const command: LiveAction = { kind: "incident", since: canonicalSince(body.since), dryRun: body.dryRun === true };
     const user = yield* reauth(caller, { password: body.password, otp: body.otp }, command);
     const reason = body.reason ?? "account compromised";
-    const published = (yield* store.publishedSince(user, since)).filter((v) => v.status !== "revoked");
+    // read as every other read does (atTime): a pending revoke past its 24 h is revoked, not reported as still pending
+    const published = (yield* store.publishedSince(user, since)).map((v) => atTime(v, at)).filter((v) => v.status !== "revoked");
     // only packages the account still owns: a former owner's old publishes are the current owners' call
     const owned = new Set<string>();
 
