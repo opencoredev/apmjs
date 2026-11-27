@@ -1863,8 +1863,10 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
 
   // a hook whose commands apm stopped expanding runs commands apm did not read
   for (const h of hooks) if (h.cut !== null && h.kind !== "publish") add("incomplete", `scripts.${h.hook}: apm stopped reading the commands it runs at ${h.cut}`);
-  // a root file named like curl or wget, or a binding.gyp, whose build npm may run at install, keeps the reading
-  const hookEvidence = analyzeHooks(found, manifest, hooks, files.some((f) => /^(?:curl|wget)(?:\.[^/]*)?$/i.test(f.path) || /^binding\.gyp$/i.test(f.path)));
+  // a root file named like curl or wget, a binding.gyp, whose build npm may run at install, or a bin of the package's
+  // own, which npm links onto the PATH before its install scripts run, keeps the reading
+  const ownBins = manifest.bin !== undefined || (isRecord(manifest.directories) && manifest.directories.bin !== undefined);
+  const hookEvidence = analyzeHooks(found, manifest, hooks, ownBins || files.some((f) => /^(?:curl|wget)(?:\.[^/]*)?$/i.test(f.path) || /^binding\.gyp$/i.test(f.path)));
 
   // what runs on the installing machine: install hooks, and the git hooks npm runs when it installs from git
   // every hook's commands before what only the shell reading adds to any of them (HookCommand.added)

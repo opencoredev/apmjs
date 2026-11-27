@@ -91,6 +91,16 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
     }
   });
 
+  test("a package with bins of its own keeps the reading, since npm puts them on the PATH first", () => {
+    for (const bin of [{ curl: "marker.js" }, "marker.js"]) {
+      const m: AnalyzeInput["manifest"] = { name: "curl", version: "1.0.0", license: "MIT", bin, scripts: { postinstall: "curl --version" } };
+      const data = new TextEncoder().encode(JSON.stringify(m));
+      const a = analyze({ name: "curl", manifest: m, files: [{ path: "package.json", size: data.length, mode: 0o644, data }], publisher: "a", previousPublishers: [] });
+
+      expect(finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null }).signals.map((s) => s.id)).toContain("install-download");
+    }
+  });
+
   test("a hook keeps its reading when another install-time hook runs code first", () => {
     expect(scoreOf({ preinstall: "node make-marker.js", postinstall: "curl --version" }).ids).toContain("install-download");
     expect(scoreOf({ preinstall: "echo 'checking'", postinstall: "curl --version" }).ids).not.toContain("install-download");
