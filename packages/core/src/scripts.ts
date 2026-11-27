@@ -681,7 +681,7 @@ export type DownloadContext = {
   viaEval?: boolean;
   /** Packages installed alongside this one: running their bins with npx downloads nothing. */
   localBins?: ReadonlySet<string>;
-  /** A lifecycle hook's command, which npm runs from the package's root: `shipsNetTool` as netToolsInert reads it. */
+  /** A script's own text, which npm runs with its shell from the package's root: `shipsNetTool` as netToolsInert reads it. */
   hook?: { shipsNetTool: boolean };
 };
 
@@ -695,10 +695,6 @@ const PRINTED_LITERAL = /^echo '[A-Za-z0-9 ._,:/@+-]*'$/;
 
 // the commands between `&&` and `||`, which sh and cmd.exe both read as lists
 const LIST_SEPARATOR = /&&|\|\|/;
-
-// a command of plain words that the shell runs as written and that leaves the directory and the PATH where they were
-const PLAIN_COMMAND = /^[A-Za-z0-9 ._/:@+,-]*$/;
-const CHANGES_LOOKUP = /^(?:cd|chdir|pushd|popd)(?![A-Za-z0-9])/i;
 
 /** `s` without the ASCII spaces around it. */
 function trimSpaces(s: string): string {
@@ -715,8 +711,8 @@ function trimSpaces(s: string): string {
 /**
  * Whether every curl or wget mention in a hook command is a call that fetches nothing (`curl --version`) or a
  * literal an echo prints (`echo 'run curl --version'`), read only in those exact shapes: `cmd` is a list of
- * commands joined by `&&` or `||`, each one of those shapes or a command of plain words that mentions neither
- * tool and moves no lookup. `shipsNetTool`: the package has a file at its root named like curl or wget, which
+ * commands joined by `&&` or `||`, each one of those shapes, so nothing before a call moves where it is looked up.
+ * `shipsNetTool`: the package has a file at its root named like curl or wget, which
  * cmd.exe runs before the one on the PATH. Anything else is read as fetching, as before.
  */
 export function netToolsInert(cmd: string, shipsNetTool = false): boolean {
@@ -725,7 +721,7 @@ export function netToolsInert(cmd: string, shipsNetTool = false): boolean {
   return cmd
     .split(LIST_SEPARATOR)
     .map(trimSpaces)
-    .every((c) => NET_TOOL_INFO_CALL.test(c) || PRINTED_LITERAL.test(c) || (PLAIN_COMMAND.test(c) && !CHANGES_LOOKUP.test(c) && !NET_TOOL_MENTION.test(c)));
+    .every((c) => NET_TOOL_INFO_CALL.test(c) || PRINTED_LITERAL.test(c));
 }
 
 /** `cmd` with every curl and wget mention blanked when netToolsInert holds, else `cmd` as it is. */

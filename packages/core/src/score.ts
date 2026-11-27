@@ -1128,6 +1128,9 @@ function withoutInertNetFindings(cmd: string, shipsNetTool: boolean): ReturnType
  * Signals from the lifecycle scripts: what runs at install, at a git install, and on the publisher's machine. Returns
  * the evidence it cited from commands that run at install, so the risk signals can tell install-time use apart.
  */
+// a hook command expandHooks found inside another (`sh -c`) or decoded from a string
+const NESTED_COMMAND = / \((?:sh -c|decoded [^)]*)\)$/;
+
 function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: readonly ExpandedHook[], shipsNetTool: boolean): Set<string> {
   const atInstall = new Set<string>();
   const installed = depNames(manifest, ["dependencies", "optionalDependencies", "peerDependencies"]);
@@ -1142,13 +1145,16 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
 
     for (const c of h.commands) {
       const label = `package.json ${c.from}: ${c.text.slice(0, 80)}`;
+      // only a script's own text runs from the package's root with npm's shell; one npm runs inside another shell or
+      // decoded from a string is read as before
+      const root = NESTED_COMMAND.test(c.from) ? null : { shipsNetTool };
 
-      if (h.kind !== "publish" && isInlineDownload(c.text, { viaEval: c.viaEval, localBins: h.kind === "git" ? gitInstalled : installed, hook: { shipsNetTool } })) {
+      if (h.kind !== "publish" && isInlineDownload(c.text, { viaEval: c.viaEval, localBins: h.kind === "git" ? gitInstalled : installed, hook: root ?? undefined })) {
         found.add("install-download", label);
         risky = true;
       }
 
-      for (const f of withoutInertNetFindings(c.text, shipsNetTool)) {
+      for (const f of root === null ? scanText(c.text, "plain") : withoutInertNetFindings(c.text, shipsNetTool)) {
         const ev = `${label}${f.how === "as written" ? "" : ` (${f.how})`}`;
         found.add(f.id, ev, f.confidence);
 

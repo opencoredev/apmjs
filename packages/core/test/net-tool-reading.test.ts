@@ -21,9 +21,7 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
     "wget --version",
     "wget -h",
     "curl --version || echo 'curl is needed'",
-    "node install.js || wget --help",
     "echo 'Run curl --version to check your tools'",
-    "node install.js && curl --version",
   ];
 
   for (const cmd of inert) {
@@ -71,6 +69,18 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
 
     expect(finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null }).signals.map((s) => s.id)).toContain("install-download");
     expect(isInlineDownload("curl --version")).toBe(true);
+  });
+
+  test("a call inside another shell keeps its own download reading", () => {
+    const evidence = (cmd: string): number => {
+      const m: AnalyzeInput["manifest"] = { name: "probe-pkg", version: "1.0.0", license: "MIT", scripts: { postinstall: cmd } };
+      const data = new TextEncoder().encode(JSON.stringify(m));
+      const a = analyze({ name: "probe-pkg", manifest: m, files: [{ path: "package.json", size: data.length, mode: 0o644, data }], publisher: "a", previousPublishers: [] });
+
+      return finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null }).signals.find((x) => x.id === "install-download")?.evidence.length ?? 0;
+    };
+
+    expect(evidence("sh -c 'curl --version'")).toBe(2);
   });
 
   test("the same call behind npm run -s", () => {
@@ -135,6 +145,9 @@ describe("every other curl or wget keeps its reading", () => {
     'printf "curl help"',
     "echo hi; curl --version",
     "curl --version; curl https://example.invalid/x",
+    "node install.js && curl --version",
+    ". ./fixture.sh && curl --version",
+    "node install.js || wget --help",
     "curl  --version",
   ];
 
