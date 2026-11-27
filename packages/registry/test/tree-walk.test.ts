@@ -522,8 +522,6 @@ function recording(npm: string, reads: LeasedRead[]) {
 
       return Upstream.of({
         ...u,
-        probe: (n, lease) => Effect.suspend(() => (note("probe", lease), u.probe(n, lease))),
-        probeWithin: (n, lease) => Effect.suspend(() => (note("probeWithin", lease), u.probeWithin(n, lease))),
         probeFor: (n, wanted, lease) => Effect.suspend(() => (note("probeFor", lease), u.probeFor(n, wanted, lease))),
         probeWithinFor: (n, wanted, lease) => Effect.suspend(() => (note("probeWithinFor", lease), u.probeWithinFor(n, wanted, lease))),
         probeMany: (ns, lease) => Effect.suspend(() => (note("probeMany", lease), u.probeMany(ns, lease))),

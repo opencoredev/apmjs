@@ -509,6 +509,9 @@ function noteWhy(note: Note, id: string): string {
  */
 type DepClass = "risk" | "unfinished" | "fresh-unread" | "fresh-clear" | "gap";
 
+/** How the registry's "unchecked" warning for a dependency that did not fit the request's budget begins (OVER_BUDGET_TEXT in the registry's apm.ts). */
+export const UNREAD_IN_BUDGET = "not checked: apm checks at most ";
+
 function classifyDep(w: WarningInput): DepClass {
   const scored = w.signals === undefined ? null : { score: w.score ?? null, signals: w.signals, scorer: w.scorer ?? null };
   const reading = scored === null ? null : readingOf({ ...scored, coverage: w.coverage ?? null });
@@ -532,9 +535,12 @@ function classifyDep(w: WarningInput): DepClass {
     case "unscorable":
       // only a size apm cannot read is apm's own gap; any other decision (the analysis limit, unreadable bytes) holds
       return w.unscorable === "too-large" ? "gap" : "unfinished";
+    case "unchecked":
+      // one apm could not read within the request's budget (its packument or its stored score) holds, as one it could
+      // not score does: what it read of it may be a risk (review of c88b027, finding 1). Other unchecked specs are gaps
+      return w.text.startsWith(UNREAD_IN_BUDGET) ? "unfinished" : "gap";
     case "pending":
     case "unavailable":
-    case "unchecked":
       return "gap";
     default: {
       const _exhaustive: never = w.kind;

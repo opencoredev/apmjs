@@ -207,6 +207,18 @@ const ok = (score: number, over: Partial<Extract<ResolveOutcome, { kind: "ok" }>
 });
 
 describe("explainInstall", () => {
+  // Review of c88b027, finding 1: a dependency whose stored score did not fit the registry's budget was a gap, so a risk
+  // in it apm had read before was answered install
+  test("a dependency the registry could not read within its budget holds; another unchecked one is a note", () => {
+    const unchecked = (text: string): ResolveOutcome => ok(100, { deps: { unchecked: 1, uncheckedDeps: [{ dependency: "dep@1.0.0", reason: text }], reviews: { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] }, warnings: [{ name: "dep", version: "^1.0.0", kind: "unchecked", text: `not checked: ${text}`, via: ["app@1.0.0"] }], risks: [] } });
+    const review: ReviewInput = { kind: "reviewed", state: "found-nothing", findings: 0 };
+    const budget = explainInstall({ name: "app", range: null, resolve: unchecked("apm checks at most 16 MB of package metadata in one request, and less while the registry holds others, and this package's did not fit"), review });
+
+    expect(budget.verdict).toBe("review-first");
+    expect(budget.summary).toContain("could not fully analyse or score");
+    expect(explainInstall({ name: "app", range: null, resolve: unchecked("a git dependency, which apm cannot check"), review }).verdict).toBe("install");
+  });
+
   test("install gives the exact commands for every client", () => {
     const v = explainInstall({ name: "zod", range: null, resolve: ok(92), review: { kind: "reviewed", state: "found-nothing", findings: 0 } });
 

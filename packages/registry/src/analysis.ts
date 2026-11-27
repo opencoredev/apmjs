@@ -595,7 +595,8 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
 
             const fetchFailed = (errorClass: string): Effect.Effect<JobOutcome, StoreError> => store.failFetch({ name: job.name, version: job.version, errorClass, now, runMs: RUN_WINDOW_MS }).pipe(Effect.as("retry"));
             // the job's own lease (worker.ts opens one per queue message, and one for the sweep that runs jobs itself)
-            const probe = yield* upstream.probe(job.name, yield* RequestMemory);
+            // whether this version already has an analysis is all the job reads of the scores (trimmed)
+            const probe = yield* upstream.probeFor(job.name, () => new Map([[job.version, "trimmed"]]), yield* RequestMemory);
 
             switch (probe.kind) {
               case "unknown":

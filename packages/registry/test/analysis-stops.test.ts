@@ -97,8 +97,6 @@ const STUB: UpstreamApi = {
     baseUrl: "http://upstream.invalid/",
     scopeExists: () => Effect.succeed("unknown"),
     search: () => Effect.succeed({ kind: "unavailable" }),
-    probe: () => Effect.succeed({ kind: "found", pkg: pkg() }),
-    probeWithin: () => Effect.succeed({ kind: "found", pkg: pkg() }),
     probeFor: () => Effect.succeed({ kind: "found", pkg: pkg() }),
     probeWithinFor: () => Effect.succeed({ kind: "found", pkg: pkg() }),
     devDependencies: () => Effect.succeed(null),

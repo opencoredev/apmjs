@@ -78,7 +78,7 @@ export default {
       const lease = pool.request();
       const got = await Effect.runPromise(Effect.gen(function* () {
         const u = yield* Upstream;
-        const p = yield* u.probe("huge", lease);
+        const p = yield* u.probeFor("huge", () => new Map(), lease);
         if (p.kind !== "found") return { kind: p.kind };
         return yield* u.serve(p.pkg, "1.0.0");
       }).pipe(Effect.provide(layer), Effect.scoped));

@@ -5,22 +5,26 @@
 // registry.npmjs.org does; the store is the real Postgres one.
 import { describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { Effect, Layer, Option } from "effect";
 import { Client } from "pg";
 import { z } from "zod";
 import { analyze, PREVIOUS_SCORER, SCORER, type Analysis as Scored } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
 import { Analysis } from "../src/analysis.ts";
-import { apmRoute, resolveResponse, ResolveWait } from "../src/apm.ts";
+import { apmRoute, OVER_BUDGET_TEXT, resolveResponse, ResolveWait, scanResponse, upstreamRoute } from "../src/apm.ts";
 import { Auth } from "../src/auth.ts";
 import { Blobs } from "../src/blobs.ts";
 import { Clock } from "../src/clock.ts";
 import { RegistryConfig } from "../src/config.ts";
 import { KEPT_CHOICES_INSERT_LOCK, Store, type StoreApi, type VersionRecord } from "../src/db.ts";
 import { digestLabel, digestOf } from "../src/digest.ts";
+import { StoreError } from "../src/errors.ts";
 import { ChoicesWriter, driverWriteBytes, keepPlans, KEPT_CHOICES_MAX_AGE_MS, KEPT_CHOICES_MAX_CHOICES, KEPT_CHOICES_MAX_TEXT, keptPlan, KeptSide, KEPT_TEXT_WEIGHTS, utf8Bytes } from "../src/kept-choices.ts";
 import { KEPT_VERSIONS, pageExists, summarize } from "../src/kept-package.ts";
 import { MemoryPool, RequestMemory, type Lease } from "../src/memory.ts";
+import { KnownMalicious } from "../src/osv.ts";
 import { NPM_FAILURE_MS, Upstream } from "../src/upstream.ts";
 import { keptSummary } from "../src/walk-catalog.ts";
 import { measured } from "./pg-proxy.ts";
@@ -43,6 +47,7 @@ function fakeNpm(initial: Record<string, Doc[]>) {
   const failing = new Set<string>();
   const bare = new Set<string>();
   const times = new Map<string, number>();
+  const tags = new Map<string, Record<string, string>>();
   const seen = { bodies: 0, notModified: 0 };
 
   const textOf = (name: string): string | null => {
@@ -60,7 +65,10 @@ function fakeNpm(initial: Record<string, Doc[]>) {
 
     const time = Object.fromEntries(vs.map((d, i) => [d.version, new Date(times.get(`${name}@${d.version}`) ?? NOW - (20 - i) * DAY).toISOString()]));
 
-    return JSON.stringify({ name, "dist-tags": { latest: vs.at(-1)?.version ?? "" }, versions, time });
+    // a tag set to "" is left out: a package npm names no latest of
+    const distTags = Object.fromEntries(Object.entries({ latest: vs.at(-1)?.version ?? "", ...tags.get(name) }).filter(([, v]) => v !== ""));
+
+    return JSON.stringify({ name, "dist-tags": distTags, versions, time });
   };
 
   const server = Bun.serve({
@@ -87,7 +95,7 @@ function fakeNpm(initial: Record<string, Doc[]>) {
     },
   });
 
-  return { url: server.url.href, docs, failing, bare, times, seen, stop: () => server.stop(true) };
+  return { url: server.url.href, docs, failing, bare, times, tags, seen, stop: () => server.stop(true) };
 }
 
 const noBlobs = Layer.succeed(
@@ -105,16 +113,48 @@ const Body = z
 
 const settings = (npm: string) => ({ baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: npm, legacyAuth: false, namePolicy: "open", admins: [] }) as const;
 
-/** A resolve of `name` (`range`, latest by default) at `at` (NOW by default) in a memory pool of its own, as a new isolate's. */
-async function resolve(input: { url: string; npm: string; name: string; strict?: boolean; at?: number; range?: string }) {
+/** The OSSF feed, standing in: it lists each `name@version` of `listed` under MAL-TEST, by version and by name. */
+const feedListing = (listed: readonly string[]) =>
+  Layer.succeed(
+    KnownMalicious,
+    KnownMalicious.of({
+      lookup: (pkgs) => Effect.succeed(pkgs.filter((p) => listed.includes(`${p.name}@${p.version}`)).map((p) => ({ name: p.name, version: p.version, ids: ["MAL-TEST"] }))),
+      advisoriesFor: (name) => Effect.succeed(listed.flatMap((l) => (l.startsWith(`${name}@`) ? [{ id: "MAL-TEST", versions: [l.slice(name.length + 1)], ranges: [] }] : []))),
+    }),
+  );
+
+/** Every service a request uses here: a memory pool of its own, as a new isolate's, or `lease`; the store wrapped by `store`. */
+function rigLayers(input: { url: string; npm: string; at?: number; store?: (s: StoreApi) => StoreApi; lease?: Lease; listed?: readonly string[] }) {
+  const at = input.at ?? NOW;
+  const wrap = input.store ?? ((s: StoreApi) => s);
+  const memory = input.lease === undefined ? RequestMemory.layer(new MemoryPool()) : Layer.succeed(RequestMemory, input.lease);
+  const feed = input.listed === undefined ? Layer.empty : feedListing(input.listed);
+  const base = Layer.mergeAll(Store.postgres(input.url), Clock.fixed({ now: at, wallNow: at }), Analysis.none, noBlobs, Layer.succeed(ResolveWait, { maxMs: 0, pollMs: 1 }), Layer.succeed(RegistryConfig, settings(input.npm)), memory, feed);
+
+  // the wrapped store is the one every service is built with, the upstream reader included
+  const wrapped = Layer.provideMerge(
+    Layer.effect(
+      Store,
+      Effect.gen(function* () {
+        return Store.of(wrap(yield* Store));
+      }),
+    ),
+    base,
+  );
+
+  return Layer.provideMerge(Upstream.layer(input.npm, 60_000, null), wrapped);
+}
+
+/**
+ * A resolve of `name` (`range`, latest by default) at `at` (NOW by default), with rigLayers; with `listed`, the OSSF
+ * feed listing those.
+ */
+async function resolve(input: { url: string; npm: string; name: string; strict?: boolean; at?: number; range?: string; store?: (s: StoreApi) => StoreApi; lease?: Lease; listed?: readonly string[] }) {
   const params = new URLSearchParams({ name: input.name, range: input.range ?? "latest" });
 
   if (input.strict) params.set("strict", "1");
-  const at = input.at ?? NOW;
-  const base = Layer.mergeAll(Store.postgres(input.url), Clock.fixed({ now: at, wallNow: at }), Analysis.none, noBlobs, Layer.succeed(ResolveWait, { maxMs: 0, pollMs: 1 }), Layer.succeed(RegistryConfig, settings(input.npm)), RequestMemory.layer(new MemoryPool()));
-  const layers = Layer.provideMerge(Upstream.layer(input.npm, 60_000, null), base);
   const program = Effect.flatMap(resolveResponse(new URL(`http://registry.test/-/apm/v1/resolve?${params}`)), (res) => Effect.promise(async () => ({ status: res.status, text: await res.text() })));
-  const out = await Effect.runPromise(program.pipe(Effect.provide(layers), Effect.scoped));
+  const out = await Effect.runPromise(program.pipe(Effect.provide(rigLayers(input)), Effect.scoped));
 
   return { status: out.status, text: out.text, body: Body.parse(JSON.parse(out.text)) };
 }
@@ -338,7 +378,7 @@ describe("kept choices: review of 3aacc2a", () => {
         try {
           const program = Effect.flatMap(Upstream, (up) =>
             how === "chosen"
-              ? up.chosen({ names: ["app"], lease, choices: () => [{ key: "all", choose: (pkg) => pkg.versions }], keep: (c, r) => keptSummary({ kind: "upstream", name: c.name, distTags: c.distTags, versions: [...(c.versions.get("all") ?? [])] }, r) })
+              ? up.chosen({ names: ["app"], lease, choices: () => [{ key: "all", choose: (pkg) => pkg.versions }], keep: (c, r) => keptSummary({ kind: "upstream", name: c.name, distTags: c.distTags, versions: [...(c.versions.get("all") ?? [])] }, r), analyses: "whole" })
               : up.summaries(["app"], lease, (pkg, r) => keptSummary({ kind: "upstream", name: pkg.name, distTags: pkg.distTags, versions: pkg.versions }, r)),
           );
 
@@ -442,7 +482,7 @@ describe("kept choices: re-check of 3366a36", () => {
       try {
         const program = Effect.flatMap(Upstream, (up) =>
           how === "chosen"
-            ? up.chosen({ names, lease, choices: () => [{ key, choose: (pkg) => pkg.versions }], keep: (c, r) => keptSummary({ kind: "upstream", name: c.name, distTags: c.distTags, versions: [...(c.versions.get(key) ?? [])] }, r) })
+            ? up.chosen({ names, lease, choices: () => [{ key, choose: (pkg) => pkg.versions }], keep: (c, r) => keptSummary({ kind: "upstream", name: c.name, distTags: c.distTags, versions: [...(c.versions.get(key) ?? [])] }, r), analyses: "whole" })
             : up.summaries(names, lease, (pkg, r) => keptSummary({ kind: "upstream", name: pkg.name, distTags: pkg.distTags, versions: pkg.versions }, r)),
         );
 
@@ -1048,7 +1088,7 @@ describe("a resolve reads the analyses of the versions it picks, not every one s
 
         const picked = await run(
           Effect.flatMap(Upstream, (up) =>
-            up.chosen({ names: ["nextlike"], lease: new MemoryPool().request(), choices: () => choices, keep: (c) => ({ summary: Object.fromEntries([...c.versions].map(([key, vs]) => [key, shown(vs)])), weight: 0 }) }),
+            up.chosen({ names: ["nextlike"], lease: new MemoryPool().request(), choices: () => choices, keep: (c) => ({ summary: Object.fromEntries([...c.versions].map(([key, vs]) => [key, shown(vs)])), weight: 0 }), analyses: "whole" }),
           ),
         );
 
@@ -1144,6 +1184,57 @@ describe("a resolve reads the analyses of the versions it picks, not every one s
       }
     }));
 
+  /** upstreamRoute's answer for `path` at NOW (`viaSafe`: under ~safe), read from the database at `url` and npm at `npmUrl`. */
+  async function served(url: string, npmUrl: string, path: string, options: { viaSafe: boolean; headers?: Record<string, string> }): Promise<{ status: number; text: string }> {
+    const layers = Layer.provideMerge(
+      Upstream.layer(npmUrl, 60_000, null),
+      Layer.mergeAll(Store.postgres(url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings(npmUrl)), RequestMemory.layer(new MemoryPool())),
+    );
+
+    const req = new Request(`http://registry.test${path}`, { headers: options.headers });
+    const program = Effect.flatMap(upstreamRoute(req, new URL(req.url), options.viaSafe), (res) => Effect.promise(async () => ({ status: res?.status ?? 0, text: (await res?.text()) ?? "" })));
+
+    return Effect.runPromise(program.pipe(Effect.provide(layers), Effect.scoped));
+  }
+
+  // Post-launch review of 216a4c7, finding 3: the full packument, a credentialed or ~safe one, a version's document and
+  // a ~safe tarball read every stored analysis of the package as one value (Store.upstreamAnalyses), charged to nothing
+  test("the packument, a version's document and a tarball under ~safe read the analyses of the versions npm lists only, trimmed", () =>
+    withRig(async ({ url, npm, sql }) => {
+      const history = await seed(npm, sql);
+      const proxy = await measured(url);
+
+      try {
+        for (const [path, options] of [
+          ["/nextlike", { viaSafe: false }],
+          ["/nextlike", { viaSafe: false, headers: { authorization: "Bearer x", accept: "application/vnd.npm.install-v1+json" } }],
+          ["/nextlike", { viaSafe: true }],
+          ["/nextlike/1.0.3", { viaSafe: false }],
+          ["/nextlike/latest", { viaSafe: true }],
+          ["/nextlike/-/nextlike-1.0.3.tgz", { viaSafe: true }],
+        ] as const) {
+          const before = proxy.total();
+          const r = await served(proxy.url, npm.url, path, options);
+          const bytes = proxy.total() - before;
+
+          expect(r.status).not.toBe(0);
+          // 16 MB stored; at most the four listed versions' analyses (1.0.0's 270 kB among them) and the other rows
+          expect(history).toBeGreaterThan(16_000_000);
+          expect(bytes).toBeLessThan(270_000 + 64 * 1024);
+        }
+
+        expect((await served(proxy.url, npm.url, "/nextlike", { viaSafe: false })).text).toContain('"_apmScore"');
+      } finally {
+        proxy.close();
+      }
+    }));
+
+  test("no route reads a package's whole history of analyses", () => {
+    const dir = join(import.meta.dir, "..", "src");
+
+    for (const f of readdirSync(dir).filter((f) => f.endsWith(".ts") && f !== "db.ts")) expect(readFileSync(join(dir, f), "utf8")).not.toMatch(/\.upstreamAnalyses\(/);
+  });
+
   // Review of ef5ace1: a version npm lists no checksum for has no digest, so it was left out of the versions read, and
   // the outcome the worker stores for it (unavailable, no digest) with it: it showed as queued for analysis
   test("a picked or shown version npm lists no checksum for keeps its unavailable outcome", () =>
@@ -1213,5 +1304,454 @@ describe("a resolve reads the analyses of the versions it picks, not every one s
         { package: "@next/swc-oldonly", versions: KEPT_VERSIONS },
         { package: "oldscored", versions: KEPT_VERSIONS },
       ]);
+    }));
+});
+
+// Post-launch review of 216a4c7, findings 6 and 7: between reading a package and keeping it, a resolve held its
+// dist-tags uncharged, and the analyses it read for the versions it picked were held, parsed and kept with the tree
+// charged to nothing. Both are charged now, and an analysis that did not fit the request reads as not checked
+// (over-budget), never as a version with no score, nor as a clean one.
+describe("what a resolve reads of the analyses is charged to it, and what does not fit is never clean", () => {
+  const noDigest = (): never => {
+    throw new Error("no digest");
+  };
+
+  const label = (name: string, version: string): string => digestLabel(digestOf({ integrity: integrityOf(`${name}@${version}`), shasum: "1".repeat(40) }) ?? noDigest());
+
+  /** The store with every read of analyses that names a package but `root` changed by `read`. */
+  const atWalk = (root: string, read: (s: StoreApi, input: Parameters<StoreApi["upstreamAnalysesWithin"]>[0]) => ReturnType<StoreApi["upstreamAnalysesWithin"]>) => (s: StoreApi): StoreApi => ({
+    ...s,
+    upstreamAnalysesWithin: (input) => (input.keys.some((k) => k.package !== root) ? read(s, input) : s.upstreamAnalysesWithin(input)),
+  });
+
+  const scoreTree = async (sql: (q: string, p?: unknown[]) => Promise<unknown[]>) => {
+    for (const [n, v] of [["app", "1.0.0"], ["dep", "1.0.0"], ["risky", "1.0.0"]] as const) await scored(sql, n, v);
+  };
+
+  test("a read of the walk's analyses that fails fails the resolve: it is never answered", () =>
+    withRig(async ({ url, npm, sql }) => {
+      await scoreTree(sql);
+      expect((await resolve({ url, npm: npm.url, name: "app" })).status).toBe(200);
+      const dropped = atWalk("app", () => Effect.fail(new StoreError({ operation: "upstreamAnalysesFor", cause: new Error("Connection terminated unexpectedly") })));
+
+      // the worker answers a StoreError 503 or 500 (worker.ts), so the CLI installs nothing
+      for (const strict of [false, true]) await expect(resolve({ url, npm: npm.url, name: "app", strict, store: dropped })).rejects.toBeInstanceOf(StoreError);
+    }));
+
+  test("a dependency whose analysis does not fit the request is not checked (over-budget), never unscored or clean", () =>
+    withRig(async ({ url, npm, sql }) => {
+      await scoreTree(sql);
+      const starved = atWalk("app", (s, input) => s.upstreamAnalysesWithin({ ...input, allowance: 0 }));
+      const full = await resolve({ url, npm: npm.url, name: "app" });
+      const r = await resolve({ url, npm: npm.url, name: "app", store: starved });
+
+      expect(full.body.tree?.packages.map((p) => p.name)).toEqual(["dep", "risky"]);
+      expect(r.status).toBe(200);
+      // still listed: what needs no score of them is checked (review of 6f206c5, finding 1)
+      expect(r.body.tree?.packages).toEqual(full.body.tree?.packages);
+      expect(r.body.warnings?.filter((w) => w.kind === "unchecked").map((w) => w.name)).toEqual(["dep", "risky"]);
+      expect(r.text).toContain(OVER_BUDGET_TEXT);
+      // on 216a4c7 a version whose analysis was not read had score null: queued for analysis, "not scored yet"
+      expect(r.body.warnings?.some((w) => w.kind === "pending" || w.kind === "unscorable")).toBe(false);
+      expect(r.text).not.toContain("queued for analysis");
+      expect((await resolve({ url, npm: npm.url, name: "app", strict: true, store: starved })).status).not.toBe(200);
+    }));
+
+  test("a dependency's dist-tags are charged to the request while its analyses are read", () =>
+    withRig(async ({ url, npm, sql }) => {
+      await scoreTree(sql);
+      const count = 50_000;
+
+      npm.tags.set("dep", Object.fromEntries(Array.from({ length: count }, (_, i) => [`t${i}`, "1.0.0"])));
+      const lease = new MemoryPool().request();
+      const taken: number[] = [];
+      const watched = atWalk("app", (s, input) => Effect.suspend(() => (taken.push(lease.taken), s.upstreamAnalysesWithin(input))));
+
+      try {
+        const r = await resolve({ url, npm: npm.url, name: "app", store: watched, lease });
+
+        expect(r.status).toBe(200);
+        expect(r.body.tree?.packages.map((p) => p.name)).toEqual(["dep", "risky"]);
+        // each tag `"t12345":"1.0.0"` is a key and a value of about 16 characters: at least 100 of weight. On 216a4c7 the
+        // request held 13 kB here, the tags' 7 MB counted by nobody
+        process.stdout.write(`[analysis-budget] ${count} dist-tags on a dependency: the request held ${((taken[0] ?? 0) / 1024 / 1024).toFixed(2)} MiB as its analyses were read\n`);
+        expect(taken.length).toBe(1);
+        expect(taken[0]).toBeGreaterThan(count * 100);
+      } finally {
+        lease.release();
+      }
+    }));
+
+  /** A next-like analysis of `name@version`: 2,656 files left unread (skipped), and `kept` characters of evidence kept. */
+  async function heavy(sql: (q: string, p?: unknown[]) => Promise<unknown[]>, name: string, version: string, kept: number): Promise<void> {
+    const m = doc(name, version);
+    const file = (path: string, text: string) => ({ path, size: text.length, mode: 0o644, data: encoder.encode(text) });
+    const analysis = analyze({ name, manifest: m, files: [file("package.json", JSON.stringify(m)), file("index.js", "module.exports = 1;\n")], publisher: "u", previousPublishers: [] });
+    const skipped = Array.from({ length: 2656 }, (_, i) => ({ path: `dist/compiled/chunk-${i}/index.js`, size: 120_000, reason: "over-budget" }));
+
+    await sql("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ($1, $2, $3, $4, $5::jsonb, 0)", [name, version, label(name, version), SCORER, JSON.stringify({ ...analysis, skipped, padding: "x".repeat(kept) })]);
+  }
+
+  test("a tree of next-like dependencies: the walk reads their analyses trimmed, and keeps them charged", () =>
+    withRig(async ({ url, npm, sql }) => {
+      const deps = Array.from({ length: 20 }, (_, i) => `heavy-dep-${i}`);
+
+      npm.docs.set("heavy", [doc("heavy", "1.0.0", Object.fromEntries(deps.map((d) => [d, "^1.0.0"])))]);
+      await scored(sql, "heavy", "1.0.0");
+
+      for (const d of deps) {
+        npm.docs.set(d, [doc(d, "1.0.0")]);
+        await heavy(sql, d, "1.0.0", 30_000);
+      }
+
+      const [stored] = await sql("SELECT sum(octet_length(analysis::text))::bigint AS bytes FROM upstream_analysis WHERE package LIKE 'heavy-dep-%'");
+      const history = z.object({ bytes: z.coerce.number() }).parse(stored).bytes;
+      const proxy = await measured(url);
+      const lease = new MemoryPool().request();
+      const layers = Layer.provideMerge(Upstream.layer(npm.url, 60_000, null), Layer.mergeAll(Store.postgres(url), Clock.fixed({ now: NOW, wallNow: NOW }), noBlobs, Layer.succeed(RegistryConfig, settings(npm.url))));
+      const walk = new MemoryPool().request();
+
+      try {
+        const before = proxy.total();
+        const r = await resolve({ url: proxy.url, npm: npm.url, name: "heavy", lease });
+        const bytes = proxy.total() - before;
+
+        // the walk's own read of the twenty, as a level of it reads them: what stays taken is what its answer holds
+        const got = await Effect.runPromise(
+          Effect.flatMap(Upstream, (up) =>
+            up.chosen({ names: deps, lease: walk, choices: () => [{ key: "latest", choose: (pkg) => pkg.versions }], keep: (c, reserve) => keptSummary({ kind: "upstream", name: c.name, distTags: c.distTags, versions: [...(c.versions.get("latest") ?? [])] }, reserve), analyses: "trimmed" }),
+          ).pipe(Effect.provide(layers), Effect.scoped),
+        );
+
+        process.stdout.write(`[analysis-budget] 20 next-like dependencies (${(history / 1e6).toFixed(1)} MB stored): a resolve read ${(bytes / 1e6).toFixed(2)} MB of the database, the request held ${(lease.peakTaken / 1024 / 1024).toFixed(2)} MiB at most; the level's answer holds ${(walk.taken / 1024 / 1024).toFixed(2)} MiB\n`);
+        expect(r.status).toBe(200);
+        expect(r.body.tree?.packages.map((p) => p.name).sort()).toEqual([...deps].sort());
+        // whole, each is about 300 kB, nine tenths of it the files left unread, which no dependency's check reads
+        expect(history).toBeGreaterThan(20 * 250_000);
+        expect(bytes).toBeLessThan(20 * 60_000);
+        expect([...got.values()].map((a) => a.kind)).toEqual(deps.map(() => "found"));
+        // the 30 kB each keeps, parsed (two bytes a character), stays charged while the answer holds it
+        expect(walk.taken).toBeGreaterThan(20 * 2 * 30_000);
+      } finally {
+        walk.release();
+        lease.release();
+        proxy.close();
+      }
+    }));
+});
+
+// Review of 6f206c5. Finding 1: an analysis that did not fit took with it what needs no score: the walk let go of the
+// version it picked, so the OSSF feed never saw it, and the scanner returned before comparing the lockfile's integrity.
+// Finding 6: a version's document and the credentialed abbreviated packument read every version's analysis, so an
+// unrelated one that did not fit made them a 503. Finding 7: a root analysis that landed during the resolve and did not
+// fit its reread answered 404, "No package named".
+describe("what needs no score is checked of a version whose analysis does not fit, and only what is shown is read", () => {
+  const noDigest = (): never => {
+    throw new Error("no digest");
+  };
+
+  const label = (name: string, version: string): string => digestLabel(digestOf({ integrity: integrityOf(`${name}@${version}`), shasum: "1".repeat(40) }) ?? noDigest());
+
+  /** The store with every read of analyses under `allowance` at most, or only those naming a package but `root`. */
+  const capped = (allowance: number, root?: string) => (s: StoreApi): StoreApi => ({
+    ...s,
+    upstreamAnalysesWithin: (input) => (root === undefined || input.keys.some((k) => k.package !== root) ? s.upstreamAnalysesWithin({ ...input, allowance: Math.min(allowance, input.allowance) }) : s.upstreamAnalysesWithin(input)),
+  });
+
+  const ScanBody = z
+    .object({
+      advisories: z.array(z.object({ package: z.string(), level: z.string() })),
+      blocked: z.array(z.object({ package: z.string(), kind: z.string() })),
+      unchecked: z.array(z.object({ package: z.string(), reason: z.string() })),
+      pending: z.array(z.object({ package: z.string() })),
+    })
+    .loose();
+
+  async function scan(input: { url: string; npm: string; packages: { name: string; version: string; integrity?: string }[]; store?: (s: StoreApi) => StoreApi }) {
+    const req = new Request("http://registry.test/-/apm/v1/scan", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ packages: input.packages }) });
+    const program = Effect.flatMap(scanResponse(req, { kind: "user", user: "someone", tokenHash: "0".repeat(64), scope: "publish" }), (res) => Effect.promise(async () => ScanBody.parse(await res.json())));
+
+    return Effect.runPromise(program.pipe(Effect.provide(rigLayers(input)), Effect.scoped));
+  }
+
+  /** apmRoute's answer to an anonymous GET of `path`, with rigLayers. */
+  async function apmGet(input: { url: string; npm: string; path: string; store?: (s: StoreApi) => StoreApi }) {
+    const auth = Auth.layer({ databaseUrl: input.url, options: { secret: "test-secret-that-is-long-enough-for-better-auth" }, baseURL: "http://web.test/" });
+    const req = new Request(`http://registry.test${input.path}`);
+    const program = Effect.flatMap(apmRoute(req, new URL(req.url), { kind: "anon" }), (res) => Effect.promise(async () => ({ status: res?.status ?? 0, text: (await res?.text()) ?? "" })));
+
+    return Effect.runPromise(program.pipe(Effect.provide(Layer.provideMerge(auth, rigLayers(input))), Effect.scoped));
+  }
+
+  // Review of dd7a461. Finding 1: an unread dependency was let go before its age was checked, so a fresh one lost the
+  // cooldown warning. Finding 2: popular-scores sent an expired kept score as current when only the read did not fit.
+  // Finding 3: the version and score answers were a 404 for a version npm lists when its analysis did not fit
+  test("a fresh dependency whose analysis does not fit still warns of the cooldown", () =>
+    withRig(async ({ url, npm, sql }) => {
+      for (const [n, v] of [["app", "1.0.0"], ["dep", "1.0.0"], ["risky", "1.0.0"]] as const) await scored(sql, n, v);
+      npm.times.set("dep@1.0.0", NOW - MINUTE);
+
+      for (const store of [undefined, capped(0, "app")]) {
+        const r = await resolve({ url, npm: npm.url, name: "app", store });
+
+        expect(r.body.warnings?.filter((w) => w.name === "dep").map((w) => w.kind)).toContain("cooldown");
+      }
+
+      // and the capped resolve did leave dep unread, saying so as the web verdict reads it (verdict.ts, UNREAD_IN_BUDGET)
+      const Texts = z.object({ warnings: z.array(z.object({ name: z.string(), kind: z.string(), text: z.string() })) }).loose();
+      const unread = Texts.parse(JSON.parse((await resolve({ url, npm: npm.url, name: "app", store: capped(0, "app") })).text)).warnings.filter((w) => w.name === "dep" && w.kind === "unchecked");
+
+      expect(unread.map((w) => w.text)).toEqual([`not checked: ${OVER_BUDGET_TEXT}`]);
+      expect(unread[0]?.text).toStartWith("not checked: apm checks at most ");
+    }));
+
+  test("popular-scores does not send an expired kept score as current when the analysis does not fit", () =>
+    withRig(async ({ url, npm, sql }) => {
+      await scored(sql, "dep", "2.0.0");
+      const stale = { name: "dep", version: "2.0.0", score: 37, grade: "F" };
+
+      await Effect.runPromise(Effect.flatMap(Store, (s) => s.keepLatestScore({ score: stale, at: NOW - 30 * DAY, capacity: 100 })).pipe(Effect.provide(Store.postgres(url)), Effect.scoped));
+      const Scores = z.object({ packages: z.array(z.object({ name: z.string(), score: z.number().nullable() })) }).loose();
+      const ask = async (store?: (s: StoreApi) => StoreApi) => Scores.parse(JSON.parse((await apmGet({ url, npm: npm.url, path: "/-/apm/v1/popular-scores?names=dep", store })).text)).packages[0];
+
+      expect((await ask(capped(0)))?.score).toBeNull();
+      const current = await ask();
+
+      expect(current?.score).not.toBeNull();
+      expect(current?.score).not.toBe(37);
+    }));
+
+  test("the version and score answers are a retryable 503, not a 404, when the version's analysis does not fit", () =>
+    withRig(async ({ url, npm, sql }) => {
+      await scored(sql, "dep", "1.0.0");
+
+      for (const path of ["/-/apm/v1/packages/dep/versions/1.0.0", "/-/apm/v1/score/dep/1.0.0"]) {
+        expect((await apmGet({ url, npm: npm.url, path, store: capped(0) })).status).toBe(503);
+        expect((await apmGet({ url, npm: npm.url, path })).status).toBe(200);
+      }
+
+      // a version npm does not list is still a 404, whatever scores did not fit (review of c88b027, finding 3)
+      for (const path of ["/-/apm/v1/packages/dep/versions/9.9.9", "/-/apm/v1/score/dep/9.9.9"]) {
+        for (const store of [undefined, capped(0)]) expect((await apmGet({ url, npm: npm.url, path, store })).status).toBe(404);
+      }
+    }));
+
+  test("a dependency the OSSF feed lists is refused in every mode, whether its analysis fit or not", () =>
+    withRig(async ({ url, npm, sql }) => {
+      for (const [n, v] of [["app", "1.0.0"], ["dep", "1.0.0"], ["risky", "1.0.0"]] as const) await scored(sql, n, v);
+
+      for (const store of [undefined, capped(0, "app")]) {
+        for (const strict of [false, true]) {
+          const r = await resolve({ url, npm: npm.url, name: "app", strict, store, listed: ["risky@1.0.0"] });
+
+          // on 6f206c5 an analysis that did not fit let risky@1.0.0 install, with a warning that it was not checked
+          expect(r.status).toBe(422);
+          expect(r.text).toContain("MAL-TEST");
+        }
+      }
+    }));
+
+  test("a scanned version whose analysis does not fit still has its integrity compared, and is unchecked, never clean", () =>
+    withRig(async ({ url, npm, sql }) => {
+      await scored(sql, "dep", "1.0.0");
+      const other = await scan({ url, npm: npm.url, packages: [{ name: "dep", version: "1.0.0", integrity: integrityOf("other bytes") }], store: capped(0) });
+
+      // on 6f206c5: unchecked, with no fatal advisory, so a lockfile naming other bytes installed in the default mode
+      expect(other.blocked).toEqual([{ package: "dep", kind: "integrity" }]);
+      expect(other.advisories.map((a) => a.level)).toEqual(["fatal"]);
+      const same = await scan({ url, npm: npm.url, packages: [{ name: "dep", version: "1.0.0", integrity: integrityOf("dep@1.0.0") }], store: capped(0) });
+
+      expect(same.blocked).toEqual([]);
+      expect(same.pending).toEqual([]);
+      expect(same.unchecked).toEqual([{ package: "dep", reason: OVER_BUDGET_TEXT }]);
+      // and with room for it, scored: nothing unchecked
+      expect((await scan({ url, npm: npm.url, packages: [{ name: "dep", version: "1.0.0", integrity: integrityOf("dep@1.0.0") }] })).unchecked).toEqual([]);
+    }));
+
+  test("a version's document and the credentialed install packument read no analysis of another version", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("twoscores", [doc("twoscores", "1.0.0"), doc("twoscores", "1.0.1")]);
+      await scored(sql, "twoscores", "1.0.1");
+      // 1.0.0's analysis is far past what the requests below may hold, 1.0.1's well inside it
+      await sql("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) SELECT 'twoscores', '1.0.0', $1, scorer, analysis || jsonb_build_object('padding', repeat('x', 300000)), 0 FROM upstream_analysis WHERE package = 'twoscores'", [label("twoscores", "1.0.0")]);
+
+      const served = async (path: string, viaSafe: boolean, headers?: Record<string, string>) => {
+        const req = new Request(`http://registry.test${path}`, { headers });
+        const program = Effect.flatMap(upstreamRoute(req, new URL(req.url), viaSafe), (res) => Effect.promise(async () => ({ status: res?.status ?? 0, text: (await res?.text()) ?? "" })));
+
+        return Effect.runPromise(program.pipe(Effect.provide(rigLayers({ url, npm: npm.url, store: capped(100_000) })), Effect.scoped));
+      };
+
+      for (const viaSafe of [false, true]) {
+        const r = await served("/twoscores/1.0.1", viaSafe);
+
+        // on 6f206c5: 503, both versions' analyses read
+        expect(r.status).toBe(200);
+        expect(r.text).toContain('"_apmScore"');
+      }
+
+      expect((await served("/twoscores", false, { authorization: "Bearer x", accept: "application/vnd.npm.install-v1+json" })).status).toBe(200);
+      // the full packument embeds every version's score: one that does not fit is a 503, never left out
+      expect((await served("/twoscores", false)).status).toBe(503);
+    }));
+
+  test("a root analysis that lands during the resolve and does not fit its reread is a 503 naming the budget, not a 404", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("late", [doc("late", "1.0.0")]);
+      let reads = 0;
+
+      // the first read finds no analysis of late@1.0.0, so the resolve waits for it; by the reread it has landed, too large
+      const landing = (s: StoreApi): StoreApi => ({
+        ...s,
+        upstreamAnalysesWithin: (input) =>
+          ++reads === 1 ? s.upstreamAnalysesWithin(input) : Effect.flatMap(Effect.promise(() => (reads === 2 ? scored(sql, "late", "1.0.0") : Promise.resolve())), () => s.upstreamAnalysesWithin({ ...input, allowance: 0 })),
+      });
+
+      const r = await resolve({ url, npm: npm.url, name: "late", store: landing });
+
+      expect(reads).toBeGreaterThanOrEqual(2);
+      // on 6f206c5: 404, "No package named late"
+      expect(r.status).toBe(503);
+      expect(r.text).toContain(OVER_BUDGET_TEXT);
+      expect(r.text).not.toContain("No package named");
+    }));
+
+  /** `path` through upstreamRoute with rigLayers. */
+  const route = async (input: { url: string; npm: string; path: string; viaSafe: boolean; store?: (s: StoreApi) => StoreApi; listed?: readonly string[] }) => {
+    const req = new Request(`http://registry.test${input.path}`);
+    const program = Effect.flatMap(upstreamRoute(req, new URL(req.url), input.viaSafe), (res) => Effect.promise(async () => ({ status: res?.status ?? 0, text: (await res?.text()) ?? "" })));
+
+    return Effect.runPromise(program.pipe(Effect.provide(rigLayers(input)), Effect.scoped));
+  };
+
+  // Review of fb84083: the statement was sent the lease's headroom as its allowance, reserved from nothing, so a reply
+  // could pass the isolate's pool before it was charged
+  test("a read of analyses reserves its allowance before it is sent", () =>
+    withRig(async ({ url, npm, sql }) => {
+      for (const [n, v] of [["app", "1.0.0"], ["dep", "1.0.0"], ["risky", "1.0.0"]] as const) await scored(sql, n, v);
+      const lease = new MemoryPool().request();
+      const seen: { allowance: number; taken: number }[] = [];
+      const watched = (s: StoreApi): StoreApi => ({ ...s, upstreamAnalysesWithin: (input) => Effect.suspend(() => (seen.push({ allowance: input.allowance, taken: lease.taken }), s.upstreamAnalysesWithin(input))) });
+
+      try {
+        expect((await resolve({ url, npm: npm.url, name: "app", store: watched, lease })).status).toBe(200);
+        expect(seen.length).toBeGreaterThan(0);
+
+        for (const call of seen) {
+          // on fb84083: 72 MiB of headroom sent, about 0.1 MiB taken
+          expect(call.allowance).toBeLessThanOrEqual(16 * 1024 * 1024);
+          expect(call.taken).toBeGreaterThanOrEqual(call.allowance);
+        }
+      } finally {
+        lease.release();
+      }
+    }));
+
+  // Review of fb84083: an unread root was a 503 before its candidates' state was checked, so one the feed lists all of
+  // was not refused as such
+  test("a root whose analyses do not fit still has its candidates checked against the feed: all listed is a 422", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("rootlisted", [doc("rootlisted", "1.0.0"), doc("rootlisted", "1.1.0")]);
+      await scored(sql, "rootlisted", "1.1.0");
+      const listed = ["rootlisted@1.0.0", "rootlisted@1.1.0"];
+
+      for (const strict of [false, true]) {
+        const r = await resolve({ url, npm: npm.url, name: "rootlisted", range: "^1.0.0", strict, store: capped(0), listed });
+
+        // on fb84083: 503, the budget
+        expect(r.status).toBe(422);
+        expect(r.text).toContain("MAL-TEST");
+      }
+
+      // one not listed is a 503 naming the budget, never answered without its score
+      const one = await resolve({ url, npm: npm.url, name: "rootlisted", range: "^1.0.0", store: capped(0), listed: ["rootlisted@1.1.0"] });
+
+      expect(one.status).toBe(503);
+      expect(one.text).toContain(OVER_BUDGET_TEXT);
+    }));
+
+  // the plain tarball takes the fast path (fast-tarball.ts), which reads no score
+  test("a ~safe tarball the feed lists is refused as listed when its package's analyses do not fit", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("tarlisted", [doc("tarlisted", "1.0.0")]);
+      await scored(sql, "tarlisted", "1.0.0");
+      const r = await route({ url, npm: npm.url, path: "/tarlisted/-/tarlisted-1.0.0.tgz", viaSafe: true, store: capped(0), listed: ["tarlisted@1.0.0"] });
+
+      // on fb84083: 503
+      expect(r.status).toBe(403);
+    }));
+
+  // Review of c752a16: with only its analyses refused, the listing npm sent was dropped, so the digest-specific reviewer
+  // check, which needs no score, did not run
+  test("a ~safe tarball an apm reviewer confirmed malicious is refused when only its package's analyses do not fit", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("tarrev", [doc("tarrev", "1.0.0"), doc("tarrev", "1.1.0")]);
+      await scored(sql, "tarrev", "1.0.0");
+      await scored(sql, "tarrev", "1.1.0");
+      let asked = 0;
+
+      const reviewed = (s: StoreApi): StoreApi => ({
+        ...capped(0)(s),
+        confirmedReviews: (name) => {
+          if (name !== "tarrev") return s.confirmedReviews(name);
+          asked++;
+
+          return Effect.succeed([{ version: "1.0.0", digest: label("tarrev", "1.0.0") }]);
+        },
+      });
+
+      const tarball = await route({ url, npm: npm.url, path: "/tarrev/-/tarrev-1.0.0.tgz", viaSafe: true, store: reviewed });
+
+      // on c752a16: 503, and the reviewers were not asked
+      expect(tarball.status).toBe(410);
+      expect(asked).toBeGreaterThan(0);
+      expect((await route({ url, npm: npm.url, path: "/tarrev/1.0.0", viaSafe: true, store: reviewed })).status).toBe(404);
+      // a version they did not confirm is the budget's 503: it needs a score
+      const other = await route({ url, npm: npm.url, path: "/tarrev/-/tarrev-1.1.0.tgz", viaSafe: true, store: reviewed });
+
+      expect(other.status).toBe(503);
+      expect(other.text).toContain(OVER_BUDGET_TEXT);
+    }));
+
+  // Review of dd47451: the whole packument skipped both checks when only its scores did not fit
+  test("a ~safe packument whose analyses do not fit still asks the reviewers and the feed, and names what they refuse in its 503", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("pkgrev", [doc("pkgrev", "1.0.0"), doc("pkgrev", "1.1.0")]);
+      await scored(sql, "pkgrev", "1.0.0");
+      await scored(sql, "pkgrev", "1.1.0");
+      let asked = 0;
+
+      const reviewed = (s: StoreApi): StoreApi => ({
+        ...capped(0)(s),
+        confirmedReviews: (name) => {
+          if (name !== "pkgrev") return s.confirmedReviews(name);
+          asked++;
+
+          return Effect.succeed([{ version: "1.0.0", digest: label("pkgrev", "1.0.0") }]);
+        },
+      });
+
+      const r = await route({ url, npm: npm.url, path: "/pkgrev", viaSafe: true, store: reviewed, listed: ["pkgrev@1.1.0"] });
+      const body = z.object({ error: z.string(), confirmed: z.array(z.string()), knownMalicious: z.array(z.object({ version: z.string() })) }).parse(JSON.parse(r.text));
+
+      expect(r.status).toBe(503);
+      expect(body.error).toContain(OVER_BUDGET_TEXT);
+      // on dd47451: neither asked
+      expect(asked).toBeGreaterThan(0);
+      expect(body.confirmed).toEqual(["1.0.0"]);
+      expect(body.knownMalicious.map((m) => m.version)).toEqual(["1.1.0"]);
+    }));
+
+  // Review of fb84083: with no latest tag from npm, latest was read as an exact version, so ~safe's fallback had no scores
+  test("~safe/latest of a package npm names no latest of answers the highest version the view keeps", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("nolatest", [doc("nolatest", "1.0.0")]);
+      npm.tags.set("nolatest", { latest: "" });
+      await scored(sql, "nolatest", "1.0.0");
+      const r = await route({ url, npm: npm.url, path: "/nolatest/latest", viaSafe: true });
+
+      // on fb84083: 404
+      expect(r.status).toBe(200);
+      expect(r.text).toContain('"_apmScore"');
     }));
 });

@@ -1,0 +1,219 @@
+// The OSSF feed's reads of one name's advisories (osv.ts advisoriesFor) are bounded: each MAL- id is read once, at most
+// MAX_ADVISORIES of them across every page, a page's all at once, and none past MAX_ADVISORY_BYTES. An advisory past a bound
+// is not read, so it withholds every version of the name; the answer is partial and not kept, so the next request asks
+// again. Reads that overlap spend the request's OSV budget once, not once each. OSV is a stand-in
+// fetcher; no network and no database.
+import { describe, expect, test } from "bun:test";
+import { Effect, Layer } from "effect";
+import { z } from "zod";
+import { readCapped } from "../src/http.ts";
+import { ISOLATE_POOL, type Lease, MemoryPool, RequestMemory } from "../src/memory.ts";
+import { KnownMalicious, listedAmong, MAX_ADVISORIES, MAX_ADVISORY_BYTES, osvFeed, type Advisory } from "../src/osv.ts";
+
+/**
+ * `pages`: the MAL- ids of each page of the name's answer, in order, duplicates kept. `failOnce`: ids whose first read
+ * OSV answers 503. `lease`: the request's (RequestMemory), when it has one.
+ */
+type Stand = { pages: string[][]; huge?: ReadonlySet<string>; readMs?: number; cancelFails?: boolean; failOnce?: ReadonlySet<string>; lease?: Lease };
+
+const PageQuery = z.object({ queries: z.array(z.object({ page_token: z.string().optional() })) });
+
+/** OSV for one name; each advisory names version 1.0.0. */
+function standIn(name: string, stand: Stand) {
+  const counts = { reads: new Map<string, number>(), inFlight: 0, maxInFlight: 0, cancels: 0 };
+
+  // SAFETY: osvFeed calls its fetcher only with a URL string and RequestInit, the call shape this stand-in reads
+  const fetcher = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const path = new URL(String(input)).pathname;
+    const read = /\/v1\/vulns\/(.+)$/.exec(path);
+
+    if (!read?.[1]) {
+      const page = Number(PageQuery.parse(JSON.parse(String(init?.body))).queries[0]?.page_token ?? "0");
+      const next = page + 1 < stand.pages.length ? { next_page_token: String(page + 1) } : {};
+
+      return Response.json({ results: [{ vulns: (stand.pages[page] ?? []).map((id) => ({ id, modified: "2026-11-24T00:00:00Z" })), ...next }] });
+    }
+
+    const id = decodeURIComponent(read[1]);
+
+    counts.reads.set(id, (counts.reads.get(id) ?? 0) + 1);
+
+    if (stand.failOnce?.has(id) === true && counts.reads.get(id) === 1) return new Response("unavailable", { status: 503 });
+    counts.inFlight++;
+    counts.maxInFlight = Math.max(counts.maxInFlight, counts.inFlight);
+
+    try {
+      await Bun.sleep(stand.readMs ?? 5);
+
+      const body = JSON.stringify({ id, affected: [{ package: { name, ecosystem: "npm" }, versions: ["1.0.0"] }], details: stand.huge?.has(id) === true ? "x".repeat(MAX_ADVISORY_BYTES) : "" });
+
+      if (stand.cancelFails !== true) return new Response(body, { headers: { "content-type": "application/json" } });
+      const bytes = new TextEncoder().encode(body);
+
+      // a body still open past the cap whose cancel rejects, as a broken connection's can: a closed one is not cancelled
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start: (c) => {
+            for (let at = 0; at < bytes.length; at += 64 * 1024) c.enqueue(bytes.slice(at, at + 64 * 1024));
+          },
+          cancel: () => {
+            counts.cancels++;
+
+            return Promise.reject(new Error("connection reset"));
+          },
+        }),
+      );
+    } finally {
+      counts.inFlight--;
+    }
+  }) as typeof fetch;
+
+  const root = `https://osv.test/${crypto.randomUUID()}/`;
+  const memory = stand.lease === undefined ? Layer.empty : Layer.succeed(RequestMemory, stand.lease);
+  const ask = (): Promise<readonly Advisory[]> => Effect.runPromise(Effect.flatMap(KnownMalicious, (k) => k.advisoriesFor(name)).pipe(Effect.provide(Layer.merge(osvFeed(root, fetcher), memory))));
+
+  return { counts, ask };
+}
+
+const reads = (counts: { reads: Map<string, number> }): number => [...counts.reads.values()].reduce((a, b) => a + b, 0);
+
+const idsFrom = (from: number, n: number): string[] => Array.from({ length: n }, (_, i) => `MAL-2026-${from + i}`);
+
+describe("one name's advisory reads are bounded", () => {
+  test("an id the answer lists twice is read once, and the answer is complete and kept", async () => {
+    const s = standIn("twice-listed", { pages: [["MAL-2026-1", "MAL-2026-1", "MAL-2026-2"]] });
+
+    expect((await s.ask()).map((a) => a.id)).toEqual(["MAL-2026-1", "MAL-2026-2"]);
+    expect([...s.counts.reads.values()]).toEqual([1, 1]);
+    // kept: the next request reads nothing
+    expect((await s.ask()).map((a) => a.id)).toEqual(["MAL-2026-1", "MAL-2026-2"]);
+    expect(reads(s.counts)).toBe(2);
+  });
+
+  test("past MAX_ADVISORIES ids, only that many are read, all at once; the rest withhold every version, and the partial answer is not kept", async () => {
+    const ids = idsFrom(1000, MAX_ADVISORIES + 36);
+    const s = standIn("many-listed", { pages: [ids] });
+    const first = await s.ask();
+
+    expect(first.map((a) => a.id).toSorted()).toEqual(ids.toSorted());
+    expect(first.filter((a) => a.versions.includes("1.0.0")).map((a) => a.id)).toEqual(ids.slice(0, MAX_ADVISORIES));
+    // a version only an unread advisory could name is withheld too
+    expect(listedAmong("many-listed", first.filter((a) => a.id === ids.at(-1)), ["2.0.0", "0.0.1-beta"]).size).toBe(2);
+    expect(reads(s.counts)).toBe(MAX_ADVISORIES);
+    expect(s.counts.maxInFlight).toBe(MAX_ADVISORIES);
+    // not kept: the next request asks OSV again
+    await s.ask();
+    expect(reads(s.counts)).toBe(2 * MAX_ADVISORIES);
+  });
+
+  test("MAX_ADVISORIES counts every page: an id a later page repeats is not read again, and the reads stop at the bound", async () => {
+    const s = standIn("paged-listed", { pages: [idsFrom(2000, 40), [...idsFrom(2000, 5), ...idsFrom(3000, 40)]] });
+    const got = await s.ask();
+
+    expect(reads(s.counts)).toBe(MAX_ADVISORIES);
+    expect([...s.counts.reads.values()].every((n) => n === 1)).toBe(true);
+    expect(got.filter((a) => a.versions.length > 0).map((a) => a.id)).toEqual([...idsFrom(2000, 40), ...idsFrom(3000, MAX_ADVISORIES - 40)]);
+    expect(got.filter((a) => a.versions.length === 0).map((a) => a.id)).toEqual(idsFrom(3000 + MAX_ADVISORIES - 40, 40 - (MAX_ADVISORIES - 40)));
+  });
+
+  test("an advisory over MAX_ADVISORY_BYTES is not read and withholds every version; the other one still withholds its own, and the partial answer is not kept", async () => {
+    const s = standIn("one-huge", { pages: [["MAL-2026-7", "MAL-2026-8"]], huge: new Set(["MAL-2026-8"]) });
+    const got = await s.ask();
+
+    expect(got.map((a) => a.id).toSorted()).toEqual(["MAL-2026-7", "MAL-2026-8"]);
+    expect([...listedAmong("one-huge", got, ["1.0.0", "3.1.4"]).values()].map((m) => m.ids)).toEqual([["MAL-2026-7", "MAL-2026-8"], ["MAL-2026-8"]]);
+    await s.ask();
+    expect(s.counts.reads.get("MAL-2026-7")).toBe(2);
+  });
+
+  // Sol on e2081f3: a cancel that rejected after the cap made the advisory a transient failure, serving its versions
+  test("an oversized advisory whose body fails to cancel still withholds every version", async () => {
+    const s = standIn("cancel-fails", { pages: [["MAL-2026-9"]], huge: new Set(["MAL-2026-9"]), cancelFails: true });
+
+    expect(listedAmong("cancel-fails", await s.ask(), ["1.0.0", "2.0.0"]).size).toBe(2);
+    // Sol on de628d8: the fixture closed its stream, so Bun never ran the rejecting cancel
+    expect(s.counts.cancels).toBe(1);
+  });
+
+  // Sol on de628d8: every id was marked asked for before its read, so one whose read failed was skipped when a later
+  // page listed it again, and the versions it names were served
+  test("an advisory whose read failed is read again when a later page lists it", async () => {
+    const s = standIn("retried", { pages: [["MAL-2026-11"], ["MAL-2026-11", "MAL-2026-12"]], failOnce: new Set(["MAL-2026-11"]) });
+    const got = await s.ask();
+
+    expect(s.counts.reads.get("MAL-2026-11")).toBe(2);
+    expect(got.map((a) => [a.id, a.versions])).toEqual([
+      ["MAL-2026-11", ["1.0.0"]],
+      ["MAL-2026-12", ["1.0.0"]],
+    ]);
+    // Sol on fb84083: recovered, the answer is complete and kept, so the next request reads nothing
+    await s.ask();
+    expect(s.counts.reads.get("MAL-2026-11")).toBe(2);
+  });
+
+  // Sol on fb84083: a withheld advisory's range from 0 named only versions SemVer reads
+  test("an advisory withheld unread names every version npm lists, SemVer or not", async () => {
+    const s = standIn("odd-versions", { pages: [["MAL-2026-15"]], huge: new Set(["MAL-2026-15"]) });
+
+    expect([...listedAmong("odd-versions", await s.ask(), ["1.0.0", "1.0", "v2", "latest-build"]).keys()]).toEqual(["1.0.0", "1.0", "v2", "latest-build"]);
+  });
+
+  // Sol on fb84083: what the isolate kept of a name was charged to the request that read it, and to nothing after
+  test("what the isolate keeps of a name's advisories stays charged to its pool after the request", async () => {
+    const before = ISOLATE_POOL.charged;
+    const lease = ISOLATE_POOL.request();
+    const s = standIn("kept-charged", { pages: [["MAL-2026-16"]], lease });
+
+    await s.ask();
+    lease.release();
+    expect(ISOLATE_POOL.charged).toBeGreaterThan(before);
+  });
+
+  // Sol on de628d8: what a read of an advisory holds was charged to nothing
+  test("an advisory's read is charged to the request, and one the request has no room for withholds every version", async () => {
+    const roomy = new MemoryPool().request();
+
+    try {
+      const s = standIn("charged", { pages: [["MAL-2026-13"]], lease: roomy });
+
+      expect(listedAmong("charged", await s.ask(), ["1.0.0", "2.0.0"]).size).toBe(1);
+      // its bytes' room while it was read, and what was kept of it after
+      expect(roomy.peakTaken).toBeGreaterThanOrEqual(2 * MAX_ADVISORY_BYTES);
+      expect(roomy.taken).toBeGreaterThan(0);
+      expect(roomy.taken).toBeLessThan(64 * 1024);
+    } finally {
+      roomy.release();
+    }
+
+    const full = new MemoryPool().request();
+
+    try {
+      expect(full.take(full.headroom - 1024)).toBe(true);
+      const s = standIn("no-room", { pages: [["MAL-2026-14"]], lease: full });
+
+      // on de628d8: read anyway, so only 1.0.0
+      expect(listedAmong("no-room", await s.ask(), ["1.0.0", "2.0.0"]).size).toBe(2);
+      expect(s.counts.reads.size).toBe(0);
+    } finally {
+      full.release();
+    }
+  });
+
+  test("readCapped answers over the limit even when the cancel after it rejects", async () => {
+    let reads = 0;
+    const reader = { read: async () => (reads++ < 4 ? { done: false, value: new Uint8Array(1024) } : { done: true, value: undefined }), cancel: () => Promise.reject(new Error("connection reset")) };
+    const source = { body: Object.assign(new ReadableStream<Uint8Array>(), { getReader: () => reader }) };
+
+    expect(await readCapped(source, 2048)).toBeNull();
+  });
+
+  // Sol on c4a535c and Greptile on cc2bd34: reads that overlapped were each charged their whole wait, and reads queued
+  // behind a concurrency cap could start after the budget was spent, leaving listed advisories unread
+  test("a page's advisories are read at once and spend the budget once: 64 advisories of 650 ms each are all read", async () => {
+    const ids = idsFrom(4000, MAX_ADVISORIES);
+    const s = standIn("slow-listed", { pages: [ids], readMs: 650 });
+
+    expect((await s.ask()).map((a) => a.id)).toEqual(ids);
+    expect(s.counts.maxInFlight).toBe(MAX_ADVISORIES);
+  });
+});

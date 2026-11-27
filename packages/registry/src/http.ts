@@ -406,27 +406,38 @@ export function failureResponse(f: HttpFailure): Response {
 /**
  * Reads a body (a request's or a response's) up to `max` bytes. The stream is cancelled as soon as it passes the
  * limit, so a client that sends no Content-Length, or a false one, cannot make the Worker buffer more than
- * `max` plus one chunk. Null when the body is over the limit.
+ * `max` plus one chunk. Null when the body is over the limit. When `signal` aborts first, the stream is cancelled and
+ * the read rejects with its reason; an abort once the body is known to be over the limit changes nothing.
  */
-export async function readCapped(source: { readonly body: ReadableStream<Uint8Array> | null }, max: number): Promise<Uint8Array | null> {
+export async function readCapped(source: { readonly body: ReadableStream<Uint8Array> | null }, max: number, signal?: AbortSignal): Promise<Uint8Array | null> {
   if (!source.body) return new Uint8Array(0);
   const chunks: Uint8Array[] = [];
   let total = 0;
   const reader = source.body.getReader();
+  const cancel = (): void => void reader.cancel().catch(() => undefined);
 
-  for (;;) {
-    const { done, value } = await reader.read();
+  signal?.addEventListener("abort", cancel, { once: true });
 
-    if (done) break;
-    total += value.length;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
 
-    if (total > max) {
-      await reader.cancel();
+      if (signal?.aborted === true) throw signal.reason instanceof Error ? signal.reason : new Error("the read was stopped");
 
-      return null;
+      if (done) break;
+      total += value.length;
+
+      // over the limit whatever the cancel does: a failed cancel must not turn the answer into a read error
+      if (total > max) {
+        await reader.cancel().catch(() => undefined);
+
+        return null;
+      }
+
+      chunks.push(value);
     }
-
-    chunks.push(value);
+  } finally {
+    signal?.removeEventListener("abort", cancel);
   }
 
   return Buffer.concat(chunks);

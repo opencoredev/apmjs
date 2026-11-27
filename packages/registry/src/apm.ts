@@ -280,8 +280,13 @@ const pageLookup = (name: string, lease: Lease, need: PageNeed) =>
     if (!upstream) return null;
     const probe = yield* pageProbe({ upstream, name, need, lease, first: { kind: "read", kept: row.kept, analyses: row.analyses, whole: row.whole } });
 
+    if (probe.kind === "unknown") return "unknown" as const;
+
     return probe.kind === "found" ? { src: upstreamSource(probe.pkg), maintainers: probe.pkg.maintainers } : null;
   });
+
+/** What a page route answers when pageLookup is "unknown": npm did not answer, or the package did not fit the request. */
+const PAGE_UNKNOWN = "apm could not read this package in time. Try again shortly.";
 
 /** Upstream.probe's wanted for a reader of no score: whether npm has the package, and its versions. */
 const NO_SCORES: Wanted = () => new Map();
@@ -296,7 +301,7 @@ const latestWanted =
     new Map([...Object.values(pkg.distTags), ...pkg.versions.filter((v) => v.published_at >= at - RECENT_SEED_MS).map((v) => v.version)].map((v) => [v, "trimmed"] as const));
 
 /** Like lookupOrUnknown, with a package that did not fit `lease` kept apart as "over-budget". */
-const lookupWithin = (name: string, lease: Lease, wanted?: Wanted) =>
+const lookupWithin = (name: string, lease: Lease, wanted: Wanted) =>
   Effect.gen(function* () {
     const pkg = yield* (yield* Store).getPackage(name);
 
@@ -304,7 +309,7 @@ const lookupWithin = (name: string, lease: Lease, wanted?: Wanted) =>
     const upstream = yield* upstreamOrNull;
 
     if (!upstream) return null;
-    const p = yield* (wanted === undefined ? upstream.probeWithin(name, lease) : upstream.probeWithinFor(name, wanted, lease));
+    const p = yield* upstream.probeWithinFor(name, wanted, lease);
 
     switch (p.kind) {
       case "found":
@@ -314,6 +319,8 @@ const lookupWithin = (name: string, lease: Lease, wanted?: Wanted) =>
       case "unknown":
       case "over-budget":
         return p.kind;
+      case "unread":
+        return { kind: "unread" as const, src: upstreamSource(p.pkg) };
       default: {
         const _exhaustive: never = p;
 
@@ -475,13 +482,15 @@ const catalogWithin = (name: string, lease: Lease, choice: KeyedSelect) =>
       lease,
       choices: () => choices,
       keep: (c, reserve) => keptSummary({ kind: "upstream", name: c.name, distTags: c.distTags, versions: [...(c.versions.get(choice.key) ?? [])] }, reserve),
+      // a resolve's root answer embeds its version's report whole
+      analyses: "whole",
     });
 
     return lookupOf(got.get(name));
   });
 
 /** Like lookup, but keeps "upstream could not be asked" apart from "nobody has it". */
-const lookupOrUnknown = (name: string, lease: Lease, wanted?: Wanted) =>
+const lookupOrUnknown = (name: string, lease: Lease, wanted: Wanted) =>
   Effect.gen(function* () {
     const pkg = yield* (yield* Store).getPackage(name);
 
@@ -489,7 +498,7 @@ const lookupOrUnknown = (name: string, lease: Lease, wanted?: Wanted) =>
     const upstream = yield* upstreamOrNull;
 
     if (!upstream) return null;
-    const probe = yield* (wanted === undefined ? upstream.probe(name, lease) : upstream.probeFor(name, wanted, lease));
+    const probe = yield* upstream.probeFor(name, wanted, lease);
 
     if (probe.kind === "unknown") return "unknown" as const;
 
@@ -575,9 +584,13 @@ export function manifestMismatch(body: Record<string, unknown>, tar: Record<stri
  * `unavailable`: the upstream could not be asked, so whether the dependency exists, and what it is, is not known.
  * `over-budget`: the request held as much package metadata as it may (REQUEST_METADATA_WEIGHT), so it was not read.
  * `out-of-time`: the walk's time ran out (WALK_BUDGET_MS) before it was read.
+ * `unread`: the version picked, read without its analysis, which did not fit the request: what needs no score (its
+ * state, the OSSF feed, apm's reviewers, its integrity) is still checked of it, and it is never taken for one with no
+ * score, so it is unchecked for `reason`.
  */
 type Picked =
   | { kind: "found"; src: Catalog; v: VersionRecord }
+  | { kind: "unread"; src: Catalog; v: VersionRecord; reason: string }
   | { kind: "missing"; reason: string }
   | { kind: "unavailable"; reason: string }
   | { kind: "over-budget"; reason: string }
@@ -592,11 +605,25 @@ const found = (src: Catalog, v: VersionRecord): Picked => ({ kind: "found", src,
  */
 type Lookup = Catalog | null | "unknown" | "over-budget";
 
+/** A catalog read as a lookup is, or one kept without its analyses, which did not fit the request (Upstream.chosen). */
+type CatalogRead = Lookup | { kind: "unread"; src: Catalog };
+
 /** What the walk's `keep` reads of a version to decide whether it may install: its package, number and state. */
 type Keepable = Pick<VersionRecord, "package" | "version" | "status">;
 
-/** The newest version a registry dependency (plain or npm: alias) would install, among those `keep` allows. */
-const pickDependency = (dep: RegistryDependency, keep: (v: Keepable) => boolean, lease: Lease) => Effect.map(lookupOrUnknown(dep.name, lease), (src) => pickFrom(src, dep, keep));
+/**
+ * The newest version a registry dependency (plain or npm: alias) would install, among those `keep` allows, with the
+ * score and grade of that version only: the pick is made of the package before any analysis is read.
+ */
+const pickDependency = (dep: RegistryDependency, keep: (v: Keepable) => boolean, lease: Lease) =>
+  Effect.map(
+    lookupOrUnknown(dep.name, lease, (pkg) => {
+      const v = pickVersion({ distTags: pkg.distTags, versions: pkg.versions, dep, keep });
+
+      return new Map(v ? [[v.version, "trimmed"] as const] : []);
+    }),
+    (src) => pickFrom(src, dep, keep),
+  );
 
 /** The version of `versions` (heads or whole rows) a dependency picks: the newest in its range or tag that `keep` allows. */
 function pickVersion<V extends Pick<VersionRecord, "version" | "status">>(input: { distTags: Record<string, string>; versions: readonly V[]; dep: RegistryDependency; keep: (v: V) => boolean }): V | undefined {
@@ -640,7 +667,7 @@ function pickFrom(src: Lookup, dep: RegistryDependency, keep: (v: Keepable) => b
  * batch given a deadline answers "out-of-time", and the readers that come here (a resolve's root) give none: it would
  * mean the package was not read, so it counts as not asked.
  */
-function lookupOf(p: ChosenAnswer<Catalog> | undefined): Lookup {
+function lookupOf(p: ChosenAnswer<Catalog> | undefined): CatalogRead {
   if (p === undefined) return "unknown";
 
   switch (p.kind) {
@@ -653,6 +680,8 @@ function lookupOf(p: ChosenAnswer<Catalog> | undefined): Lookup {
       return "unknown";
     case "over-budget":
       return "over-budget";
+    case "unread":
+      return { kind: "unread", src: p.summary };
     default: {
       const _exhaustive: never = p;
 
@@ -789,6 +818,8 @@ function pickMemo(lease: Lease, keep: (v: Keepable) => boolean, deadline: { at: 
             lease,
             choices: (name) => (byName.get(name) ?? []).map((d) => dependencyChoice(d, keep)),
             keep: (c, reserve) => upstreamPicks(c, byName.get(c.name) ?? [], reserve),
+            // a dependency's score, grade, signals and coverage are read (reportFor), never its unread files or capabilities
+            analyses: "trimmed",
             deadline: deadline.at,
           })
         : null;
@@ -800,6 +831,12 @@ function pickMemo(lease: Lease, keep: (v: Keepable) => boolean, deadline: { at: 
           // a package npm had: its picks; one not read in time: unchecked, for that reason; otherwise every range of it
           // is picked from what the lookup came to
           if (answer?.kind === "found") known.set(pickKey(d), answer.summary.get(pickKey(d)) ?? { kind: "unavailable", reason: UNAVAILABLE_TEXT });
+          // its analyses did not fit: the version it picks is kept, so what needs no score is still checked of it
+          else if (answer?.kind === "unread") {
+            const p = answer.summary.get(pickKey(d)) ?? { kind: "unavailable", reason: UNAVAILABLE_TEXT };
+
+            known.set(pickKey(d), p.kind === "found" ? { kind: "unread", src: p.src, v: p.v, reason: OVER_BUDGET_TEXT } : p);
+          }
           else if (answer?.kind === "out-of-time") known.set(pickKey(d), { kind: "out-of-time", reason: outOfTimeText(deadline.ms) });
           else known.set(pickKey(d), pickFrom(answer === undefined ? "unknown" : answer.kind === "absent" ? null : answer.kind, d, keep));
         }
@@ -1432,6 +1469,8 @@ const packageResponse = (name: string) =>
     const lease = yield* RequestMemory;
     const found = yield* pageLookup(name, lease, { kind: "page" });
 
+    if (found === "unknown") return fail(503, PAGE_UNKNOWN);
+
     if (!found) return fail(404, "Not found");
     const { src, maintainers } = found;
 
@@ -1531,7 +1570,10 @@ const packageExists = (path: string) =>
 const versionResponse = (name: string, version: string) =>
   Effect.gen(function* () {
     const at = yield* now;
-    const src = (yield* pageLookup(name, yield* RequestMemory, { kind: "version", version }))?.src;
+    const found = yield* pageLookup(name, yield* RequestMemory, { kind: "version", version });
+
+    if (found === "unknown") return fail(503, PAGE_UNKNOWN);
+    const src = found?.src;
 
     if (!src) return fail(404, "Not found");
     const v0 = src.versions.find((x) => x.version === version);
@@ -1601,7 +1643,10 @@ type WorkedOut =
   // `waiting`: the latest version, when the current scorer has no result for it yet (the queue may score it); `seeds`:
   // the other versions a dist-tag names or published recently with no result yet (analysis.ts, versionsToSeed)
   | { kind: "upstream"; score: LatestScore; waiting: string | null; seeds: string[] }
-  | { kind: "unavailable" };
+  // npm did not answer
+  | { kind: "unavailable" }
+  // npm answered, but the package or its scores did not fit the request: what is kept may be out of date
+  | { kind: "omitted" };
 
 /**
  * Popular latest versions one sweep queues for the current scorer (refreshLatestScores): the home page's dozen, after a
@@ -1639,7 +1684,10 @@ const workOutLatestScore = (name: string, known: boolean) =>
       if (!local && !known && !(yield* store.upstreamScored(name))) return { kind: "unanalysed", score: none } satisfies WorkedOut;
       const src = yield* lookupWithin(name, lease, latestWanted(at));
 
-      if (src === "unknown" || src === "over-budget") return { kind: "unavailable" } satisfies WorkedOut;
+      if (src === "unknown") return { kind: "unavailable" } satisfies WorkedOut;
+
+      // its scores did not fit: not one with no score, nor one npm could not be asked about
+      if (src === "over-budget" || src?.kind === "unread") return { kind: "omitted" } satisfies WorkedOut;
       const latest = src ? src.versions.find((v) => v.version === src.distTags.latest) : undefined;
       // an upstream version carries its stored analysis already (upstream.get reads them); none means not scored yet
       const r = latest ? reportFor(latest, at) : null;
@@ -1693,6 +1741,9 @@ const popularScoresResponse = (url: URL) =>
 
             case "unavailable":
               return Effect.succeed(hit?.score ?? { name, version: null, score: null, grade: null });
+            // an expired kept score is not sent as the current one when npm answered and only the read did not fit
+            case "omitted":
+              return Effect.succeed({ name, version: null, score: null, grade: null });
             default: {
               const _exhaustive: never = w;
 
@@ -1782,6 +1833,7 @@ export const refreshLatestScores = Effect.gen(function* () {
             }
 
             case "unavailable":
+            case "omitted":
               return Effect.succeed(0);
             default: {
               const _exhaustive: never = w;
@@ -2797,7 +2849,7 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
         continue;
       }
 
-      if (picked.kind !== "found") {
+      if (picked.kind !== "found" && picked.kind !== "unread") {
         miss(dep, item.edge === "peer" ? `peer dependency: ${picked.reason}` : picked.reason, item.via);
         continue;
       }
@@ -2837,6 +2889,23 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
       packages.push(platform === null ? { name: dep.name, version: picked.v.version } : { name: dep.name, version: picked.v.version, platform });
       const digest = digestOf(picked.v);
       digests.push(digest ? digestLabel(digest) : null);
+
+      if (picked.kind === "unread") {
+        // its score did not fit the request: unchecked, never pending or clean. It stays listed, so the OSSF feed and
+        // apm's reviewers still decide on it, and what it installs is walked. Its age needs no score: a fresh one still
+        // warns of the cooldown
+        miss(dep, picked.reason, item.via);
+        limited = true;
+        const fresh = cooldownWarning({ name: dep.name, version: picked.v.version, ageMs: at - picked.v.published_at, cooldownMs: policy.cooldownMs, url: versionUrl(webUrl, dep.name, picked.v.version), via: item.via });
+
+        if (fresh) warnings.push(fresh);
+        children.set(key, installedChildren(picked.v.manifest));
+
+        for (const e of installEdges(picked.v.manifest)) queue.push({ dep: e.spec, edge: e.edge, via: [...item.via, key], installedAs: [...item.installedAs, dep.key], level: item.level + 1 });
+
+        continue;
+      }
+
       let v = picked.v;
 
       // a capped resolve (anonymous) queues only what its allowance admits, nearest first; the rest answer as queued ones
@@ -3017,6 +3086,19 @@ const CONFIRMED_SKIP = "confirmed malicious by an apm reviewer";
 
 const answered = (response: Response): ResolvePass => ({ kind: "answer", response });
 
+/**
+ * A resolve whose root could not be looked up, or did not fit the request: nothing to install and not a pass, so a 503 a
+ * retry may get past, naming which (an absent root is a 404).
+ */
+const rootUnread = (name: string, range: string, why: "unknown" | "over-budget") =>
+  json(
+    why === "unknown"
+      ? { error: `${name} ${UNAVAILABLE_TEXT}. Nothing was installed; try again in a minute.`, name, range, version: null, unavailable: [{ dependency: name, via: [] }], retryAfter: PENDING_RETRY_AFTER_S }
+      : { error: `${name}: ${OVER_BUDGET_TEXT}. Nothing was installed; try again in a minute.`, name, range, version: null, retryAfter: PENDING_RETRY_AFTER_S },
+    503,
+    { "cache-control": "no-store", "retry-after": String(PENDING_RETRY_AFTER_S) },
+  );
+
 const waitingOn = (p: Omit<Extract<ResolvePass, { kind: "pending" }>, "kind">): ResolvePass => ({ kind: "pending", ...p });
 
 /**
@@ -3034,7 +3116,8 @@ type ResolveMode = { strict: boolean; final: boolean };
 /** A later page of a resolve's root, read under `lease` (rootPage): the catalog, or why it could not be read. */
 type PageRead = (offset: number, lease: Lease) => ReturnType<typeof catalogWithin>;
 
-type PassInput = { name: string; range: string; policy: Policy; treePolicy: Policy; target: InstallTarget; project: ProjectDeps; src: Catalog; mode: ResolveMode; lease: Lease; page: PageRead; allowance: QueueAllowance };
+/** `scored`: whether `src` was read with its analyses; one kept without them (unread) still has its candidates' state checked. */
+type PassInput = { name: string; range: string; policy: Policy; treePolicy: Policy; target: InstallTarget; project: ProjectDeps; src: Catalog; scored: boolean; mode: ResolveMode; lease: Lease; page: PageRead; allowance: QueueAllowance };
 
 const resolvePass = (input: PassInput) =>
   Effect.suspend(() => {
@@ -3139,6 +3222,7 @@ const resolveWalk = (input: PassInput) =>
     let looked = 0;
     let offset = 0;
     let page = src;
+    let scored = input.scored;
     let pageLease: Lease | null = null;
     const newest = src.versions[0];
     const knownMalicious: ListedMalicious[] = [];
@@ -3166,6 +3250,18 @@ const resolveWalk = (input: PassInput) =>
 
         if (!current.includes(v0)) break;
         looked++;
+
+        // the page's analyses did not fit: a candidate the feed or apm's reviewers refuse is skipped as ever, since that
+        // needs no score, and the first one left cannot be answered for (Sol on fb84083)
+        if (!scored) {
+          const listedHere = listed.get(v0.version);
+          const hard = confirmed.has(v0.version) ? CONFIRMED_SKIP : listedHere ? maliciousText(listedHere) : null;
+
+          if (hard === null) return answered(rootUnread(name, range, "over-budget"));
+          skip({ version: v0.version, reason: hard, revokeReason: null });
+          continue;
+        }
+
         // analyze a bounded number of candidates; upstream analysis means downloading the tarball
         // a capped resolve (anonymous) spends its root slot only on a candidate a score could still let through: one
         // apm has not scored or decided on, from npm, not confirmed malicious, and (strict) past the cooldown
@@ -3202,11 +3298,16 @@ const resolveWalk = (input: PassInput) =>
       pageLease?.release();
       pageLease = nextLease;
 
-      if (got === null || got === "unknown" || got === "over-budget") {
-        return answered(json({ error: `${name} ${UNAVAILABLE_TEXT}: apm could not read past the ${offset} newest versions in range. Nothing was installed; try again in a minute.`, name, range, version: null, skipped, retryAfter: PENDING_RETRY_AFTER_S }, 503, { "cache-control": "no-store", "retry-after": String(PENDING_RETRY_AFTER_S) }));
+      const read = got;
+
+      if (read === null || read === "unknown" || read === "over-budget") {
+        const why = read === "over-budget" ? `: ${OVER_BUDGET_TEXT}, so` : ` ${UNAVAILABLE_TEXT}:`;
+
+        return answered(json({ error: `${name}${why} apm could not read past the ${offset} newest versions in range. Nothing was installed; try again in a minute.`, name, range, version: null, skipped, retryAfter: PENDING_RETRY_AFTER_S }, 503, { "cache-control": "no-store", "retry-after": String(PENDING_RETRY_AFTER_S) }));
       }
 
-      page = got;
+      scored = read.kind !== "unread";
+      page = read.kind === "unread" ? read.src : read;
     }
 
     const newestReport = newest ? reportFor(newest, at) : null;
@@ -3381,8 +3482,7 @@ export const resolveResponse = (url: URL, queueing: ResolveQueueing = QUEUE_ALL)
     const candidates: KeyedSelect = { key: rootKey(range, 0), select: (full) => rootPage(full, range, 0) };
     // a later page of the root's candidates, when the first is all skipped (review of 2fbf383, finding 4)
     const page: PageRead = (offset, under) => catalogWithin(name, under, { key: rootKey(range, offset), select: (full) => rootPage(full, range, offset) });
-    const first = yield* catalogWithin(name, rootLease, candidates);
-    let src: Catalog | null | "unknown" = first === "over-budget" ? "unknown" : first;
+    let src = yield* catalogWithin(name, rootLease, candidates);
 
     /** The root read afresh: the catalog it replaces is given back. */
     const reload = Effect.gen(function* () {
@@ -3391,13 +3491,8 @@ export const resolveResponse = (url: URL, queueing: ResolveQueueing = QUEUE_ALL)
       rootLease.release();
       rootLease = next;
 
-      return got === "unknown" || got === "over-budget" ? null : got;
+      return got;
     });
-
-    // the package itself could not be looked up: there is no version to install, and a retry may find one
-    if (src === "unknown") {
-      return json({ error: `${name} ${UNAVAILABLE_TEXT}. Nothing was installed; try again in a minute.`, name, range, version: null, unavailable: [{ dependency: name, via: [] }], retryAfter: PENDING_RETRY_AFTER_S }, 503, { "cache-control": "no-store", "retry-after": String(PENDING_RETRY_AFTER_S) });
-    }
 
     const configured = Option.getOrElse(yield* Effect.serviceOption(ResolveWait), () => RESOLVE_WAIT);
     const wait = { maxMs: Math.min(configured.maxMs, asked.maxMs), pollMs: configured.pollMs };
@@ -3405,8 +3500,10 @@ export const resolveResponse = (url: URL, queueing: ResolveQueueing = QUEUE_ALL)
     let waited = 0;
 
     for (;;) {
-      if (!src) return fail(404, `No package named ${name}.`);
-      const pass = yield* resolvePass({ name, range, policy, treePolicy, target, project, src, page, mode: { strict, final: false }, lease, allowance });
+      if (src === null) return fail(404, `No package named ${name}.`);
+
+      if (src === "unknown" || src === "over-budget") return rootUnread(name, range, src);
+      const pass = yield* resolvePass({ name, range, policy, treePolicy, target, project, src: src.kind === "unread" ? src.src : src, scored: src.kind !== "unread", page, mode: { strict, final: false }, lease, allowance });
 
       if (pass.kind === "answer") return pass.response;
 
@@ -3423,8 +3520,10 @@ export const resolveResponse = (url: URL, queueing: ResolveQueueing = QUEUE_ALL)
         // the wait is over: what landed is read afresh, and what is still pending is a warning
         src = yield* reload;
 
-        if (!src) return fail(404, `No package named ${name}.`);
-        const last = yield* resolvePass({ name, range, policy, treePolicy, target, project, src, page, mode: { strict, final: true }, lease, allowance });
+        if (src === null) return fail(404, `No package named ${name}.`);
+
+        if (src === "unknown" || src === "over-budget") return rootUnread(name, range, src);
+        const last = yield* resolvePass({ name, range, policy, treePolicy, target, project, src: src.kind === "unread" ? src.src : src, scored: src.kind !== "unread", page, mode: { strict, final: true }, lease, allowance });
 
         if (last.kind === "answer") return last.response;
       }
@@ -3552,18 +3651,21 @@ const scanOne = (input: { p: { name: string; version: string; integrity?: string
     });
 
     // only the version asked about is kept of its package
-    const src = yield* catalogWithin(p.name, lease, { key: `version ${p.version}`, select: (full) => full.versions.filter((v) => v.version === p.version) });
+    const read = yield* catalogWithin(p.name, lease, { key: `version ${p.version}`, select: (full) => full.versions.filter((v) => v.version === p.version) });
 
-    if (src === "over-budget") return unchecked(OVER_BUDGET_TEXT);
+    if (read === "over-budget") return unchecked(OVER_BUDGET_TEXT);
 
     // the registry or npm could not be asked: not clean, and kept apart from a version nobody has
-    if (src === "unknown") return [flagged(stateWarning({ kind: "unavailable", name: p.name, version: p.version, text: UNAVAILABLE_TEXT, url, via: [] }), "unavailable")] satisfies ScanOne[];
+    if (read === "unknown") return [flagged(stateWarning({ kind: "unavailable", name: p.name, version: p.version, text: UNAVAILABLE_TEXT, url, via: [] }), "unavailable")] satisfies ScanOne[];
 
     // a bundled version ships inside its parent's tarball, which the parent's score covers: only its version state is
     // asked about here, and a version no registry knows is the parent's to vouch for (review of 2a098b1, finding 2)
     const parentVouches: ScanOne[] = [{ kind: "clean" }];
 
-    if (src === null) return p.bundled === true ? parentVouches : unchecked("not on this registry or upstream");
+    if (read === null) return p.bundled === true ? parentVouches : unchecked("not on this registry or upstream");
+    // a version whose analysis did not fit is still checked for all that needs no score (its state, integrity and
+    // reviewers), then unchecked, never pending or clean
+    const src = read.kind === "unread" ? read.src : read;
     const v0 = src.versions.find((x) => x.version === p.version);
 
     if (!v0) return p.bundled === true ? parentVouches : unchecked("no such version");
@@ -3604,6 +3706,8 @@ const scanOne = (input: { p: { name: string; version: string; integrity?: string
     // inside the cooldown: a warning (strict: refused), and the version is still checked
     const fresh = cooldownWarning({ name: p.name, version: p.version, ageMs: at - v0.published_at, cooldownMs: policy.cooldownMs, url, via: [] });
     const findings: ScanOne[] = [...yanked, ...unverified, ...(fresh ? [flagged(fresh, "cooldown")] : [])];
+
+    if (read.kind === "unread") return [...findings, ...unchecked(OVER_BUDGET_TEXT)] satisfies ScanOne[];
     // a stored analysis of these exact bytes is reused; a version never analyzed is queued (capped for anonymous callers)
     const needsQueue = !parseAnalysis(v0.score) && !v0.unscorable;
 
@@ -4128,6 +4232,32 @@ const installAnswer = (name: string, upstream: UpstreamApi, edge: EdgeChecksApi 
     return streamedJson(make(), "versions", headers, { onDone: lease.retain() });
   });
 
+/**
+ * The analyses upstreamRoute reads of a package, all trimmed: only a score, a grade, signals and coverage are read of
+ * them (compact, policyBlock). A tarball's version's, and an exact version's document's: the one score it embeds and
+ * ~safe keeps it by. None for the abbreviated packument outside ~safe, which embeds no score and keeps every version.
+ * Otherwise every version's: the full packument embeds each one's _apmScore, and a tag's document is of the version
+ * the tag names among those kept (the view's, the feeds'), latest falling back to the highest of them.
+ */
+const routeWanted = (input: { name: string; rest: readonly string[]; viaSafe: boolean; abbreviated: boolean }): Wanted => {
+  const [spec, file] = input.rest;
+
+  if (spec === "-" && file) {
+    const version = tarballVersion(input.name, file);
+
+    return () => new Map(version ? [[version, "trimmed"] as const] : []);
+  }
+
+  if (input.rest.length === 0 && input.abbreviated && !input.viaSafe) return () => new Map();
+
+  return (pkg) => {
+    // latest is answered from the kept versions when npm's latest is not among them, or npm names none (filterDistTags)
+    const exact = input.rest.length === 1 && spec !== undefined && spec !== "latest" && tagTarget(pkg.distTags, spec) === undefined;
+
+    return new Map((exact ? [spec] : pkg.versions.map((v) => v.version)).map((v) => [v, "trimmed"] as const));
+  };
+};
+
 /** Packuments and tarballs of packages that only exist upstream; null for anything else. */
 export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
   Effect.gen(function* () {
@@ -4174,11 +4304,52 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
     // the packument and the devDependencies the full one adds back are held together under the request's lease until
     // the answer is sent
     const lease = yield* RequestMemory;
-    const src = yield* lookupWithin(sp.name, lease);
+    const abbreviated = (req.headers.get("accept") ?? "").includes("application/vnd.npm.install-v1+json");
+    const src = yield* lookupWithin(sp.name, lease, routeWanted({ name: sp.name, rest: sp.rest, viaSafe, abbreviated }));
 
     // npm could not be asked, or answered with a packument apm refused to read or could not hold: a registry error the
-    // client retries, never "Not found", which npm reports as a package that does not exist
-    if (src === "unknown" || src === "over-budget") return json({ error: `The upstream registry could not be read for ${sp.name}. Try again shortly.` }, 503, { "retry-after": String(UPSTREAM_RETRY_AFTER_S) });
+    // client retries, never "Not found", which npm reports as a package that does not exist. A version the request names
+    // that the OSSF feed lists is refused first, as it would be with the package read: that needs neither (Sol on fb84083)
+    // npm's listing read, its analyses not, as they did not fit: what needs no score of the version asked for is checked
+    // as it would be with them (apm's reviewers, the OSSF feed), and the rest is the budget's 503 (Sol on c752a16)
+    if (src !== null && src !== "unknown" && src !== "over-budget" && src.kind === "unread") {
+      const { name, versions, distTags } = src.src;
+      const spec = sp.rest[0] ?? "";
+      const tarball = spec === "-" && sp.rest[1] !== undefined;
+      const named = tarball ? tarballVersion(name, sp.rest[1] ?? "") : sp.rest.length === 1 ? (tagTarget(distTags, spec) ?? spec) : null;
+      const v = versions.find((x) => x.version === named);
+
+      if (named !== null && v !== undefined && (yield* confirmedVersions(name, [v])).has(named)) return tarball ? fail(410, confirmedText(name, named), { confirmed: true }) : fail(404, "Version not found");
+      const listedHere = named === null ? undefined : (yield* listedVersionsOf(name, [named])).get(named);
+
+      if (listedHere && tarball) return fail(403, listedTarballText(listedHere), { knownMalicious: listedHere });
+
+      if (listedHere) return fail(404, `${maliciousText(listedHere)}, so apm does not serve it.`, { knownMalicious: listedHere });
+
+      if (named !== null) return json({ error: `${name}: ${OVER_BUDGET_TEXT}. Try again shortly.` }, 503, { "retry-after": String(UPSTREAM_RETRY_AFTER_S) });
+      // the whole packument: what apm's reviewers and the feed refuse of it is named in the 503, with the feed's notice
+      // (Sol on dd47451: neither was asked)
+      const [confirmed, advisories] = yield* Effect.all([confirmedVersions(name, versions), advisoriesOf(name)], { concurrency: "unbounded" });
+      const listed = listedAmong(name, advisories, versionsAndTags(src.src));
+
+      return json(
+        { error: `${name}: ${OVER_BUDGET_TEXT}. Try again shortly.`, confirmed: [...confirmed].toSorted(), knownMalicious: [...listed.values()] },
+        503,
+        { "retry-after": String(UPSTREAM_RETRY_AFTER_S), ...noticeHeaders(name, advisories) },
+      );
+    }
+
+    if (src === "unknown" || src === "over-budget") {
+      const tarball = sp.rest[0] === "-" && sp.rest[1] !== undefined;
+      const named = tarball ? tarballVersion(sp.name, sp.rest[1] ?? "") : sp.rest.length === 1 ? (sp.rest[0] ?? null) : null;
+      const listedHere = named === null ? undefined : (yield* listedVersionsOf(sp.name, [named])).get(named);
+
+      if (listedHere && tarball) return fail(403, listedTarballText(listedHere), { knownMalicious: listedHere });
+
+      if (listedHere) return fail(404, `${maliciousText(listedHere)}, so apm does not serve it.`, { knownMalicious: listedHere });
+
+      return json({ error: `The upstream registry could not be read for ${sp.name}. Try again shortly.` }, 503, { "retry-after": String(UPSTREAM_RETRY_AFTER_S) });
+    }
 
     if (!src || src.kind !== "upstream") return null;
     const at = yield* now;
@@ -4279,7 +4450,6 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
     }
 
     if (sp.rest.length > 0) return null;
-    const abbreviated = (req.headers.get("accept") ?? "").includes("application/vnd.npm.install-v1+json");
 
     const [confirmed, advisories] = yield* Effect.all([confirmedVersions(src.name, src.versions), advisoriesOf(src.name)], { concurrency: "unbounded" });
     const listed = listedAmong(src.name, advisories, versionsAndTags(src));
@@ -4415,7 +4585,10 @@ export const apmRoute = (req: Request, url: URL, caller: Caller) =>
       const sp = splitPath(`/${rest.slice("score/".length)}`);
 
       if (!sp) return fail(404, "Not found");
-      const src = (yield* pageLookup(sp.name, yield* RequestMemory, { kind: "history", spec: sp.rest[0] }))?.src;
+      const found = yield* pageLookup(sp.name, yield* RequestMemory, { kind: "history", spec: sp.rest[0] });
+
+      if (found === "unknown") return fail(503, PAGE_UNKNOWN);
+      const src = found?.src;
 
       if (!src) return fail(404, "Not found");
       const spec = sp.rest[0];

@@ -6,7 +6,7 @@
 // of every packument (dist-tags moved or dropped as for a confirmed version), its version document is a 404 and its
 // tarball a 403, each citing the MAL- id, from one small OSV query per name. A feed that does not answer refuses nothing.
 // npm and OSV are local stand-ins on 127.0.0.1; the database is a real Postgres.
-import { afterAll, afterEach, beforeAll, describe, expect, setSystemTime, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { Effect, Layer, Option } from "effect";
 import { z } from "zod";
@@ -409,6 +409,43 @@ describe("what the review of 34ccf92 found", () => {
     }
   });
 
+  // Sol on #44, finding 1: an advisory a partial answer read was kept for that request alone, so an outage right after
+  // it served the version it had withheld
+  test("what a partial answer read stays withheld through an outage, until a complete answer replaces it or it is a day old", async () => {
+    const root = freshRoot();
+    const advisory = VULNS.get("half-read")?.[0];
+    const tarball = async () => (await get("/half-read/-/half-read-1.2.0.tgz", { root }))?.status;
+    const t0 = Date.now();
+
+    expect(advisory?.id).toBe("MAL-2026-1006");
+    osv.unreadable.add("MAL-2026-1007");
+    expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0", "1.1.0"]);
+    osv.down = true;
+    expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0", "1.1.0"]);
+    expect(await tarball()).toBe(403);
+    // a day after it was read, an outage fails open again, as for a name never answered
+    const aDayOn = t0 + NAME_STALE_MS + 60_000;
+
+    setSystemTime(new Date(aDayOn));
+    expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0", "1.1.0", "1.2.0"]);
+    // a complete answer replaces what partial answers read: once OSV withdraws the advisory, the version is served
+    osv.down = false;
+    osv.unreadable.clear();
+    setSystemTime(new Date(aDayOn + 60_000));
+    expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0"]);
+
+    try {
+      if (advisory) advisory.withdrawn = "2026-11-25T00:00:00Z";
+      setSystemTime(new Date(aDayOn + 60_000 + NAME_FRESH_MS + 1_000));
+      expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0", "1.2.0"]);
+      osv.down = true;
+      setSystemTime(new Date(aDayOn + 60_000 + 2 * NAME_FRESH_MS + 2_000));
+      expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0", "1.2.0"]);
+    } finally {
+      if (advisory) delete advisory.withdrawn;
+    }
+  });
+
   test("after a failure the isolate does not ask OSV again for a while, so an outage costs one wait, not one per request", async () => {
     const root = freshRoot();
 
@@ -523,5 +560,272 @@ describe("advisories", () => {
 
     expect(await installStamp(rows, [])).toBe(await installStamp(rows));
     expect(await installStamp(rows, ["osv x"])).not.toBe(await installStamp(rows));
+  });
+});
+
+// Sol on #59 (3e21a4f): what a partial answer read was kept beside the name's complete answer, as a whole, so an older
+// complete answer could undo a newer partial one (an amended or withdrawn advisory), a slower request's answer could
+// undo a newer one, and a newer copy from the data center's cache did not retire what it superseded. Each advisory is
+// now decided by the newest answer that read it, complete or partial, from this isolate or the data center's cache.
+describe("each advisory of a name is what the newest answer that read it says", () => {
+  const X = "MAL-2026-1010";
+  const Y = "MAL-2026-1011";
+  const naming = (id: string, versions: string[], withdrawn?: string): Vuln => (withdrawn === undefined ? { id, affected: [{ package: { name: "observed", ecosystem: "npm" }, versions }] } : { id, withdrawn, affected: [{ package: { name: "observed", ecosystem: "npm" }, versions }] });
+
+  /** One request's advisoriesFor("observed") at `root`, as the versions each advisory names. */
+  const asked = async (root: string, fetcher: typeof fetch = fetch): Promise<Record<string, string[]>> => {
+    const got = await Effect.runPromise(Effect.flatMap(KnownMalicious, (k) => k.advisoriesFor("observed")).pipe(Effect.provide(osvFeed(root, fetcher))));
+
+    return Object.fromEntries(got.map((a) => [a.id, a.versions]));
+  };
+
+  /** fetch, with the answer to the first request whose URL has `part` held until `release` (`asked`: it was answered). */
+  function held(part: string) {
+    const answered = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    let holding = true;
+
+    const fetcher = Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const res = await fetch(input, init);
+
+        if (holding && String(input).includes(part)) {
+          holding = false;
+          answered.resolve();
+          await gate.promise;
+        }
+
+        return res;
+      },
+      { preconnect: fetch.preconnect },
+    );
+
+    return { fetcher, asked: answered.promise, release: () => gate.resolve() };
+  }
+
+  let t = Date.now();
+
+  const at = (ms: number): void => {
+    t = ms;
+    setSystemTime(new Date(t));
+  };
+
+  beforeEach(() => {
+    VULNS.set("observed", [naming(X, ["1.0.0"]), naming(Y, ["1.1.0"])]);
+    at(Date.now());
+  });
+
+  afterEach(() => {
+    VULNS.delete("observed");
+  });
+
+  test("an advisory a partial answer read amended is kept as amended through an outage, the older complete answer notwithstanding", async () => {
+    const root = freshRoot();
+
+    expect(await asked(root)).toEqual({ [X]: ["1.0.0"], [Y]: ["1.1.0"] });
+    at(t + NAME_FRESH_MS + 1_000);
+    VULNS.set("observed", [naming(X, ["2.0.0"]), naming(Y, ["1.1.0"])]);
+    osv.unreadable.add(Y);
+    expect(await asked(root)).toEqual({ [X]: ["2.0.0"], [Y]: ["1.1.0"] });
+    osv.down = true;
+    at(t + 60_000);
+    // on 3e21a4f: 1.0.0, the complete answer's, as X was in it
+    expect(await asked(root)).toEqual({ [X]: ["2.0.0"], [Y]: ["1.1.0"] });
+  });
+
+  test("an advisory a partial answer read withdrawn stays withdrawn through an outage", async () => {
+    const root = freshRoot();
+
+    await asked(root);
+    at(t + NAME_FRESH_MS + 1_000);
+    VULNS.set("observed", [naming(X, ["1.0.0"], "2026-11-25T00:00:00Z"), naming(Y, ["1.1.0"])]);
+    osv.unreadable.add(Y);
+    expect(await asked(root)).toEqual({ [Y]: ["1.1.0"] });
+    osv.down = true;
+    at(t + 60_000);
+    // on 3e21a4f: X again, from the stale complete answer
+    expect(await asked(root)).toEqual({ [Y]: ["1.1.0"] });
+  });
+
+  test("a slower partial answer asked for before a withdrawal was read does not bring the advisory back", async () => {
+    const root = freshRoot();
+
+    await asked(root);
+    at(t + NAME_FRESH_MS + 1_000);
+    osv.unreadable.add(Y);
+    // the slower request reads X while it is listed, and its answer lands only after the next request's
+    const slow = held(`vulns/${X}`);
+    const first = asked(root, slow.fetcher);
+
+    await slow.asked;
+    at(t + 1_000);
+    VULNS.set("observed", [naming(X, ["1.0.0"], "2026-11-25T00:00:00Z"), naming(Y, ["1.1.0"])]);
+    expect(await asked(root)).toEqual({ [Y]: ["1.1.0"] });
+    slow.release();
+    // what the slow request answers is read from what the isolate knows once its answer is in
+    expect(await first).toEqual({ [Y]: ["1.1.0"] });
+    osv.down = true;
+    at(t + 60_000);
+    expect(await asked(root)).toEqual({ [Y]: ["1.1.0"] });
+  });
+
+  test("a slower complete answer asked for before an advisory was listed does not leave out what a newer answer read", async () => {
+    const root = freshRoot();
+
+    VULNS.set("observed", []);
+    const slow = held("querybatch");
+    const first = asked(root, slow.fetcher);
+
+    await slow.asked;
+    at(t + 1_000);
+    VULNS.set("observed", [naming(X, ["1.0.0"]), naming(Y, ["1.1.0"])]);
+    osv.unreadable.add(Y);
+    expect(await asked(root)).toEqual({ [X]: ["1.0.0"] });
+    slow.release();
+    // on 3e21a4f: {}, the complete answer as of when it was asked
+    expect(await first).toEqual({ [X]: ["1.0.0"] });
+    osv.down = true;
+    at(t + 60_000);
+    expect(await asked(root)).toEqual({ [X]: ["1.0.0"] });
+  });
+
+  test("a newer complete answer that leaves out an advisory a partial answer read retires it, before it is a day old", async () => {
+    const root = freshRoot();
+
+    osv.unreadable.add(Y);
+    expect(await asked(root)).toEqual({ [X]: ["1.0.0"] });
+    osv.unreadable.clear();
+    VULNS.set("observed", [naming(Y, ["1.1.0"])]);
+    at(t + 60_000);
+    expect(await asked(root)).toEqual({ [Y]: ["1.1.0"] });
+    osv.down = true;
+    at(t + NAME_FRESH_MS + 1_000);
+    expect(await asked(root)).toEqual({ [Y]: ["1.1.0"] });
+  });
+
+  test("a newer complete answer from the data center's cache retires what it leaves out, and a miss after it does not bring it back", async () => {
+    const root = freshRoot();
+    const copies = new Map<string, Response>();
+
+    const cache = {
+      match: async (key: Request) => copies.get(key.url)?.clone(),
+      put: async (key: Request, res: Response) => {
+        copies.set(key.url, res);
+      },
+    };
+
+    Object.defineProperty(globalThis, "caches", { value: { default: cache }, configurable: true });
+
+    try {
+      osv.unreadable.add(Y);
+      expect(await asked(root)).toEqual({ [X]: ["1.0.0"] });
+      // another isolate's complete answer, asked for later: Y only
+      copies.set(`https://osv-cache.apmjs.internal/v2/${encodeURIComponent(`${root} observed`)}`, Response.json({ fetchedAt: t + 1_000, advisories: [{ id: Y, versions: ["1.1.0"], ranges: [] }] }));
+      osv.down = true;
+      at(t + NAME_FRESH_MS + 2_000);
+      // stale, while OSV is down: on 3e21a4f X still counted beside it
+      expect(await asked(root)).toEqual({ [Y]: ["1.1.0"] });
+      copies.clear();
+      at(t + 1_000);
+      expect(await asked(root)).toEqual({ [Y]: ["1.1.0"] });
+    } finally {
+      Reflect.deleteProperty(globalThis, "caches");
+    }
+  });
+
+  /** The data center's cache, standing in: its copies by URL, and with `gated`, the first read held until `release`. */
+  function sharedCache(gated = false) {
+    const copies = new Map<string, Response>();
+    const reading = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    let holding = gated;
+
+    const cache = {
+      match: async (key: Request) => {
+        if (holding) {
+          holding = false;
+          reading.resolve();
+          await gate.promise;
+        }
+
+        return copies.get(key.url)?.clone();
+      },
+      put: async (key: Request, res: Response) => {
+        copies.set(key.url, res);
+      },
+    };
+
+    Object.defineProperty(globalThis, "caches", { value: { default: cache }, configurable: true });
+
+    return { copies, reading: reading.promise, release: () => gate.resolve(), restore: () => Reflect.deleteProperty(globalThis, "caches") };
+  }
+
+  // Sol on 6f206c5: the freshness check after the cache read, the backoff's and the answer used the time from before it
+  test("a request whose cache read lands after another request's answer answers with that answer, in a backoff too", async () => {
+    const root = freshRoot();
+    const shared = sharedCache(true);
+
+    try {
+      const first = asked(root);
+
+      await shared.reading;
+      at(t + 1_000);
+      expect(await asked(root)).toEqual({ [X]: ["1.0.0"], [Y]: ["1.1.0"] });
+      // OSV goes down at the root: a name asked about next starts its backoff
+      osv.down = true;
+      await Effect.runPromise(Effect.flatMap(KnownMalicious, (k) => k.advisoriesFor("observed-other")).pipe(Effect.provide(osvFeed(root))));
+      shared.release();
+      // on 6f206c5: {}, the newer answer read as not yet asked for
+      expect(await first).toEqual({ [X]: ["1.0.0"], [Y]: ["1.1.0"] });
+    } finally {
+      shared.restore();
+    }
+  });
+
+  // Sol on 6f206c5: the data center's copy was written when an answer's time matched the newest complete one's, so an
+  // older answer of the same millisecond, landing last, overwrote the newer one's copy
+  test("of two complete answers asked for in one millisecond, the newer one's is the data center's copy", async () => {
+    const root = freshRoot();
+    const shared = sharedCache();
+
+    try {
+      VULNS.set("observed", []);
+      const slow = held("querybatch");
+      const first = asked(root, slow.fetcher);
+
+      await slow.asked;
+      VULNS.set("observed", [naming(X, ["1.0.0"])]);
+      expect(await asked(root)).toEqual({ [X]: ["1.0.0"] });
+      slow.release();
+      expect(await first).toEqual({ [X]: ["1.0.0"] });
+      await Bun.sleep(20);
+      const copy = shared.copies.get(`https://osv-cache.apmjs.internal/v2/${encodeURIComponent(`${root} observed`)}`);
+
+      // on 6f206c5: the empty answer's
+      expect(await copy?.clone().json()).toEqual({ fetchedAt: t, advisories: [{ id: X, versions: ["1.0.0"], ranges: [] }] });
+    } finally {
+      shared.restore();
+    }
+  });
+
+  // Sol on 6f206c5: a complete answer spoke only for the advisories the isolate had seen, so an older answer landing
+  // after it could add one it left out
+  test("an older answer that lands after a newer complete one does not bring back an advisory the newer one left out", async () => {
+    const root = freshRoot();
+
+    VULNS.set("observed", [naming(X, ["1.0.0"])]);
+    const slow = held(`vulns/${X}`);
+    const first = asked(root, slow.fetcher);
+
+    await slow.asked;
+    at(t + 1_000);
+    VULNS.set("observed", []);
+    expect(await asked(root)).toEqual({});
+    slow.release();
+    // on 6f206c5: X, from the listing the newer answer superseded
+    expect(await first).toEqual({});
+    osv.down = true;
+    at(t + 60_000);
+    expect(await asked(root)).toEqual({});
   });
 });
