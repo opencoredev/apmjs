@@ -28,9 +28,9 @@ const MAX_REACH_WORK = MAX_ANALYSIS_WORK / 8;
 /** Where the review ranks what it shows that main's rules pass over (ordered): after everything they show. */
 const REACHED_TIER = 7;
 
-// a heredoc, or a builtin that moves the shell or reads another file's commands: a hook's words then may not be the shell's
-// expansions in the package's folder
-const SHELL_MOVES = /<<|(?:^|[\s;&|'"(])(?:cd|pushd|popd|source|\.)(?=[\s;&|'")]|$)/;
+// a word that, anywhere in a hook and however quoted, may move the shell, read another file's commands or turn pathname
+// expansion off: the hook's words then may not be the shell's expansions in the package's folder
+const SHELL_MOVES = new Set(["cd", "pushd", "popd", "source", ".", "set", "shopt", "eval", "exec"]);
 
 /** Files larger than this are not decoded at all; they are listed as not read. */
 export const MAX_DECODED_BYTES = 16 * 1024 * 1024;
@@ -251,7 +251,7 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
   // what `?` and bracket globs (`node ./pay?oad.txt`) expand to, in words with no quoting or expansion so each is the
   // shell's: read after all of the above, with slots, a meter and a tier of their own, so they only take what it leaves.
   // Nothing when a hook may turn pathname expansion off (`set -f`), move the shell (`cd sub`) or hold a heredoc, and no
-  // absolute pattern, one outside ASCII or one with a POSIX class (`[[:digit:]]`)
+  // absolute or home pattern, one outside ASCII or one with a POSIX class (`[[:digit:]]`)
   const later = new Set<string>();
   const meter = new Meter(MAX_REACH_WORK);
 
@@ -265,15 +265,15 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
         for (const c of h.commands) {
           meter.charge("text", Math.ceil(c.text.length / 16) + 1);
 
-          if (SHELL_MOVES.test(c.text)) return;
+          if (c.text.includes("<<")) return;
 
           for (const t of shellWords(c.text)) {
             if (t === null || t === "(" || t === ")" || t === "cut") continue;
 
-            if (t.word === "set") return;
+            if (SHELL_MOVES.has(t.word)) return;
             const w = stripDot(t.word);
 
-            if (t.pattern && !t.quoted && !t.expanded && !t.word.startsWith("/") && /^[\x20-\x7e]*$/.test(w) && !/\[[:=.]/.test(w) && patterns.size < MAX_GLOBS && w.length <= MAX_GLOB_CHARS) {
+            if (t.pattern && !t.quoted && !t.expanded && !/^[/~]/.test(t.word) && /^[\x20-\x7e]*$/.test(w) && !/\[[:=.]/.test(w) && patterns.size < MAX_GLOBS && w.length <= MAX_GLOB_CHARS) {
               patterns.set(w, { depth: w.split("/").length, prefix: w.slice(0, w.search(/[*?[]/)) });
             }
           }

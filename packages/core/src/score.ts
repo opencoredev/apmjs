@@ -10,7 +10,7 @@ import { boundedManifest, MANIFEST_LIMITS, measureManifest } from "./manifest.ts
 import { MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { charge, chargeText, inPhase, MAX_ANALYSIS_WORK, Meter, MeterExhausted, PHASE_NAMES, withMeter, type Phase } from "./meter.ts";
 import { isEstablishedName, typoConflicts, type NameHistory } from "./names.ts";
-import { commandWords, commandWordsWithin, expandHooks, gypCommands, fetchesInCommandPosition, isInlineDownload, otherScripts, shellOperands, type ExpandedHook, type HookKind, type ShellWords } from "./scripts.ts";
+import { commandWords, commandWordsWithin, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook, type HookKind, type ShellWords } from "./scripts.ts";
 import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type Lang, type ExecutedCode, type FlowFinding, type Hidden, type Imports, type TextFinding } from "./source.ts";
 import { scanTextRules } from "./textrules.ts";
 import { keptBytes, MAX_KEPT_VIEW_BYTES, scanBinaryImports, scanBinaryText, type BinaryTextScan } from "./binary-text.ts";
@@ -1390,9 +1390,6 @@ const decoder = new TextDecoder();
 /** A streamed read's plan (planLayers): production's, and what the second layer holds besides. */
 export type ReadingPlan = { production: Set<string>; extra: Set<string> };
 
-/** Work units planLayers' reconsideration of passed-over files may spend, on a meter of its own. */
-const MAX_RECONSIDER_WORK = MAX_ANALYSIS_WORK / 64;
-
 /**
  * Which files of a tarball too large to hold a streamed read keeps whole, at most `budget` bytes of them, in two layers.
  * `production` is production's (274d284) plan, exactly: the files `analyze` reads by name, then what install hooks run,
@@ -1524,22 +1521,6 @@ export function planLayers(input: { manifest: AnalyzeInput["manifest"]; files: r
 
   for (const p of all) if (!baseline.has(p)) queueX.push(p);
   walk();
-
-  // with what that plan left of the budget, a file the first walk passed over as one nothing ran is held now that only
-  // the shell reading runs it, on a meter of its own: running it out keeps the plan as it stands
-  try {
-    withMeter(new Meter(MAX_RECONSIDER_WORK), () => {
-      for (const p of all) {
-        if (baseline.has(p) || held.has(p) || extra.has(p) || !seenX.has(p)) continue;
-        seenX.delete(p);
-        queueX.push(p);
-      }
-
-      walk();
-    });
-  } catch (e) {
-    if (!(e instanceof MeterExhausted)) throw e;
-  }
 
   return { production: held, extra };
 }
@@ -2615,39 +2596,9 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   try {
     withMeter(new Meter(MAX_ADDED_TARGET_WORK), () => {
       for (const p of later) if (!seen.has(p)) reach(p);
-
       readExtra();
       charge("score", scoringUnits() - baselineUnits);
     });
-  } catch (e) {
-    if (!(e instanceof MeterExhausted)) throw e;
-  }
-
-  // what an added run hands a shell as its script (`sh ./setup.sh`), named as written inside the package, that production's
-  // walk read whole but not as an install target: a download when it runs curl or wget on a URL as a command, read on a
-  // meter of its own after everything above and added only once the whole reading fits, so none of it ever takes a
-  // finding or a file from what came before
-  try {
-    const shellRun = new Set<string>();
-
-    withMeter(new Meter(MAX_ADDED_TARGET_WORK), () => {
-      for (const c of installCommands) {
-        if (!c.added) continue;
-
-        for (const w of shellOperands(c.text)) {
-          const path = w.replace(/^(?:\.\/)+/, "");
-          const f = path === "" || path.startsWith("/") || path.split("/").some((s) => s === "." || s === "..") ? undefined : byPath.get(path);
-
-          if (f === undefined || !readWhole.has(f) || installTargets.has(f.path)) continue;
-          chargeText("text", f.data.length, 2);
-          const text = new TextDecoder().decode(f.data);
-
-          if (isShellScript(f, text) && fetchesInCommandPosition(text)) shellRun.add(f.path);
-        }
-      }
-    });
-
-    for (const p of shellRun) add("install-download", `${p}: run by an install script and downloads code`);
   } catch (e) {
     if (!(e instanceof MeterExhausted)) throw e;
   }

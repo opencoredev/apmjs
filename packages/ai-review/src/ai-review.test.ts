@@ -255,6 +255,8 @@ describe("review input", () => {
     expect(shown("cat <<'DOC'\n./a?.txt\nDOC", { "a1.txt": "a" })).not.toContain("a1.txt");
     expect(shown("printf '%s\\n' /nonexistent/a?.txt", { "nonexistent/a1.txt": "a" })).not.toContain("nonexistent/a1.txt");
     expect(shown("cd sub; printf '%s\\n' ./a?.txt", { "a1.txt": "a" })).not.toContain("a1.txt");
+    expect(shown("c'd' sub; printf '%s\\n' ./a?.txt", { "a1.txt": "a" })).not.toContain("a1.txt");
+    expect(shown("printf '%s\\n' ~/a?.txt", { "~/a1.txt": "a" })).not.toContain("~/a1.txt");
   });
 
   test("a ? or bracket glob's file never takes the place of one a * glob reached", () => {
