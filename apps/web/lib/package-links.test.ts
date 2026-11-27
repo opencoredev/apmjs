@@ -25,6 +25,11 @@ describe("link sanitizing", () => {
     expect(repositoryUrl({ url: "git+https://gitlab.com/acme/tool.git", directory: null })).toBe("https://gitlab.com/acme/tool");
     expect(repositoryUrl({ url: "git@gitlab.com:acme/tool.git", directory: null })).toBeNull();
     expect(repositoryUrl({ url: "javascript:alert(1)", directory: null })).toBeNull();
+    // a browser resolves github.com/../.. to github.com itself
+    expect(repositoryUrl({ url: "git+https://github.com/../..", directory: null })).toBeNull();
+    expect(repositoryUrl({ url: "https://github.com./../..", directory: null })).toBeNull();
+    // the trailing-dot host is still GitHub, so a real repository keeps its link
+    expect(repositoryUrl({ url: "https://github.com./facebook/react", directory: null })).toBe("https://github.com/facebook/react");
     expect(repositoryUrl(null)).toBeNull();
   });
 });
