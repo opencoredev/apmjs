@@ -62,8 +62,9 @@ export function truncate(text: string, width: number): string {
   const kept: Piece[] = [];
   let used = 0;
 
-  // a link or other escape that is not a color is dropped: cut short, it could stay open past the line
-  for (const p of piecesOf(text)) {
+  // a link or other escape that is not a color is dropped: cut short, it could stay open past the line. Only the
+  // part that can show is split into characters, however long the text
+  for (const p of piecesOf(Bun.sliceAnsi(text, 0, width + 1))) {
     if (p.kind === "escape") {
       if (SGR.test(p.text)) kept.push(p);
     } else if (used + p.width <= width - 1) {
@@ -119,6 +120,9 @@ export function reflow(text: string): string {
   return out.join("\n");
 }
 
+/** The most characters of one line apm lays out for a terminal; the rest is cut with an ellipsis. */
+const MAX_LAID_OUT = 8000;
+
 /** The fewest columns a wrapped line keeps for its text: a deeper indent is given up first. */
 const MIN_TEXT = 16;
 
@@ -126,8 +130,10 @@ const MIN_TEXT = 16;
  * `line` wrapped to `width` columns: at spaces where it can, between characters where a word is longer than a line.
  * Each continuation is indented under the text it continues, and the colors open at a break are closed and reopened.
  */
-export function wrap(line: string, width: number): string {
-  if (widthOf(line) <= width) return line;
+export function wrap(full: string, width: number): string {
+  if (widthOf(full) <= width) return full;
+  // registry text can be megabytes (a yank reason): a terminal is shown its first screens, in time linear in what it shows
+  const line = full.length > MAX_LAID_OUT ? `${Bun.sliceAnsi(full, 0, MAX_LAID_OUT)}…${RESET}` : full;
   const plain = Bun.stripANSI(line);
   const room = Math.max(0, width - MIN_TEXT);
   const indent = Math.min(/^ */.exec(plain)?.[0].length ?? 0, room);
@@ -140,11 +146,22 @@ export function wrap(line: string, width: number): string {
   let used = 0;
   let avail = width - indent;
 
+  // the colors open so far, kept as pieces are placed so each break costs only its own line
+  let open: string[] = [];
+
   const current = (): Piece[] => lines[lines.length - 1] ?? [];
+
+  const place = (p: Piece): void => {
+    current().push(p);
+
+    if (p.kind !== "escape" || !SGR.test(p.text)) return;
+
+    if (p.text === RESET || p.text === `${ESC}[m`) open = [];
+    else open.push(p.text);
+  };
 
   const breakLine = (): void => {
     const line = current();
-    const open = openColors(lines.flat());
 
     // the spaces a line ends in are dropped, wherever its colors close
     for (let i = line.length - 1; i >= 0; i--) {
@@ -179,9 +196,10 @@ export function wrap(line: string, width: number): string {
       // spaces at a break are dropped; their colors are kept
       if (used + run.width >= avail) {
         breakLine();
-        current().push(...run.pieces.filter((p) => p.kind === "escape"));
+
+        for (const p of run.pieces) if (p.kind === "escape") place(p);
       } else {
-        current().push(...run.pieces);
+        for (const p of run.pieces) place(p);
         used += run.width;
       }
 
@@ -193,7 +211,7 @@ export function wrap(line: string, width: number): string {
 
     for (const p of run.pieces) {
       if (p.kind === "grapheme" && used + p.width > avail && used > 0) breakLine();
-      current().push(p);
+      place(p);
       used += p.kind === "grapheme" ? p.width : 0;
     }
   }

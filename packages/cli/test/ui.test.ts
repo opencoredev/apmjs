@@ -103,6 +103,18 @@ describe("terminal layout", () => {
     expect(wrapCommand({ command: "bun install", first: "→ ", rest: "      ", width: 40 })).toEqual(["→ bun install"]);
   });
 
+  test("a megabytes-long line (a yank reason) is laid out in linear time and cut to its first screens", () => {
+    const huge = `\x1b[2mskipped 1.0.0: ${"word ".repeat(1_000_000)}\x1b[0m`;
+    const started = performance.now();
+    const wrapped = wrap(huge, 80);
+    const cut = truncate(huge, 80);
+
+    expect(performance.now() - started).toBeLessThan(2000);
+    expect(widest(wrapped)).toBeLessThanOrEqual(80);
+    expect(wrapped.length).toBeLessThan(20_000);
+    expect(Bun.stringWidth(cut)).toBe(80);
+  });
+
   test("a narrow terminal keeps room for text: a deep indent gives way", () => {
     const out = wrap("    advisory  MAL-2026-20430 (OSSF malicious-packages feed)", 20);
 
