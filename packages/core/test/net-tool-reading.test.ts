@@ -131,6 +131,7 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
     expect(scoreOf({ prepare: "echo 'curl is optional'" }).ids).toContain("install-download");
 
     expect(scoreOf({ preinstall: "\u00a0", postinstall: "curl --version" }).ids).toContain("install-download");
+
     for (const deps of ["dependencies", "optionalDependencies", "peerDependencies"]) expect(scoreOf({ postinstall: "curl --version" }, { [deps]: { "probe-tool": "1.0.0" } }).ids).toContain("install-download");
     expect(scoreOf({ preinstall: "", postinstall: "curl --version" }).ids).not.toContain("install-download");
 
