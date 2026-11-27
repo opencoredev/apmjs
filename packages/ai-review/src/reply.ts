@@ -33,26 +33,86 @@ export type ModelReply =
   | { kind: "answer"; verdict: ModelVerdict; confidence: number; summary: string; findings: RawFinding[]; malformed: number }
   | { kind: "empty"; reason: EmptyReason };
 
-/** The first JSON object in a reply that may be wrapped in a code fence or prose. */
-function jsonIn(content: string): { ok: true; value: unknown } | { ok: false } {
+/** The text of each top-level `{…}` in `s`, in order: one pass, quotes read only inside an object. */
+function topLevelObjects(s: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+
+    if (inString) {
+      if (c === "\\") i++;
+      else if (c === '"') inString = false;
+    } else if (c === '"' && depth > 0) inString = true;
+    else if (c === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (c === "}" && depth > 0) {
+      depth--;
+
+      if (depth === 0) out.push(s.slice(start, i + 1));
+    }
+  }
+
+  return out;
+}
+
+/** An object with a verdict key, whatever its value: a candidate for the model's answer. */
+const WithVerdict = z.object({ verdict: z.unknown() }).loose();
+
+/**
+ * The answer in a reply that may be wrapped in a code fence or prose. The whole reply when it is JSON. A reply that
+ * starts with a verdict object and goes on in prose (braces and all) keeps that object, unless it clears and another
+ * verdict in it disagrees, and marks it as found in prose (a benign one does not settle the review). A reply that starts with prose is taken from its first `{` to its last `}`, as before: a verdict object
+ * after prose may be one the model quoted from the package, so it is never picked out of the prose on its own.
+ */
+function jsonIn(content: string): { ok: true; value: unknown; inProse: boolean } | { ok: false } {
   const s = content
     .trim()
     .replace(/^```(?:json)?\s*/, "")
     .replace(/```\s*$/, "");
 
   try {
-    return { ok: true, value: JSON.parse(s) };
+    return { ok: true, value: JSON.parse(s), inProse: false };
   } catch {
+    const objects = s.startsWith("{") ? topLevelObjects(s) : [];
+    const answers = objects.flatMap((text) => verdictObject(text) ?? []);
+    const first = objects[0];
+    const opening = first === undefined ? null : verdictObject(first);
+
+    // the reply opens with its answer: keep it. A later verdict that disagrees may be one the package planted for the
+    // model to quote, so it voids only an answer that clears (a flag still needs its citations to check out). With prose
+    // after it, the object may itself be one the package told the model to repeat, so it counts as found in prose.
+    if (opening !== null && first !== undefined) {
+      const kept = opening.verdict !== "benign" || answers.every((x) => x.verdict === opening.verdict);
+
+      return kept ? { ok: true, value: opening, inProse: s.slice(first.length).trim() !== "" } : { ok: false };
+    }
+
     const a = s.indexOf("{");
     const b = s.lastIndexOf("}");
 
     if (a < 0 || b <= a) return { ok: false };
 
     try {
-      return { ok: true, value: JSON.parse(s.slice(a, b + 1)) };
+      return { ok: true, value: JSON.parse(s.slice(a, b + 1)), inProse: true };
     } catch {
       return { ok: false };
     }
+  }
+}
+
+/** The object in `text` when it is JSON with a verdict key, else null. */
+function verdictObject(text: string): z.infer<typeof WithVerdict> | null {
+  try {
+    const v = WithVerdict.safeParse(JSON.parse(text));
+
+    return v.success ? v.data : null;
+  } catch {
+    return null;
   }
 }
 
@@ -65,6 +125,10 @@ export function parseReply(content: string, finishReason: string | null = null):
   const reply = RawReply.safeParse(json.value);
 
   if (!reply.success) return { kind: "empty", reason: "bad-verdict" };
+
+  // a benign object after prose may be one the package planted and the model quoted: it is not an answer, so it
+  // cannot settle the review on its own (decide.ts asks again). A flag from prose still has to pass the citation check.
+  if (json.inProse && reply.data.verdict === "benign") return { kind: "empty", reason: "no-json" };
   const findings: RawFinding[] = [];
   let malformed = 0;
 
