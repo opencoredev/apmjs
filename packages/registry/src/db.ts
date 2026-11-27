@@ -355,6 +355,8 @@ const PageReadRow = z.object({
   ...AnalysesColumns,
   // the versions whose analyses came whole (PageScores)
   shown: z.array(z.string()),
+  // the tarballs an apm reviewer confirmed malicious, as confirmedReviews reads them
+  confirmed: z.array(z.object({ version: z.string(), digest: z.string() })),
 });
 
 /**
@@ -379,11 +381,14 @@ export const PAGE_TRIMMED = ["skipped", "capabilities"] as const;
  * the versions whose analyses came whole (PageScores).
  */
 export type PageRow =
-  | { kind: "local"; pkg: PackageRecord; versions: VersionRecord[]; owners: string[] }
-  | { kind: "upstream"; kept: KeptPackageRow | null; analyses: UpstreamAnalyses; whole: ReadonlySet<string> };
+  | { kind: "local"; pkg: PackageRecord; versions: VersionRecord[]; owners: string[]; confirmed: ConfirmedReview[] }
+  | { kind: "upstream"; kept: KeptPackageRow | null; analyses: UpstreamAnalyses; whole: ReadonlySet<string>; confirmed: ConfirmedReview[] };
+
+/** A tarball an apm reviewer confirmed malicious: its version and digest label (confirmed.ts). */
+export type ConfirmedReview = { version: string; digest: string };
 
 /** What Store.fileRead found: a package published here (files.ts reads its one version on its own), or pageRead's upstream row. */
-export type FileRow = { kind: "local" } | Extract<PageRow, { kind: "upstream" }>;
+export type FileRow = { kind: "local" } | Omit<Extract<PageRow, { kind: "upstream" }>, "confirmed">;
 
 export type Advisory = z.infer<typeof AdvisoryRow>;
 
@@ -1032,7 +1037,9 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
                  FROM upstream_analysis u WHERE ${read} AND u.package = ${name} AND u.version IN (SELECT version FROM listed) AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis))) AND NOT EXISTS (SELECT 1 FROM p)) AS analyses,
               (SELECT coalesce(jsonb_agg(jsonb_build_object('version', o.version, 'outcome', o.outcome, 'detail', o.detail, 'digest', o.digest) ORDER BY o.scorer), '[]'::jsonb)
                  FROM analysis_outcomes o WHERE ${read} AND o.package = ${name} AND o.version IN (SELECT version FROM listed) AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL AND NOT EXISTS (SELECT 1 FROM p)) AS unscorable,
-              (SELECT coalesce(jsonb_agg(version), '[]'::jsonb) FROM shown WHERE version IS NOT NULL AND ${read}) AS shown`,
+              (SELECT coalesce(jsonb_agg(version), '[]'::jsonb) FROM shown WHERE version IS NOT NULL AND ${read}) AS shown,
+              (SELECT coalesce(jsonb_agg(jsonb_build_object('version', r.version, 'digest', r.digest) ORDER BY r.version, r.digest), '[]'::jsonb)
+                 FROM reviews r WHERE ${withVersions} AND r.package = ${name} AND r.human_state = 'confirmed') AS confirmed`,
         z.tuple([PageReadRow]).transform(([r]) => r),
       );
     });
@@ -1425,9 +1432,9 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
       Effect.gen(function* () {
         const row = yield* pageRow({ name, at, scores, local: "versions" });
 
-        if (row.pkg !== null) return { kind: "local", pkg: row.pkg, versions: dismissedFrom(row.versions, row.dismissals), owners: row.owners } satisfies PageRow;
+        if (row.pkg !== null) return { kind: "local", pkg: row.pkg, versions: dismissedFrom(row.versions, row.dismissals), owners: row.owners, confirmed: row.confirmed } satisfies PageRow;
 
-        return { kind: "upstream", kept: row.kept, analyses: analysesOf(row.analyses, row.dismissals, row.unscorable), whole: new Set(row.shown) } satisfies PageRow;
+        return { kind: "upstream", kept: row.kept, analyses: analysesOf(row.analyses, row.dismissals, row.unscorable), whole: new Set(row.shown), confirmed: row.confirmed } satisfies PageRow;
       }),
     // pageRead's statement without a local package's versions and owners: a file view reads its one version on its own
     fileRead: ({ name, at, scores }) =>
