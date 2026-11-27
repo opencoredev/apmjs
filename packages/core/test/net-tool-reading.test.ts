@@ -20,11 +20,8 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
     "curl -V",
     "wget --version",
     "wget -h",
-    "'curl' --version",
-    "curl.exe -V",
     "curl --version >/dev/null 2>&1 || echo 'curl is needed'",
     "curl --version 2>/dev/null >>/dev/null",
-    "curl --version 1>&2",
     "echo 'Run curl --version to check your tools'",
     'printf "install wget first"',
     "node install.js && curl --version",
@@ -50,6 +47,18 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
     const r = finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null });
 
     expect(r.score).toBe(100);
+  });
+
+  test("a package that ships its own curl keeps the reading, since cmd.exe runs it before the one on the PATH", () => {
+    const m: AnalyzeInput["manifest"] = { name: "probe-pkg", version: "1.0.0", license: "MIT", scripts: { postinstall: "curl --version" } };
+    const files = [JSON.stringify(m), "@echo off\r\n"].map((text, i) => {
+      const data = new TextEncoder().encode(text);
+
+      return { path: i === 0 ? "package.json" : "curl.cmd", size: data.length, mode: 0o644, data };
+    });
+    const a = analyze({ name: "probe-pkg", manifest: m, files, publisher: "a", previousPublishers: [] });
+
+    expect(finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null }).signals.map((s) => s.id)).toContain("install-download");
   });
 
   test("the same call behind npm run -s", () => {
@@ -96,6 +105,13 @@ describe("every other curl or wget keeps its reading", () => {
     "echo 'see curl' & curl https://example.invalid/x",
     "echo hi ^| curl https://example.invalid/x",
     "echo %CURL% https://example.invalid/x",
+    "'curl' --version",
+    "curl.exe -V",
+    "curl --version 1>&2",
+    "curl --version >'1'>/dev/null",
+    "true x'curl'",
+    "curl\u00a0--version",
+    "curl  --version",
   ];
 
   for (const cmd of fetching) {

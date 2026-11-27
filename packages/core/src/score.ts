@@ -1102,11 +1102,11 @@ function depNames(manifest: AnalyzeInput["manifest"], fields: readonly string[])
  * The text rules' findings in a hook command, less the shell and network ones only its curl and wget mentions gave when
  * none of those fetches (withoutInertNetTools): every other finding is the command's as written, cited as before.
  */
-function withoutInertNetFindings(cmd: string): ReturnType<typeof scanText> {
+function withoutInertNetFindings(cmd: string, shipsNetTool: boolean): ReturnType<typeof scanText> {
   // the analysis' own allowance per hook command for the second reading
   const MAX_NET_TOOL_WORK = MAX_ANALYSIS_WORK / 64;
   const found = scanText(cmd, "plain");
-  const masked = withoutInertNetTools(cmd);
+  const masked = withoutInertNetTools(cmd, shipsNetTool);
 
   if (masked === cmd) return found;
   let left: Set<string>;
@@ -1128,7 +1128,7 @@ function withoutInertNetFindings(cmd: string): ReturnType<typeof scanText> {
  * Signals from the lifecycle scripts: what runs at install, at a git install, and on the publisher's machine. Returns
  * the evidence it cited from commands that run at install, so the risk signals can tell install-time use apart.
  */
-function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: readonly ExpandedHook[]): Set<string> {
+function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: readonly ExpandedHook[], shipsNetTool: boolean): Set<string> {
   const atInstall = new Set<string>();
   const installed = depNames(manifest, ["dependencies", "optionalDependencies", "peerDependencies"]);
   // a git install also installs devDependencies before it runs prepare
@@ -1143,12 +1143,12 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
     for (const c of h.commands) {
       const label = `package.json ${c.from}: ${c.text.slice(0, 80)}`;
 
-      if (h.kind !== "publish" && isInlineDownload(c.text, { viaEval: c.viaEval, localBins: h.kind === "git" ? gitInstalled : installed })) {
+      if (h.kind !== "publish" && isInlineDownload(c.text, { viaEval: c.viaEval, localBins: h.kind === "git" ? gitInstalled : installed, shipsNetTool })) {
         found.add("install-download", label);
         risky = true;
       }
 
-      for (const f of withoutInertNetFindings(c.text)) {
+      for (const f of withoutInertNetFindings(c.text, shipsNetTool)) {
         const ev = `${label}${f.how === "as written" ? "" : ` (${f.how})`}`;
         found.add(f.id, ev, f.confidence);
 
@@ -1851,7 +1851,7 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
 
   // a hook whose commands apm stopped expanding runs commands apm did not read
   for (const h of hooks) if (h.cut !== null && h.kind !== "publish") add("incomplete", `scripts.${h.hook}: apm stopped reading the commands it runs at ${h.cut}`);
-  const hookEvidence = analyzeHooks(found, manifest, hooks);
+  const hookEvidence = analyzeHooks(found, manifest, hooks, files.some((f) => /^(?:curl|wget)(?:\.[^/]*)?$/i.test(f.path)));
 
   // what runs on the installing machine: install hooks, and the git hooks npm runs when it installs from git
   // every hook's commands before what only the shell reading adds to any of them (HookCommand.added)

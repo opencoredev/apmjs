@@ -681,114 +681,61 @@ export type DownloadContext = {
   viaEval?: boolean;
   /** Packages installed alongside this one: running their bins with npx downloads nothing. */
   localBins?: ReadonlySet<string>;
+  /** The package has a file at its root named like curl or wget (netToolsInert). */
+  shipsNetTool?: boolean;
 };
 
-// curl and wget found on the PATH, as sh and cmd.exe find them: a path may name any program, the package's own included
-const NET_TOOL_WORD = /^(?:curl|wget)(?:\.exe)?$/i;
 const NET_TOOL_MENTION = /\b(?:curl|wget)\b/i;
 const NET_TOOL_MENTIONS = /\b(?:curl|wget)\b/gi;
 
-// what curl and wget do with only these: print their help or version and exit, fetching nothing
-const NET_TOOL_INFO = new Set(["--version", "-V", "--help", "-h", "--manual", "-M"]);
+// one simple command whose curl or wget fetches nothing, written in plain ASCII words one space apart: a call that only
+// prints help or a version, with at most output to the null device, or an echo or printf of one quoted literal
+const NET_TOOL_INFO_CALL = /^(?:curl|wget) (?:--version|-V|--help|-h)(?: (?:>|2>|>>|2>>)\/dev\/null| 2>&1)*$/;
+const PRINTED_LITERAL = /^(?:echo|printf) (?:'[^'|&;<>\n]*'|"[^"$`\\|&;<>\n]*")$/;
 
-// expansion, substitution, escapes, grouping, heredocs and comments, in sh and in cmd.exe (`^`, `%x%`): the words the
-// shell runs are then not the words written
-const NET_TOOL_UNREAD = /[$`\\(){}^%]|<<|(?:^|\s)#/;
+// the commands between `&&`, `||` and `;`
+const LIST_SEPARATOR = /&&|\|\||;/;
+
+/** `s` without the ASCII spaces around it. */
+function trimSpaces(s: string): string {
+  let a = 0;
+  let b = s.length;
+
+  while (a < b && s[a] === " ") a++;
+
+  while (b > a && s[b - 1] === " ") b--;
+
+  return s.slice(a, b);
+}
+
+// a character that makes the words the shell runs other than the words written: quotes, expansion, escapes, pipes,
+// redirection, grouping, comments, cmd.exe's escapes and variables, and anything outside plain ASCII
+const UNPLAIN = /['"$`\\|&<>(){}#^%]|[^\x20-\x7e]/;
 
 /**
  * Whether every curl or wget mention in `cmd` is a call that fetches nothing (`curl --version`, `wget --help`) or a
- * literal an `echo` or `printf` prints and nothing reads (`echo 'run curl --version'`). Any other shape, and a
- * command with expansion, escapes, grouping, a heredoc or a comment anywhere, is read as fetching, as before.
+ * literal an `echo` or `printf` prints (`echo 'run curl --version'`), read only in those exact shapes: `cmd` is a
+ * list of simple commands joined by `&&`, `||` or `;`, each one of those shapes or a command in plain words that
+ * mentions neither tool. `shipsNetTool`: the package has a file at its root named like curl or wget, which cmd.exe
+ * runs before the one on the PATH. Anything else is read as fetching, as before.
  */
-export function netToolsInert(cmd: string): boolean {
-  if (!/curl|wget/i.test(cmd) || NET_TOOL_UNREAD.test(cmd)) return false;
-  // the simple commands of `cmd`: their words as the shell hands them over and whether a pipe or redirection touches them
-  const segments: { words: string[]; piped: boolean; redirected: boolean }[] = [];
-  let seg = { words: [] as string[], piped: false, redirected: false };
-  let word: string | null = null;
-  let quote: string | null = null;
-  // the next word is a redirection's file, which the command is not handed
-  let target = false;
+export function netToolsInert(cmd: string, shipsNetTool = false): boolean {
+  if (shipsNetTool || !NET_TOOL_MENTION.test(cmd)) return false;
 
-  // a redirection to anything but the null device or another descriptor may do something of its own
-  let redirectsElsewhere = false;
-  // the redirection's operator, its descriptor included (`2>&`)
-  let op = "";
-
-  const flush = (): void => {
-    if (word !== null && !target) seg.words.push(word);
-
-    // only output to the null device (`>/dev/null`, `2>>/dev/null`) or a copy of an output descriptor (`2>&1`)
-    if (word !== null && target) redirectsElsewhere ||= !((/^[12]?>>?$/.test(op) && word === "/dev/null") || (/^[12]?>&$/.test(op) && /^[12]$/.test(word)));
-
-    if (word !== null) target = false;
-    word = null;
-  };
-
-  const end = (pipe: boolean): void => {
-    flush();
-    target = false;
-    segments.push(seg);
-    seg = { words: [], piped: pipe, redirected: false };
-  };
-
-  for (let i = 0; i < cmd.length; i++) {
-    const c = cmd[i] ?? "";
-    const next = cmd[i + 1] ?? "";
-
-    if (quote !== null) {
-      // cmd.exe, which runs npm's scripts on Windows, reads no single quotes, so an operator in one may end the command
-      if (/[|&;<>\n]/.test(c)) return false;
-
-      if (c === quote) quote = null;
-      else word += c;
-    } else if (c === "'" || c === '"') {
-      quote = c;
-      word ??= "";
-    } else if (c === "<" || c === ">") {
-      // a file descriptor before it (`2>`) is part of the redirection, as are `>>`, `>&` and `>|`
-      op = word !== null && /^\d+$/.test(word) ? word : "";
-
-      if (op !== "") word = null;
-      else flush();
-      seg.redirected = true;
-      op += c;
-
-      while (/[<>&|]/.test(cmd[i + 1] ?? "")) op += cmd[++i] ?? "";
-      target = true;
-    } else if (c === "|" && next !== "|") {
-      seg.piped = true;
-      end(true);
-    } else if (c === "|" || c === "&" || c === ";" || c === "\n") {
-      if (c === next && c !== ";") i++;
-      end(false);
-    } else if (/\s/.test(c)) flush();
-    else word = (word ?? "") + c;
-  }
-
-  if (quote !== null) return false;
-  end(false);
-
-  if (redirectsElsewhere) return false;
-
-  return segments.every(({ words, piped, redirected }) => {
-    if (!words.some((w) => NET_TOOL_MENTION.test(w))) return true;
-    const [head = "", ...args] = words;
-
-    if (NET_TOOL_WORD.test(head)) return args.length > 0 && args.every((w) => NET_TOOL_INFO.has(w));
-
-    return (head === "echo" || head === "printf") && !piped && !redirected;
-  });
+  return cmd
+    .split(LIST_SEPARATOR)
+    .map(trimSpaces)
+    .every((c) => NET_TOOL_INFO_CALL.test(c) || PRINTED_LITERAL.test(c) || (!UNPLAIN.test(c) && !NET_TOOL_MENTION.test(c)));
 }
 
 /** `cmd` with every curl and wget mention blanked when netToolsInert holds, else `cmd` as it is. */
-export function withoutInertNetTools(cmd: string): string {
-  return netToolsInert(cmd) ? cmd.replace(NET_TOOL_MENTIONS, (m) => "_".repeat(m.length)) : cmd;
+export function withoutInertNetTools(cmd: string, shipsNetTool = false): string {
+  return netToolsInert(cmd, shipsNetTool) ? cmd.replace(NET_TOOL_MENTIONS, (m) => "_".repeat(m.length)) : cmd;
 }
 
 /** The canonical dropper shape: a command that fetches remote code, or fetches a package and runs it. */
 export function isInlineDownload(cmd: string, ctx: DownloadContext = {}): boolean {
-  if (/\b(?:curl|wget|iwr|Invoke-WebRequest)\b/i.test(withoutInertNetTools(cmd))) return true;
+  if (/\b(?:curl|wget|iwr|Invoke-WebRequest)\b/i.test(withoutInertNetTools(cmd, ctx.shipsNetTool))) return true;
 
   if (/\|\s*(?:ba|z)?sh\b/.test(cmd)) return true;
 
