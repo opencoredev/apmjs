@@ -40,6 +40,7 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
   test("the second reading never spends the analysis' work", () => {
     const m: AnalyzeInput["manifest"] = { name: "probe-pkg", version: "1.0.0", license: "MIT", scripts: { prepublishOnly: "echo curl 'Install the tool'" } };
     const data = new TextEncoder().encode(JSON.stringify(m));
+
     const a = analyze({ name: "probe-pkg", manifest: m, files: [{ path: "package.json", size: data.length, mode: 0o644, data }], publisher: "a", previousPublishers: [], meter: new Meter(230) });
     const r = finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null });
 
@@ -48,11 +49,13 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
 
   test("a package that ships its own curl keeps the reading, since cmd.exe runs it before the one on the PATH", () => {
     const m: AnalyzeInput["manifest"] = { name: "probe-pkg", version: "1.0.0", license: "MIT", scripts: { postinstall: "curl --version" } };
+
     const files = [JSON.stringify(m), "@echo off\r\n"].map((text, i) => {
       const data = new TextEncoder().encode(text);
 
       return { path: i === 0 ? "package.json" : "curl.cmd", size: data.length, mode: 0o644, data };
     });
+
     const a = analyze({ name: "probe-pkg", manifest: m, files, publisher: "a", previousPublishers: [] });
 
     expect(finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null }).signals.map((s) => s.id)).toContain("install-download");
@@ -60,11 +63,13 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
 
   test("a file an install script runs, and binding.gyp, keep the reading they had", () => {
     const m: AnalyzeInput["manifest"] = { name: "probe-pkg", version: "1.0.0", license: "MIT", scripts: { postinstall: "sh ./setup.sh" } };
+
     const files = [JSON.stringify(m), "curl --version\n"].map((text, i) => {
       const data = new TextEncoder().encode(text);
 
       return { path: i === 0 ? "package.json" : "setup.sh", size: data.length, mode: 0o644, data };
     });
+
     const a = analyze({ name: "probe-pkg", manifest: m, files, publisher: "a", previousPublishers: [] });
 
     expect(finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null }).signals.map((s) => s.id)).toContain("install-download");
@@ -125,7 +130,9 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
     expect(scoreOf({ prepare: "curl --version" }).ids).toContain("install-download");
     expect(scoreOf({ prepare: "echo 'curl is optional'" }).ids).toContain("install-download");
 
-    for (const before of [{ prepublish: "node make-marker.js" }, { preprepare: "node make-marker.js" }] as Record<string, string>[]) {
+    const befores: Record<string, string>[] = [{ prepublish: "node make-marker.js" }, { preprepare: "node make-marker.js" }];
+
+    for (const before of befores) {
       expect(scoreOf({ ...before, prepare: "curl --version" }).ids).toContain("install-download");
     }
   });

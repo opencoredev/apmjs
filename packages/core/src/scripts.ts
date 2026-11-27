@@ -140,7 +140,7 @@ export type Scripts = z.infer<typeof ScriptsSchema>;
 /** The part of a manifest the lifecycle analysis reads. */
 export type ScriptsManifest = { readonly scripts?: unknown };
 
-function scriptsOf(manifest: ScriptsManifest): Scripts {
+export function scriptsOf(manifest: ScriptsManifest): Scripts {
   const out: Scripts = {};
 
   for (const [k, v] of Object.entries(ScriptsSchema.parse(manifest.scripts))) if (v.trim()) out[k] = v;
@@ -716,11 +716,11 @@ function trimSpaces(s: string): string {
  * cmd.exe runs before the one on the PATH. Anything else is read as fetching, as before.
  */
 export function netToolsInert(cmd: string, shipsNetTool = false): boolean {
-  return !shipsNetTool && NET_TOOL_MENTION.test(cmd) && onlyInertShapes(cmd);
+  return !shipsNetTool && NET_TOOL_MENTION.test(cmd) && onlyInertCommands(cmd);
 }
 
 /** Whether `cmd` is a list of only the shapes netToolsInert clears, so it runs none of the package's code. */
-export function onlyInertShapes(cmd: string): boolean {
+export function onlyInertCommands(cmd: string): boolean {
   return cmd
     .split(LIST_SEPARATOR)
     .map(trimSpaces)
