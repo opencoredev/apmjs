@@ -8,11 +8,12 @@ const widest = (s: string) => Math.max(...s.split("\n").map((l) => Bun.stringWid
 
 describe("terminal layout", () => {
   test("only a terminal has columns; a pipe gets whole lines", () => {
-    expect(columnsOf({ isTTY: false, columns: 80 })).toBeNull();
-    expect(columnsOf({})).toBeNull();
-    expect(columnsOf({ isTTY: true, columns: 120 })).toBe(120);
-    expect(columnsOf({ isTTY: true })).toBe(80);
-    expect(columnsOf({ isTTY: true, columns: 12 })).toBe(12);
+    // an empty environment: the suite itself may run under CI
+    expect(columnsOf({ isTTY: false, columns: 80 }, {})).toBeNull();
+    expect(columnsOf({}, {})).toBeNull();
+    expect(columnsOf({ isTTY: true, columns: 120 }, {})).toBe(120);
+    expect(columnsOf({ isTTY: true }, {})).toBe(80);
+    expect(columnsOf({ isTTY: true, columns: 12 }, {})).toBe(12);
     expect(columnsOf({ isTTY: true, columns: 120 }, { CI: "true" })).toBeNull();
     expect(columnsOf({ isTTY: true, columns: 120 }, { CI: "false" })).toBe(120);
   });
