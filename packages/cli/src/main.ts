@@ -26,7 +26,7 @@ import { makeTemp, removeTemp } from "./sandbox.ts";
 import { CLI_VERSION } from "./version.ts";
 import { manifestChecks, registryChecks, VALID_NAME_RULE, type BuildMetadata, type Existing, type PublishCheck, type RegistryView } from "./publish-checks.ts";
 import { argsError, bareInstallArgs, commandOf, helpTopic } from "./commands.ts";
-import { columnsOf, inCi, reflow, truncate, wrap, wrapCommand } from "./ui.ts";
+import { bounded, columnsOf, inCi, reflow, truncate, wrap, wrapCommand } from "./ui.ts";
 
 function flag(a: Args, k: string): string | null {
   const v = a.flags.get(k);
@@ -61,7 +61,8 @@ function fit(line: string, stream: NodeJS.WriteStream, how: "wrap" | "cut" | "ra
 
   if (columns === null || how === "raw") return line;
 
-  return line
+  // one message is laid out within a budget, so a registry text's thousands of lines cannot flood the terminal
+  return bounded(line)
     .split("\n")
     .map((l) => (how === "cut" ? truncate(l, columns) : wrap(l, columns)))
     .join("\n");

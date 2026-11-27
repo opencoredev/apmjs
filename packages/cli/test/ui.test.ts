@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { columnsOf, reflow, truncate, wrap, wrapCommand } from "../src/ui.ts";
+import { bounded, columnsOf, reflow, truncate, wrap, wrapCommand } from "../src/ui.ts";
 
 const RED = "\x1b[31m";
 const RESET = "\x1b[0m";
@@ -125,6 +125,17 @@ describe("terminal layout", () => {
     expect(wrapped.length).toBeLessThan(10_000);
     expect(cut.length).toBeLessThan(10_000);
     expect(wrapped).not.toContain("\x1b]");
+  });
+
+  test("a narrow text over the budget is cut, and a text of many lines keeps only its first", () => {
+    const narrow = `ok${"\u200b".repeat(9000)}`;
+    const lines = "reason\n".repeat(100_000);
+
+    expect(truncate(narrow, 80).length).toBeLessThan(8100);
+    expect(wrap(narrow, 80).length).toBeLessThan(8100);
+    expect(bounded(lines).split("\n")).toHaveLength(200);
+    expect(bounded(lines).endsWith("…")).toBe(true);
+    expect(bounded("short\ntext")).toBe("short\ntext");
   });
 
   test("a narrow terminal keeps room for text: a deep indent gives way", () => {

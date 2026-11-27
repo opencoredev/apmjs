@@ -57,14 +57,16 @@ function openColors(pieces: readonly Piece[]): string[] {
 }
 
 /** `text` cut to `width` columns with an ellipsis, cut between characters and closing only the colors it opened. */
-export function truncate(text: string, width: number): string {
+export function truncate(full: string, width: number): string {
+  const text = bounded(full);
+
   if (widthOf(text) <= width) return text;
   const kept: Piece[] = [];
   let used = 0;
 
   // a link or other escape that is not a color is dropped: cut short, it could stay open past the line. Only the
   // part that can show is split into characters, however long the text
-  for (const p of piecesOf(Bun.sliceAnsi(bounded(text), 0, width + 1))) {
+  for (const p of piecesOf(Bun.sliceAnsi(text, 0, width + 1))) {
     if (p.kind === "escape") {
       if (SGR.test(p.text)) kept.push(p);
     } else if (used + p.width <= width - 1) {
@@ -120,24 +122,27 @@ export function reflow(text: string): string {
   return out.join("\n");
 }
 
-/** The most code units of one line apm lays out for a terminal, escapes and invisible characters included. */
+/** The most code units of one message apm lays out for a terminal, escapes and invisible characters included. */
 const MAX_LAID_OUT = 8000;
+
+/** The most lines of one message apm lays out for a terminal, before wrapping. */
+const MAX_LINES = 200;
 
 /** The most color codes a wrapped line carries open across a break: older ones are let go first. */
 const MAX_OPEN = 16;
 
 /**
- * `text` cut to MAX_LAID_OUT code units with an ellipsis when longer, keeping only its colors: registry text can be
- * megabytes (a yank reason), and a link or other escape cut short could stay open past the line.
+ * `text` cut to MAX_LAID_OUT code units and MAX_LINES lines with an ellipsis when longer, keeping only its colors:
+ * registry text can be megabytes (a yank reason), and a link or other escape cut short could stay open past the line.
  */
-function bounded(text: string): string {
-  if (text.length <= MAX_LAID_OUT) return text;
+export function bounded(text: string): string {
+  const head = text.slice(0, MAX_LAID_OUT).split("\n").slice(0, MAX_LINES).join("\n");
 
-  const kept = piecesOf(text.slice(0, MAX_LAID_OUT)).filter((p) =>
-    p.kind === "escape" ? SGR.test(p.text) : !p.text.includes(ESC),
-  );
+  if (head.length === text.length) return text;
 
-  return `${kept.map((p) => p.text).join("")}…${RESET}`;
+  const kept = piecesOf(head).filter((p) => (p.kind === "escape" ? SGR.test(p.text) : !p.text.includes(ESC)));
+
+  return `${kept.map((p) => p.text).join("")}…${head.includes(ESC) ? RESET : ""}`;
 }
 
 /** The fewest columns a wrapped line keeps for its text: a deeper indent is given up first. */
