@@ -91,10 +91,8 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
     }
   });
 
-  test("the same call behind npm run -s", () => {
-    const r = scoreOf({ postinstall: "npm run -s check", check: "curl --version" });
-
-    for (const id of NETWORK) expect(r.ids).not.toContain(id);
+  test("a script a hook runs keeps its reading, since npm may run another package's script of that name", () => {
+    expect(scoreOf({ postinstall: "npm run -s check", check: "curl --version" }).ids).toContain("install-download");
   });
 });
 
