@@ -94,6 +94,10 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
   test("a hook keeps its reading when another install-time hook runs code first", () => {
     expect(scoreOf({ preinstall: "node make-marker.js", postinstall: "curl --version" }).ids).toContain("install-download");
     expect(scoreOf({ preinstall: "echo 'checking'", postinstall: "curl --version" }).ids).not.toContain("install-download");
+
+    for (const before of [{ prepublish: "node make-marker.js" }, { preprepare: "node make-marker.js" }] as Record<string, string>[]) {
+      expect(scoreOf({ ...before, prepare: "curl --version" }).ids).toContain("install-download");
+    }
   });
 
   test("a script a hook runs keeps its reading, since npm may run another package's script of that name", () => {

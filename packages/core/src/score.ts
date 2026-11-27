@@ -1128,6 +1128,9 @@ function withoutInertNetFindings(cmd: string, shipsNetTool: boolean): ReturnType
  * Signals from the lifecycle scripts: what runs at install, at a git install, and on the publisher's machine. Returns
  * the evidence it cited from commands that run at install, so the risk signals can tell install-time use apart.
  */
+// a lifecycle step npm may run on an install from the registry or from git, or its pre or post script
+const LIFECYCLE_STEP = /^(?:pre|post)?(?:install|preinstall|postinstall|prepare|prepack|postpack|prepublish|prepublishOnly|publish|dependencies)$/;
+
 function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: readonly ExpandedHook[], shipsNetTool: boolean): Set<string> {
   const atInstall = new Set<string>();
   const installed = depNames(manifest, ["dependencies", "optionalDependencies", "peerDependencies"]);
@@ -1135,9 +1138,10 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
   const gitInstalled = depNames(manifest, ["dependencies", "optionalDependencies", "peerDependencies", "devDependencies"]);
 
   // a hook's own text is surely what npm runs from the package's root with its shell, and the root holds what the
-  // tarball does only when nothing of this package runs before it at install: every hook that runs on the installer's
-  // machine is itself one netToolsInert clears, so none writes a program cmd.exe would find first
-  const stableRoot = hooks.every((h) => h.kind === "publish" || h.commands.every((c) => c.from === `scripts.${h.hook}` && onlyInertShapes(c.text)));
+  // tarball does only when nothing of this package runs before it at install: every script npm may run as a lifecycle
+  // step or its pre and post script, on any install from the registry or from git, is one of the shapes netToolsInert
+  // clears, so none writes a program cmd.exe would find first
+  const stableRoot = Object.entries(isRecord(manifest.scripts) ? manifest.scripts : {}).every(([name, body]) => !LIFECYCLE_STEP.test(name) || (typeof body === "string" && onlyInertShapes(body)));
 
   for (const h of hooks) {
     const own = h.commands[0]?.text ?? "";
@@ -1860,7 +1864,7 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   // a hook whose commands apm stopped expanding runs commands apm did not read
   for (const h of hooks) if (h.cut !== null && h.kind !== "publish") add("incomplete", `scripts.${h.hook}: apm stopped reading the commands it runs at ${h.cut}`);
   // a root file named like curl or wget, or a binding.gyp, whose build npm may run at install, keeps the reading
-  const hookEvidence = analyzeHooks(found, manifest, hooks, files.some((f) => /^(?:curl|wget)(?:\.[^/]*)?$/i.test(f.path) || f.path === "binding.gyp"));
+  const hookEvidence = analyzeHooks(found, manifest, hooks, files.some((f) => /^(?:curl|wget)(?:\.[^/]*)?$/i.test(f.path) || /^binding\.gyp$/i.test(f.path)));
 
   // what runs on the installing machine: install hooks, and the git hooks npm runs when it installs from git
   // every hook's commands before what only the shell reading adds to any of them (HookCommand.added)
