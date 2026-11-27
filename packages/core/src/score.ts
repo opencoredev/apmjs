@@ -1894,8 +1894,18 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   // what install hooks run that only the shell reading reaches (HookCommand.added): the extra layer's, after production's
   // whole walk
   const later = new Set<string>();
+  // of those, what an interpreter or the shell runs (`sh ./setup.sh`), not every word that names a file
+  const laterRun = new Set<string>();
 
   for (const c of installCommands) {
+    if (c.added) {
+      for (const w of scriptTargetsBefore(c.text)) {
+        const f = resolveIn(byPath, w);
+
+        if (f && f.path !== "package.json") laterRun.add(f.path);
+      }
+    }
+
     for (const w of [...scriptTargetsBefore(c.text), ...commandWords(c.text)]) {
       const f = resolveIn(byPath, w);
 
@@ -2606,8 +2616,8 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
         const f = byPath.get(p);
 
         if (!seen.has(p)) reach(p);
-        else if (f !== undefined && !installTargets.has(p)) {
-          // production's walk read it, but not as what an install hook runs: its install-time check is made here
+        else if (f !== undefined && laterRun.has(p) && readWhole.has(f) && !installTargets.has(p)) {
+          // production's walk read its whole text, but not as what an install hook runs: its install-time check is made here
           chargeText("text", f.data.length, 2);
           const text = new TextDecoder().decode(f.data);
 

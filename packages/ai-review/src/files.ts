@@ -4,7 +4,7 @@
 // not seeing a file it worried about, so the order puts what runs first: install-script targets, then
 // Node entry points, then files where apm's rule-based signals fired, then whatever those entries reach
 // through relative imports, then browser entries, then the rest of the code by depth and size.
-import { analyze, expandHooks, MAX_ANALYSIS_WORK, measureManifest, Meter, MeterExhausted, metered, runTargets, shellWords, type TarEntry, findingsOf, shellGlobMatch } from "@apm/core";
+import { analyze, expandHooks, MAX_ANALYSIS_WORK, measureManifest, Meter, MeterExhausted, metered, runTargets, shellWords, type TarEntry, findingsOf, shellGlobMatch, wildcardMatch } from "@apm/core";
 import { installScripts, type Manifest } from "./manifest.ts";
 
 const CODE = /\.(?:[cm]?jsx?|[cm]?tsx?|sh|bash|zsh|ps1|psm1|bat|cmd|py|vbs|php|rb|pl|vue|svelte|coffee)$/;
@@ -205,6 +205,7 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
   // the tarball's files (`node ./pay*.txt`): ranked after everything above, so it only takes budget main left unused
   const reached = new Set<string>();
   const globs = new Map<string, { depth: number; prefix: string }>();
+  const patterns = new Map<string, { depth: number; prefix: string }>();
   const scripts = { scripts: Object.fromEntries(manifest.scripts) };
 
   // a manifest past what apm reads is not expanded, as `analyze` does not expand it, and the expansion and glob matching
@@ -219,13 +220,18 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
             if (t === null || t === "(" || t === ")" || t === "cut") continue;
             const w = stripDot(t.word.replace(/^\$\{?PWD\}?\//, "./"));
 
-            // a glob that matches nothing is the word as written (`x[1].js`), as the shell hands it over
-            const f = resolved(w);
+            if (!t.glob) {
+              const f = resolved(w);
 
-            if (f !== undefined) reached.add(f);
+              if (f !== undefined) reached.add(f);
+            } else if (globs.size < MAX_GLOBS && w.length <= MAX_GLOB_CHARS) {
+              globs.set(w, { depth: w.split("/").length, prefix: w.slice(0, w.indexOf("*")) });
+            }
 
-            if (t.glob && globs.size < MAX_GLOBS && w.length <= MAX_GLOB_CHARS) {
-              globs.set(w, { depth: w.split("/").length, prefix: w.slice(0, w.search(/[*?[]/)) });
+            // `?` and bracket classes, in a word with no quoting or expansion, so every one of them is the shell's: read
+            // after the `*` globs above, with slots of their own
+            if ((t.glob || t.pattern) && !t.quoted && !t.expanded && /[?[]/.test(w) && patterns.size < MAX_GLOBS && w.length <= MAX_GLOB_CHARS) {
+              patterns.set(w, { depth: w.split("/").length, prefix: w.slice(0, w.search(/[*?[]/)) });
             }
           }
         }
@@ -234,7 +240,13 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
       for (const f of globs.size > 0 ? files : []) {
         const depth = f.path.split("/").length;
 
-        for (const [pattern, g] of globs) if (depth === g.depth && f.path.startsWith(g.prefix) && shellGlobMatch(f.path, pattern)) reached.add(f.path);
+        for (const [pattern, g] of globs) if (depth === g.depth && f.path.startsWith(g.prefix) && wildcardMatch(f.path, pattern)) reached.add(f.path);
+      }
+
+      for (const f of patterns.size > 0 ? files : []) {
+        const depth = f.path.split("/").length;
+
+        for (const [pattern, g] of patterns) if (depth === g.depth && f.path.startsWith(g.prefix) && shellGlobMatch(f.path, pattern)) reached.add(f.path);
       }
     });
   } catch (e) {

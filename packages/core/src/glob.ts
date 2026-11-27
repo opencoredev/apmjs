@@ -73,16 +73,20 @@ export function sameSubstitution(text: string, parts: readonly string[]): boolea
 /** One character of a shell glob: a literal, `?`, `*`, or a bracket class (`[a-z]`, `[!x]`). */
 type GlobToken = { kind: "literal"; c: string } | { kind: "any" } | { kind: "star" } | { kind: "class"; negated: boolean; ranges: [string, string][] };
 
-/** The tokens of one path segment of a shell glob; a `[` with no closing `]` is a literal, as the shell reads it. */
+/**
+ * The tokens of one path segment of a shell glob, in one pass: a `[` with no `]` after it is a literal, as the shell
+ * reads it, which the last `]`'s position tells without a search from each one.
+ */
 function globTokens(segment: string): GlobToken[] {
   const out: GlobToken[] = [];
+  const lastClose = segment.lastIndexOf("]");
 
   for (let i = 0; i < segment.length; i++) {
     const c = segment[i] ?? "";
 
     if (c === "*") out.push({ kind: "star" });
     else if (c === "?") out.push({ kind: "any" });
-    else if (c === "[") {
+    else if (c === "[" && lastClose > i + 1) {
       let j = i + 1;
       const negated = segment[j] === "!" || segment[j] === "^";
 
@@ -92,9 +96,9 @@ function globTokens(segment: string): GlobToken[] {
       // a `]` first in the class is one of its characters
       if (segment[j] === "]") j++;
 
-      while (j < segment.length && segment[j] !== "]") j++;
+      while (j < lastClose && segment[j] !== "]") j++;
 
-      if (j >= segment.length) {
+      if (segment[j] !== "]" || j <= from) {
         out.push({ kind: "literal", c });
         continue;
       }
@@ -126,20 +130,23 @@ function tokenMatches(t: GlobToken, c: string): boolean {
 }
 
 /**
- * Whether `path` matches the shell glob `pattern` segment by segment: `*`, `?` and bracket classes match within one
- * segment and never a `/`. Each segment is the greedy match wildcardMatch uses, so it takes at most
- * `segment.length × pattern segment.length` steps, which are charged before it runs.
+ * Whether `path` matches the shell glob `pattern` segment by segment, as sh expands it: `*`, `?` and bracket classes
+ * match within one segment, never a `/`, and never a segment's leading `.`, which only a literal `.` matches. Each
+ * segment is the greedy match wildcardMatch uses, so it takes at most `path.length × pattern.length` steps, which are
+ * charged before anything is read.
  */
 export function shellGlobMatch(path: string, pattern: string): boolean {
+  charge("score", Math.ceil(((path.length + 1) * (pattern.length + 1)) / 32));
   const texts = path.split("/");
   const patterns = pattern.split("/");
 
   if (texts.length !== patterns.length) return false;
-  charge("score", Math.ceil(((path.length + 1) * (pattern.length + 1)) / 32));
 
   return patterns.every((p, i) => {
     const text = texts[i] ?? "";
     const tokens = globTokens(p);
+
+    if (text.startsWith(".") && !(tokens[0]?.kind === "literal" && tokens[0].c === ".")) return false;
     let t = 0;
     let k = 0;
     let star = -1;
