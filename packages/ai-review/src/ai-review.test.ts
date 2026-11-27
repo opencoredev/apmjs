@@ -217,6 +217,11 @@ describe("review input", () => {
       { scripts: { postinstall: "./install.exe" }, path: "install.exe", body: script },
       { scripts: { postinstall: "node './setup.txt'" }, path: "setup.txt", body: payload },
       { scripts: { postinstall: "node ./pay*.txt" }, path: "payload.txt", body: payload },
+      { scripts: { postinstall: "node ./pay?oad.txt" }, path: "payload.txt", body: payload },
+      { scripts: { postinstall: "node ./pay[a-z]oad.txt" }, path: "payload.txt", body: payload },
+      { scripts: { postinstall: "node ./pay[!x]oad.txt" }, path: "payload.txt", body: payload },
+      { scripts: { postinstall: "node lib/?/[ps]ayload.txt" }, path: "lib/a/payload.txt", body: payload },
+      { scripts: { postinstall: "node ./x[1].js" }, path: "x[1].js", body: payload },
       { scripts: { postinstall: "node $PWD/payload.txt" }, path: "payload.txt", body: payload },
       { scripts: { postinstall: "npm run setup", setup: "node ./payload.txt" }, path: "payload.txt", body: payload },
     ];

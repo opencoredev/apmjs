@@ -1519,7 +1519,14 @@ export function planLayers(input: { manifest: AnalyzeInput["manifest"]; files: r
   walk();
   invoked = all;
 
-  for (const p of all) if (!baseline.has(p)) queueX.push(p);
+  // a file the walk passed over as one it could not hold is held now that only the shell reading runs it
+  for (const p of all) {
+    if (baseline.has(p)) continue;
+
+    if (!held.has(p) && !extra.has(p)) seenX.delete(p);
+    queueX.push(p);
+  }
+
   walk();
 
   return { production: held, extra };
@@ -2595,7 +2602,19 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   // meter of its own, with the scoring of what it adds: running it out stops only this reading, never one before it
   try {
     withMeter(new Meter(MAX_ADDED_TARGET_WORK), () => {
-      for (const p of later) if (!seen.has(p)) reach(p);
+      for (const p of later) {
+        const f = byPath.get(p);
+
+        if (!seen.has(p)) reach(p);
+        else if (f !== undefined && !installTargets.has(p)) {
+          // production's walk read it, but not as what an install hook runs: its install-time check is made here
+          chargeText("text", f.data.length, 2);
+          const text = new TextDecoder().decode(f.data);
+
+          if (isShellScript(f, text) && isInlineDownload(text)) add("install-download", `${f.path}: run by an install script and downloads code`);
+        }
+      }
+
       readExtra();
       charge("score", scoringUnits() - baselineUnits);
     });
