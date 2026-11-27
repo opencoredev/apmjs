@@ -6,7 +6,7 @@ import { z } from "zod";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startRegistry, addUser, makeSandbox, writePackage, run, getJson, dig, putPublish, type Registry } from "./harness";
+import { startRegistry, addUser, makeSandbox, writePackage, run, apm, getJson, dig, putPublish, type Registry } from "./harness";
 
 function searchObject(name: string, version: string, description: string) {
   return {
@@ -75,6 +75,18 @@ describe("search merges local packages with the upstream's search", () => {
     const cloud = Array.isArray(objects) ? objects.find((o: unknown) => dig(o, "package", "name") === "widget-cloud") : undefined;
     expect(cloud).toBeDefined();
     expect(dig(cloud, "apmScore") ?? null).toBeNull();
+  });
+
+  test("apm search --size <n> reads n as the size, not as a search word", async () => {
+    const sb = makeSandbox(reg);
+    const cwd = mkdtempSync(join(tmpdir(), "apm-search-cli-"));
+    const r = await apm(["search", "widget", "--size", "1", "--json"], { cwd, env: sb.env });
+
+    expect(r.code, r.out).toBe(0);
+    const doc = z.object({ query: z.string(), hits: z.array(z.unknown()) }).parse(JSON.parse(r.stdout));
+
+    expect(doc.query).toBe("widget");
+    expect(doc.hits).toHaveLength(1);
   });
 
   test("the upstream's answer is cached between identical searches", async () => {

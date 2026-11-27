@@ -80,6 +80,17 @@ describe("apm: runtime detection and pass-through", () => {
     expect(r.out).toContain("hello-from-script");
   });
 
+  test("--pm=<name> picks the package manager and is not passed on to it", async () => {
+    const sb = makeSandbox(reg, alice);
+    const app = bunProject({}, alice);
+    const pkg: unknown = JSON.parse(readFileSync(join(app, "package.json"), "utf8"));
+    writeFileSync(join(app, "package.json"), JSON.stringify({ ...Object(pkg), scripts: { args: "echo script-args:" } }));
+    const r = await apm(["run", "args", "--pm=bun", "kept"], { cwd: app, env: sb.env });
+    expect(r.code, r.out).toBe(0);
+    expect(r.stdout).toContain("script-args: kept");
+    expect(r.out).not.toContain("--pm");
+  });
+
   test("apm add in a pnpm project installs through pnpm", async () => {
     const sb = makeSandbox(reg, alice);
     const app = writeConsumer(work, reg, alice, {});
