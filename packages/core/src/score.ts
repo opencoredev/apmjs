@@ -10,7 +10,7 @@ import { boundedManifest, MANIFEST_LIMITS, measureManifest } from "./manifest.ts
 import { MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { charge, chargeText, inPhase, MAX_ANALYSIS_WORK, Meter, MeterExhausted, PHASE_NAMES, withMeter, type Phase } from "./meter.ts";
 import { isEstablishedName, typoConflicts, type NameHistory } from "./names.ts";
-import { commandWords, commandWordsWithin, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook, type HookKind, type ShellWords } from "./scripts.ts";
+import { commandWords, commandWordsWithin, expandHooks, gypCommands, isInlineDownload, otherScripts, withoutInertNetTools, type ExpandedHook, type HookKind, type ShellWords } from "./scripts.ts";
 import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type Lang, type ExecutedCode, type FlowFinding, type Hidden, type Imports, type TextFinding } from "./source.ts";
 import { scanTextRules } from "./textrules.ts";
 import { keptBytes, MAX_KEPT_VIEW_BYTES, scanBinaryImports, scanBinaryText, type BinaryTextScan } from "./binary-text.ts";
@@ -1122,7 +1122,7 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
         risky = true;
       }
 
-      for (const f of scanText(c.text, "plain")) {
+      for (const f of scanText(withoutInertNetTools(c.text), "plain")) {
         const ev = `${label}${f.how === "as written" ? "" : ` (${f.how})`}`;
         found.add(f.id, ev, f.confidence);
 

@@ -683,9 +683,102 @@ export type DownloadContext = {
   localBins?: ReadonlySet<string>;
 };
 
+// curl and wget, as cmd.exe and a path find them
+const NET_TOOL_WORD = /^(?:[^\s'"]*[/\\])?(?:curl|wget)(?:\.exe)?$/i;
+const NET_TOOL_MENTION = /\b(?:curl|wget)\b/i;
+const NET_TOOL_MENTIONS = /\b(?:curl|wget)\b/gi;
+
+// what curl and wget do with only these: print their help or version and exit, fetching nothing
+const NET_TOOL_INFO = new Set(["--version", "-V", "--help", "-h", "--manual", "-M"]);
+
+// expansion, substitution, escapes, grouping, heredocs and comments, in sh and in cmd.exe (`^`, `%x%`): the words the
+// shell runs are then not the words written
+const NET_TOOL_UNREAD = /[$`\\(){}^%]|<<|(?:^|\s)#/;
+
+/**
+ * Whether every curl or wget mention in `cmd` is a call that fetches nothing (`curl --version`, `wget --help`) or a
+ * literal an `echo` or `printf` prints and nothing reads (`echo 'run curl --version'`). Any other shape, and a
+ * command with expansion, escapes, grouping, a heredoc or a comment anywhere, is read as fetching, as before.
+ */
+export function netToolsInert(cmd: string): boolean {
+  if (!/curl|wget/i.test(cmd) || NET_TOOL_UNREAD.test(cmd)) return false;
+  // the simple commands of `cmd`: their words as the shell hands them over and whether a pipe or redirection touches them
+  const segments: { words: string[]; piped: boolean; redirected: boolean }[] = [];
+  let seg = { words: [] as string[], piped: false, redirected: false };
+  let word: string | null = null;
+  let quote: string | null = null;
+  // the next word is a redirection's file, which the command is not handed
+  let target = false;
+
+  const flush = (): void => {
+    if (word !== null && !target) seg.words.push(word);
+
+    if (word !== null) target = false;
+    word = null;
+  };
+
+  const end = (pipe: boolean): void => {
+    flush();
+    target = false;
+    segments.push(seg);
+    seg = { words: [], piped: pipe, redirected: false };
+  };
+
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i] ?? "";
+    const next = cmd[i + 1] ?? "";
+
+    if (quote !== null) {
+      // cmd.exe, which runs npm's scripts on Windows, reads no single quotes, so an operator in one may end the command
+      if (/[|&;<>\n]/.test(c)) return false;
+
+      if (c === quote) quote = null;
+      else word += c;
+    } else if (c === "'" || c === '"') {
+      quote = c;
+      word ??= "";
+    } else if (c === "<" || c === ">") {
+      // a file descriptor before it (`2>`) is part of the redirection, as are `>>`, `>&` and `>|`
+      if (word !== null && /^\d+$/.test(word)) word = null;
+      else flush();
+      seg.redirected = true;
+
+      while (/[<>&|]/.test(cmd[i + 1] ?? "")) i++;
+      target = true;
+    } else if (c === "|" && next !== "|") {
+      seg.piped = true;
+      end(true);
+    } else if (c === "|" || c === "&" || c === ";" || c === "\n") {
+      if (c === next && c !== ";") i++;
+      end(false);
+    } else if (/\s/.test(c)) flush();
+    else word = (word ?? "") + c;
+  }
+
+  if (quote !== null) return false;
+  end(false);
+
+  return segments.every(({ words, piped, redirected }) => {
+    if (!words.some((w) => NET_TOOL_MENTION.test(w))) return true;
+    const [head = "", ...args] = words;
+
+    if (NET_TOOL_WORD.test(head)) return args.length > 0 && args.every((w) => NET_TOOL_INFO.has(w));
+
+    return (head === "echo" || head === "printf") && !piped && !redirected;
+  });
+}
+
+/**
+ * `cmd` with every curl and wget mention blanked when netToolsInert holds, so the text rules read no network or shell
+ * in them; else `cmd` as it is.
+ */
+export function withoutInertNetTools(cmd: string): string {
+  return netToolsInert(cmd) ? cmd.replace(NET_TOOL_MENTIONS, (m) => "_".repeat(m.length)) : cmd;
+}
+
 /** The canonical dropper shape: a command that fetches remote code, or fetches a package and runs it. */
 export function isInlineDownload(cmd: string, ctx: DownloadContext = {}): boolean {
-  if (/\b(?:curl|wget|iwr|Invoke-WebRequest)\b/i.test(cmd)) return true;
+  if (/\b(?:curl|wget|iwr|Invoke-WebRequest)\b/i.test(withoutInertNetTools(cmd))) return true;
 
   if (/\|\s*(?:ba|z)?sh\b/.test(cmd)) return true;
 
