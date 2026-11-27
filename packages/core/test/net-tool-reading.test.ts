@@ -1,7 +1,7 @@
 // curl and wget count as install-time network only where they run and fetch: a version or help call, or a literal an
 // echo prints, adds nothing. Every other shape keeps the reading it had. Payloads are stand-ins.
 import { describe, expect, test } from "bun:test";
-import { analyze, finalize, isInlineDownload, type Analysis, type AnalyzeInput } from "../src/index.ts";
+import { analyze, finalize, isInlineDownload, Meter, type Analysis, type AnalyzeInput } from "../src/index.ts";
 
 function scoreOf(scripts: Record<string, string>) {
   const m: AnalyzeInput["manifest"] = { name: "probe-pkg", version: "1.0.0", license: "MIT", scripts };
@@ -41,6 +41,15 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
     expect(scoreOf({ prepublishOnly: "echo curl 'cu' + 'rl help' '.npm' + 'rc'" })).toEqual({ score: 95, ids: ["credential-mention", "encoded-data"] });
   });
 
+  test("the second reading never spends the analysis' work", () => {
+    const m: AnalyzeInput["manifest"] = { name: "probe-pkg", version: "1.0.0", license: "MIT", scripts: { prepublishOnly: "echo curl 'Install the tool'" } };
+    const data = new TextEncoder().encode(JSON.stringify(m));
+    const a = analyze({ name: "probe-pkg", manifest: m, files: [{ path: "package.json", size: data.length, mode: 0o644, data }], publisher: "a", previousPublishers: [], meter: new Meter(230) });
+    const r = finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null });
+
+    expect(r.score).toBe(100);
+  });
+
   test("the same call behind npm run -s", () => {
     const r = scoreOf({ postinstall: "npm run -s check", check: "curl --version" });
 
@@ -75,6 +84,8 @@ describe("every other curl or wget keeps its reading", () => {
     "/usr/bin/curl --version",
     "cat < ./curl.txt",
     "curl --version > curl.sh",
+    "curl --version < ./fixture.txt",
+    "curl --version > out.txt",
     "echo 'a | curl https://example.invalid/x'",
     "echo 'see curl' & curl https://example.invalid/x",
     "echo hi ^| curl https://example.invalid/x",

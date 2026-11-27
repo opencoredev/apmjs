@@ -1103,11 +1103,23 @@ function depNames(manifest: AnalyzeInput["manifest"], fields: readonly string[])
  * none of those fetches (withoutInertNetTools): every other finding is the command's as written, cited as before.
  */
 function withoutInertNetFindings(cmd: string): ReturnType<typeof scanText> {
+  // the analysis' own allowance per hook command for the second reading
+  const MAX_NET_TOOL_WORK = MAX_ANALYSIS_WORK / 64;
   const found = scanText(cmd, "plain");
   const masked = withoutInertNetTools(cmd);
 
   if (masked === cmd) return found;
-  const left = new Set(scanText(masked, "plain").map((f) => f.id));
+  let left: Set<string>;
+
+  // the second reading runs on a meter of its own: running it out keeps the findings as written, and never costs what
+  // the analysis has
+  try {
+    left = withMeter(new Meter(MAX_NET_TOOL_WORK), () => new Set(scanText(masked, "plain").map((f) => f.id)));
+  } catch (e) {
+    if (!(e instanceof MeterExhausted)) throw e;
+
+    return found;
+  }
 
   return found.filter((f) => (f.id !== "shell-exec" && f.id !== "network") || left.has(f.id));
 }

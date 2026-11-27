@@ -710,13 +710,13 @@ export function netToolsInert(cmd: string): boolean {
   // the next word is a redirection's file, which the command is not handed
   let target = false;
 
-  // a redirection's file that names curl or wget is neither a call nor printed text
-  let targetMention = false;
+  // a redirection to anything but the null device or another descriptor may do something of its own
+  let redirectsElsewhere = false;
 
   const flush = (): void => {
     if (word !== null && !target) seg.words.push(word);
 
-    if (word !== null && target) targetMention ||= NET_TOOL_MENTION.test(word);
+    if (word !== null && target) redirectsElsewhere ||= !/^(?:\/dev\/null|nul|\d)$/i.test(word);
 
     if (word !== null) target = false;
     word = null;
@@ -763,7 +763,7 @@ export function netToolsInert(cmd: string): boolean {
   if (quote !== null) return false;
   end(false);
 
-  if (targetMention) return false;
+  if (redirectsElsewhere) return false;
 
   return segments.every(({ words, piped, redirected }) => {
     if (!words.some((w) => NET_TOOL_MENTION.test(w))) return true;
