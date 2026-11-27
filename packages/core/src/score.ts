@@ -10,7 +10,7 @@ import { boundedManifest, MANIFEST_LIMITS, measureManifest } from "./manifest.ts
 import { MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { charge, chargeText, inPhase, MAX_ANALYSIS_WORK, Meter, MeterExhausted, PHASE_NAMES, withMeter, type Phase } from "./meter.ts";
 import { isEstablishedName, typoConflicts, type NameHistory } from "./names.ts";
-import { commandWords, commandWordsWithin, expandHooks, gypCommands, isInlineDownload, onlyInertCommands, scriptsOf, otherScripts, withoutInertNetTools, type ExpandedHook, type HookKind, type ShellWords } from "./scripts.ts";
+import { commandWords, commandWordsWithin, expandHooks, gypCommands, isInlineDownload, onlyInertCommands, rawScriptsOf, otherScripts, withoutInertNetTools, type ExpandedHook, type HookKind, type ShellWords } from "./scripts.ts";
 import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type Lang, type ExecutedCode, type FlowFinding, type Hidden, type Imports, type TextFinding } from "./source.ts";
 import { scanTextRules } from "./textrules.ts";
 import { keptBytes, MAX_KEPT_VIEW_BYTES, scanBinaryImports, scanBinaryText, type BinaryTextScan } from "./binary-text.ts";
@@ -1192,7 +1192,7 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
   // tarball does only when nothing of this package runs before it at install: every script npm may run as a lifecycle
   // step or its pre and post script, on any install from the registry or from git, is one of the shapes netToolsInert
   // clears, so none writes a program cmd.exe would find first
-  const stableRoot = Object.entries(scriptsOf(manifest)).every(([name, body]) => !LIFECYCLE_STEP.test(name) || onlyInertCommands(body));
+  const stableRoot = Object.entries(rawScriptsOf(manifest)).every(([name, body]) => !LIFECYCLE_STEP.test(name) || body === "" || onlyInertCommands(body));
 
   for (const h of hooks) {
     const own = h.commands[0]?.text ?? "";

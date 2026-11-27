@@ -140,7 +140,12 @@ export type Scripts = z.infer<typeof ScriptsSchema>;
 /** The part of a manifest the lifecycle analysis reads. */
 export type ScriptsManifest = { readonly scripts?: unknown };
 
-export function scriptsOf(manifest: ScriptsManifest): Scripts {
+/** package.json `scripts` as written, a value that is not a string read as empty: what npm hands the shell, untrimmed. */
+export function rawScriptsOf(manifest: ScriptsManifest): Scripts {
+  return ScriptsSchema.parse(manifest.scripts);
+}
+
+function scriptsOf(manifest: ScriptsManifest): Scripts {
   const out: Scripts = {};
 
   for (const [k, v] of Object.entries(ScriptsSchema.parse(manifest.scripts))) if (v.trim()) out[k] = v;
