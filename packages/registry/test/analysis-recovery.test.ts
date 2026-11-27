@@ -547,10 +547,11 @@ describe("versions the upstream no longer has cannot starve the sweep", () => {
 // decision to stop trying comes before any download, a fetch that may pass later counts as a fetch failure, and the
 // sweep also requeues jobs the queue accepted that never began a run.
 describe("every delivery of a job is recorded before it asks the upstream anything", () => {
-  /** The stub upstream, with `tarball` and `probe` replaced, and every call to either counted. */
+  /** The stub upstream, with `tarball` and `probeFor` replaced, every call to either counted, and what each probe wanted. */
   function failingUpstream(input: { tarball?: () => Effect.Effect<never> | Effect.Effect<{ kind: "unavailable"; reason: string; retryable: boolean }>; probe?: "unknown" }) {
     const real = upstreamStub(["prestart"]);
     const calls = { probe: 0, tarball: 0 };
+    const wanted: (ReadonlyMap<string, "whole" | "trimmed"> | null)[] = [];
 
     const layer = Layer.effect(
       Upstream,
@@ -559,10 +560,11 @@ describe("every delivery of a job is recorded before it asks the upstream anythi
 
         return Upstream.of({
           ...u,
-          probe: (name, lease) => Effect.suspend(() => {
+          probeFor: (name, want, lease) => Effect.suspend(() => {
             calls.probe++;
+            wanted.push(want?.({ distTags: { latest: "1.0.0" }, versions: [] }) ?? null);
 
-            return input.probe === "unknown" ? Effect.succeed<Probe>({ kind: "unknown" }) : u.probe(name, lease);
+            return input.probe === "unknown" ? Effect.succeed<Probe>({ kind: "unknown" }) : u.probeFor(name, want, lease);
           }),
           tarball: (pkg, version) => Effect.suspend(() => {
             calls.tarball++;
@@ -573,7 +575,7 @@ describe("every delivery of a job is recorded before it asks the upstream anythi
       }),
     ).pipe(Layer.provide(real.layer));
 
-    return { layer, calls };
+    return { layer, calls, wanted };
   }
 
   const JOB: AnalysisJob = { name: "prestart", version: "1.0.0" };
@@ -585,6 +587,17 @@ describe("every delivery of a job is recorded before it asks the upstream anythi
 
   // the platform stopping the Worker while it downloads or caches the tarball: nothing after it runs
   const dies = () => Effect.die(new PlatformStop());
+
+  // 2026-11-26: registry isolates were killed for memory while the analysis queue drained a backlog. Each delivery read
+  // every stored analysis of the package (next: 61, 16 MB) to learn whether this one version had one
+  test("a job reads its own version's analysis only, trimmed", async () => {
+    await withRig(async (db) => {
+      const up = failingUpstream({ tarball: dies });
+
+      await runAt(db.url, T0, up.layer);
+      expect(up.wanted).toEqual([new Map([["1.0.0", "trimmed"]])]);
+    });
+  }, 60_000);
 
   test("runs stopped while fetching are counted, and the fourth run gives up before fetching", async () => {
     await withRig(async (db, sql) => {
