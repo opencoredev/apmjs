@@ -372,6 +372,33 @@ describe("OSV advisories under memory budgets", () => {
     expect(listed("over-cap-slow-cancel", await o.ask())).toEqual(VERSIONS);
   }, 10_000);
 
+  // Review of c88b027, finding 2: what a newer answer withheld was kept only in its request, so an older empty answer
+  // landing after it became the isolate's fresh answer, and the next request was served the version without asking
+  test("an older empty answer that lands after a newer one withheld an advisory leaves the name held, and OSV is asked again", async () => {
+    const name = "older-after-over-cap";
+    const o = osv(name);
+    const gate = Promise.withResolvers<void>();
+
+    o.stand.answers.push(async () => {
+      await gate.promise;
+
+      return [];
+    });
+    const older = o.ask();
+
+    await Bun.sleep(20);
+    o.stand.ids = [X];
+    o.stand.slowCancelMs = 1;
+    expect(listed(name, await o.ask())).toEqual(VERSIONS);
+    gate.resolve();
+    await older;
+    const queries = o.stand.queries;
+
+    // on c88b027: [], the older answer taken as fresh and OSV not asked
+    expect(listed(name, await o.ask())).toEqual(VERSIONS);
+    expect(o.stand.queries).toBeGreaterThan(queries);
+  });
+
   // Sol on 91901e5: the pool's pressure shed a name a request held, freeing nothing
   test("the pool's pressure leaves a name a request holds precise", async () => {
     const o = osv("pinned-precise");

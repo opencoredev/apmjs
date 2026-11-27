@@ -324,12 +324,16 @@ let asks = 0;
  * Takes in what an answer asked for at `stamp` read: `found`, the advisories among the `read` ids that name the name,
  * and with `complete`, that no other advisory does. Each advisory takes the newest word on it: its newest observation,
  * else the newest complete answer, which said it was not listed. So an answer that lands after a newer one changes
- * nothing the newer one said. A complete answer asked for after the name was held ends the hold. Observations, the
+ * nothing the newer one said. A complete answer asked for after the name was held ends the hold. A partial answer that
+ * withheld an advisory it could not read holds the name as of when it was asked for, so an older complete answer that
+ * lands after it does not clear it, and the next request asks OSV again (review of c88b027, finding 2). Observations, the
  * complete stamp and the hold past NAME_STALE_MS are dropped.
  */
-function observe(input: { key: string; stamp: Stamp; read: ReadonlySet<string>; found: readonly Advisory[]; complete: boolean; now: number }): void {
+function observe(input: { key: string; stamp: Stamp; read: ReadonlySet<string>; found: readonly Advisory[]; complete: boolean; withheld?: ReadonlySet<string>; now: number }): void {
   const { key, stamp } = input;
   const state = NAMES.get(key) ?? { complete: null, hold: null, ids: new Map<string, Observation>() };
+
+  if ((input.withheld?.size ?? 0) > 0 && newerThan(stamp, state.hold)) state.hold = { at: stamp.at, seq: stamp.seq };
 
   for (const id of input.read) if (newerThan(stamp, state.ids.get(id) ?? state.complete)) state.ids.set(id, { ...stamp, advisory: input.found.find((a) => a.id === id) ?? null });
 
@@ -894,8 +898,9 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
         // here, whatever was known of it. The next request asks again
         const { read, advisories, withheld } = got.success;
 
-        observe({ key, stamp, read, found: advisories, complete: false, now: after });
-        const answer = [...known(after).filter((a) => !withheld.has(a.id)), ...[...withheld].map(everyVersion)];
+        observe({ key, stamp, read, found: advisories, complete: false, withheld, now: after });
+        // the hold this answer set names every version, as what it withheld already does here
+        const answer = [...known(after).filter((a) => !withheld.has(a.id) && !(withheld.size > 0 && a.id === HELD)), ...[...withheld].map(everyVersion)];
 
         partials.set(name, answer);
 

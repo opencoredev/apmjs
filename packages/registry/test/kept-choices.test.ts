@@ -1497,8 +1497,12 @@ describe("what needs no score is checked of a version whose analysis does not fi
         expect(r.body.warnings?.filter((w) => w.name === "dep").map((w) => w.kind)).toContain("cooldown");
       }
 
-      // and the capped resolve did leave dep unread
-      expect((await resolve({ url, npm: npm.url, name: "app", store: capped(0, "app") })).text).toContain(OVER_BUDGET_TEXT);
+      // and the capped resolve did leave dep unread, saying so as the web verdict reads it (verdict.ts, UNREAD_IN_BUDGET)
+      const Texts = z.object({ warnings: z.array(z.object({ name: z.string(), kind: z.string(), text: z.string() })) }).loose();
+      const unread = Texts.parse(JSON.parse((await resolve({ url, npm: npm.url, name: "app", store: capped(0, "app") })).text)).warnings.filter((w) => w.name === "dep" && w.kind === "unchecked");
+
+      expect(unread.map((w) => w.text)).toEqual([`not checked: ${OVER_BUDGET_TEXT}`]);
+      expect(unread[0]?.text).toStartWith("not checked: apm checks at most ");
     }));
 
   test("popular-scores does not send an expired kept score as current when the analysis does not fit", () =>
@@ -1526,8 +1530,10 @@ describe("what needs no score is checked of a version whose analysis does not fi
         expect((await apmGet({ url, npm: npm.url, path })).status).toBe(200);
       }
 
-      // a version npm does not list is still a 404
-      expect((await apmGet({ url, npm: npm.url, path: "/-/apm/v1/packages/dep/versions/9.9.9" })).status).toBe(404);
+      // a version npm does not list is still a 404, whatever scores did not fit (review of c88b027, finding 3)
+      for (const path of ["/-/apm/v1/packages/dep/versions/9.9.9", "/-/apm/v1/score/dep/9.9.9"]) {
+        for (const store of [undefined, capped(0)]) expect((await apmGet({ url, npm: npm.url, path, store })).status).toBe(404);
+      }
     }));
 
   test("a dependency the OSSF feed lists is refused in every mode, whether its analysis fit or not", () =>

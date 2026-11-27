@@ -623,7 +623,14 @@ export const pageProbe = (input: { upstream: UpstreamApi; name: string; need: Pa
 
     // npm's packument was read instead, which can take seconds: the scores are read again after it, as before
     // summaries were kept. What the row's check already read from npm is the answer: npm is not asked again
-    const probe: Probe = fetched === null ? yield* upstream.probeFor(name, wanted, lease) : fetched.kind === "found" ? scoredPackage(fetched.pkg, yield* wantedAnalyses(store, name, fetched.pkg.versions, wanted(fetched.pkg))) : fetched;
+    const listed = fetched === null ? yield* upstream.probeWithinFor(name, wanted, lease) : null;
+
+    // npm's listing settles a version it does not have, whatever scores did not fit: that page is a 404, not a 503
+    // (review of c88b027, finding 3). Nothing is kept of a listing whose scores were not read
+    if (listed?.kind === "unread" && input.need.kind !== "page" && versionAsked(listed.pkg, input.need) === undefined) return { kind: "found", pkg: listed.pkg } satisfies Probe;
+
+    const probe: Probe =
+      listed !== null ? (listed.kind === "over-budget" || listed.kind === "unread" ? { kind: "unknown" } : listed) : fetched?.kind === "found" ? scoredPackage(fetched.pkg, yield* wantedAnalyses(store, name, fetched.pkg.versions, wanted(fetched.pkg))) : (fetched ?? { kind: "unknown" });
 
     // a kept row is replaced with what npm sent (keepAnalyzed replaces as well as adds)
     if (probe.kind === "found") yield* keepAnalyzed(probe.pkg, yield* admittedAll(probe.pkg, wanted(probe.pkg)), yield* (yield* Clock).now);
