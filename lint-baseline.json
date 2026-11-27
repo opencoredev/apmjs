@@ -34,7 +34,7 @@
       "anti-slop/no-runtime-typeof": 7,
       "anti-slop/no-unknown-parameters": 1,
       "anti-slop/no-unsafe-dictionary-type": 1,
-      "anti-slop/require-readable-spacing": 141
+      "anti-slop/require-readable-spacing": 140
     },
     "packages/cli/src/pm.ts": {
       "anti-slop/no-runtime-typeof": 2,

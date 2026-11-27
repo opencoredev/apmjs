@@ -62,9 +62,11 @@ export function truncate(text: string, width: number): string {
   const kept: Piece[] = [];
   let used = 0;
 
+  // a link or other escape that is not a color is dropped: cut short, it could stay open past the line
   for (const p of piecesOf(text)) {
-    if (p.kind === "escape") kept.push(p);
-    else if (used + p.width <= width - 1) {
+    if (p.kind === "escape") {
+      if (SGR.test(p.text)) kept.push(p);
+    } else if (used + p.width <= width - 1) {
       kept.push(p);
       used += p.width;
     } else break;
@@ -141,7 +143,17 @@ export function wrap(line: string, width: number): string {
   const current = (): Piece[] => lines[lines.length - 1] ?? [];
 
   const breakLine = (): void => {
+    const line = current();
     const open = openColors(lines.flat());
+
+    // the spaces a line ends in are dropped, wherever its colors close
+    for (let i = line.length - 1; i >= 0; i--) {
+      const p = line[i];
+
+      if (p?.kind === "grapheme" && p.text !== " ") break;
+
+      if (p?.kind === "grapheme") line.splice(i, 1);
+    }
 
     if (open.length > 0) current().push({ kind: "escape", text: RESET });
     lines.push(open.map((text): Piece => ({ kind: "escape", text })));
@@ -187,4 +199,52 @@ export function wrap(line: string, width: number): string {
   }
 
   return lines.map((l, i) => `${" ".repeat(i === 0 ? indent : hang)}${l.map((p) => p.text).join("").trimEnd()}`).join("\n");
+}
+
+/** The words of a shell command: split at spaces outside quotes, a backslash keeping the next character in its word. */
+function shellWords(command: string): string[] {
+  const words: string[] = [];
+  let word = "";
+  let quote: "'" | '"' | null = null;
+
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i] ?? "";
+
+    if (quote === null && c === " ") {
+      if (word !== "") words.push(word);
+      word = "";
+      continue;
+    }
+
+    word += c;
+
+    if (quote === null && c === "\\") word += command[++i] ?? "";
+    else if (quote === null && (c === "'" || c === '"')) quote = c;
+    else if (quote === '"' && c === "\\") word += command[++i] ?? "";
+    else if (c === quote) quote = null;
+  }
+
+  return word === "" ? words : [...words, word];
+}
+
+/**
+ * A shell command laid out to `width` for someone to read or paste: broken only between its words, each line but the last
+ * ending in " \", so it stays one command with every argument whole. A word longer than a line is left whole.
+ */
+export function wrapCommand(input: { command: string; first: string; rest: string; width: number }): string[] {
+  if (widthOf(input.first + input.command) <= input.width) return [input.first + input.command];
+  const lines: string[] = [];
+  let line = input.first;
+  let empty = true;
+
+  for (const word of shellWords(input.command)) {
+    if (!empty && widthOf(`${line} ${word} \\`) > input.width) {
+      lines.push(`${line} \\`);
+      line = input.rest + word;
+    } else line = empty ? line + word : `${line} ${word}`;
+
+    empty = false;
+  }
+
+  return [...lines, line];
 }

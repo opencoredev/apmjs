@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { columnsOf, reflow, truncate, wrap } from "../src/ui.ts";
+import { columnsOf, reflow, truncate, wrap, wrapCommand } from "../src/ui.ts";
 
 const RED = "\x1b[31m";
 const RESET = "\x1b[0m";
@@ -82,6 +82,24 @@ describe("terminal layout", () => {
 
     expect(out.split("\x1b]8;;https://apmjs.dev").length).toBe(2);
     expect(plain(out).replace(/\n */g, " ")).toBe("see the docs for every flag apm reads and the way each one works");
+  });
+
+  test("truncating through a link drops the link instead of leaving it open", () => {
+    const out = truncate(`\x1b]8;;https://apmjs.dev\x1b\\${"docs ".repeat(20)}\x1b]8;;\x1b\\`, 30);
+
+    expect(out).not.toContain("\x1b]8");
+    expect(Bun.stringWidth(out)).toBe(30);
+  });
+
+  test("a command is broken only between its words, with a backslash at each break, so it pastes as one command", () => {
+    const command = "cp '/home/me/my project/.apm-backup/package.json' '/home/me/it'\\''s here/package.json' && npm install --frozen-lockfile --ignore-scripts";
+    const lines = wrapCommand({ command, first: "  ", rest: "      ", width: 40 });
+
+    for (const l of lines.slice(0, -1)) expect(l).toEndWith(" \\");
+    expect(lines.slice(1).every((l) => l.startsWith("      "))).toBe(true);
+    expect(lines.map((l) => l.replace(/ \\$/, "").trim()).join(" ")).toBe(command);
+    expect(lines.some((l) => l.includes("'/home/me/my project/.apm-backup/package.json'"))).toBe(true);
+    expect(wrapCommand({ command: "bun install", first: "→ ", rest: "      ", width: 40 })).toEqual(["→ bun install"]);
   });
 
   test("a narrow terminal keeps room for text: a deep indent gives way", () => {

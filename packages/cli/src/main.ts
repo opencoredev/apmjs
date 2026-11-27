@@ -26,7 +26,7 @@ import { makeTemp, removeTemp } from "./sandbox.ts";
 import { CLI_VERSION } from "./version.ts";
 import { manifestChecks, registryChecks, VALID_NAME_RULE, type BuildMetadata, type Existing, type PublishCheck, type RegistryView } from "./publish-checks.ts";
 import { argsError, bareInstallArgs, commandOf, helpTopic } from "./commands.ts";
-import { columnsOf, inCi, reflow, truncate, wrap } from "./ui.ts";
+import { columnsOf, inCi, reflow, truncate, wrap, wrapCommand } from "./ui.ts";
 
 function flag(a: Args, k: string): string | null {
   const v = a.flags.get(k);
@@ -53,10 +53,10 @@ let jsonDone = false;
 let lastError: string | null = null;
 let lastWarn: string | null = null;
 /** `line` as a terminal shows it: wrapped under its own indent (`cut`: truncated, for code and evidence), whole on a pipe. */
-function fit(line: string, stream: NodeJS.WriteStream, how: "wrap" | "cut"): string {
+function fit(line: string, stream: NodeJS.WriteStream, how: "wrap" | "cut" | "raw"): string {
   const columns = columnsOf(stream);
 
-  if (columns === null) return line;
+  if (columns === null || how === "raw") return line;
 
   return line
     .split("\n")
@@ -66,21 +66,31 @@ function fit(line: string, stream: NodeJS.WriteStream, how: "wrap" | "cut"): str
 
 /** A command apm runs, dim, and why on the line under it. */
 function sayRun(command: string, why: string | null = null): void {
-  say(dim(`→ ${command}`));
+  sayCommand({ command, first: "→ ", paint: dim });
 
   if (why !== null) say(dim(`  ${why}`));
 }
 
+/** A shell command, broken on a terminal only between its words with a " \\" at each break, so it pastes as one command. */
+function sayCommand(input: { command: string; first: string; paint?: (s: string) => string }): void {
+  const paint = input.paint ?? ((s: string) => s);
+  const columns = columnsOf(jsonMode ? process.stderr : process.stdout);
+  const lines = columns === null ? [input.first + input.command] : wrapCommand({ command: input.command, first: input.first, rest: `${input.first.replace(/\S/g, " ")}    `, width: columns });
+
+  for (const line of lines) say(paint(line), "raw");
+}
+
 /** `line` on `stream`, laid out for it: without color where that stream is not a color terminal (a redirected stderr, CI). */
-function write(stream: NodeJS.WriteStream, line: string, how: "wrap" | "cut"): void {
+function write(stream: NodeJS.WriteStream, line: string, how: "wrap" | "cut" | "raw"): void {
   const colored = stream.isTTY === true && !process.env.NO_COLOR && !inCi();
 
   stream.write(`${fit(colored ? line : Bun.stripANSI(line), stream, how)}\n`);
 }
 
-function say(line = "", how: "wrap" | "cut" = "wrap"): void {
+function say(line = "", how: "wrap" | "cut" | "raw" = "wrap"): void {
   write(jsonMode ? process.stderr : process.stdout, line, how);
 }
+
 function warn(line: string): void {
   lastWarn = line;
   write(process.stderr, line, "wrap");
@@ -178,7 +188,7 @@ function printRefusal(input: { title: string; report: Report | null; reason: str
 
 /** What the package can do, with its declaration and the variables read outside it. Never scored on its own. */
 function printCapabilities(list: readonly Capability[]): void {
-  for (const line of capabilityLines(list, { bold, dim, green, yellow })) say(line, "cut");
+  for (const line of capabilityLines(list, { bold, dim, green, yellow })) say(line);
 }
 
 /**
@@ -987,7 +997,17 @@ function sayAdded(input: { results: readonly Resolved[]; check: LockCheck }): vo
   const checked = checkedCount(input.check.graph);
   // a warning the early check and the lockfile check both found is one warning
   const keys = new Set([...input.results.flatMap((r) => r.warnings), ...input.check.warnings].map((w) => `${idOf(w)}:${w.kind}`));
-  const warnings = keys.size + input.results.filter((r) => r.explained !== null).length;
+  // and every notice printed on its own: a review-first verdict, a look-alike name, a dependency apm could not check
+  // (a dependency the lockfile check also warns about as unchecked is counted there)
+  const uncheckedLater = new Set(input.check.warnings.filter((w) => w.kind === "unchecked").map((w) => w.name));
+
+  const notices = input.results.reduce((n, r) => {
+    const own = r.warnings.some((w) => w.kind === "unchecked" && w.via.length > 0) ? [] : r.unchecked.filter((u) => !uncheckedLater.has(u.dependency.replace(/(?!^)@.*$/, "")));
+
+    return n + (r.explained === null ? 0 : 1) + (lookalikeOf(r.report) === null ? 0 : 1) + own.length;
+  }, 0);
+
+  const warnings = keys.size + notices;
   const seconds = ((performance.now() - STARTED) / 1000).toFixed(1);
 
   say();
@@ -1175,7 +1195,7 @@ function afterApplyFailure(input: { layout: Layout; backup: Backup; pm: Pm; scri
   say(`${scripts} apm wrote only ${t.manifest} and ${t.lockfile}, and leaves node_modules as ${input.pm} installed it: apm does not undo installs.`);
   say("To put your project back as it was before apm add, run:");
 
-  for (const c of commands) say(`  ${c}`);
+  for (const c of commands) sayCommand({ command: c, first: "  " });
   say(dim(`(or, with git: git checkout -- ${t.manifest} ${t.lockfile}, then ${reinstall})`));
 
   return commands;
@@ -1739,7 +1759,7 @@ async function installWithoutScripts(input: { cwd: string; det: Detection & { pm
         fail(`apm add: writing the computed files failed: ${applied.reason}`);
         say("No install script ran and nothing was installed. To put your project back as it was, run:");
 
-        for (const c of restoreCommands({ layout, backup: applied.backup })) say(`  ${c}`);
+        for (const c of restoreCommands({ layout, backup: applied.backup })) sayCommand({ command: c, first: "  " });
 
         return done(1);
 
@@ -1765,7 +1785,7 @@ async function installWithoutScripts(input: { cwd: string; det: Detection & { pm
   if (code === 0 && (after === null || !Buffer.from(after).equals(Buffer.from(checked.lockfile)))) {
     fail(`apm add: ${pm} changed ${t.lockfile} while it installed, so what it installed may not be what apm read. To put the project back, run:`);
 
-    for (const c of restoreCommands({ layout, backup: checked.backup })) say(`  ${c}`);
+    for (const c of restoreCommands({ layout, backup: checked.backup })) sayCommand({ command: c, first: "  " });
 
     return done(1);
   }
@@ -1773,7 +1793,7 @@ async function installWithoutScripts(input: { cwd: string; det: Detection & { pm
   if (code !== 0) {
     fail(`apm add: ${pm} could not install the computed lockfile (exit ${code}). To put the project back, run:`);
 
-    for (const c of restoreCommands({ layout, backup: checked.backup })) say(`  ${c}`);
+    for (const c of restoreCommands({ layout, backup: checked.backup })) sayCommand({ command: c, first: "  " });
 
     return done(code);
   }
