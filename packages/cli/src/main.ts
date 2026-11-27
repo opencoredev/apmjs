@@ -1209,7 +1209,7 @@ function afterApplyFailure(input: { layout: Layout; backup: Backup; pm: Pm; scri
 
   for (const c of commands) sayCommand({ command: c, first: "  " });
   say(dim("Or, with git:"));
-  sayCommand({ command: `cd ${shellQuote(input.layout.root)} && git checkout -- ${shellQuote(t.manifest)} ${shellQuote(t.lockfile)} && ${reinstall}`, first: "  ", paint: dim });
+  sayCommand({ command: `cd ${shellQuote(input.layout.root)} && git --literal-pathspecs checkout -- ${shellQuote(t.manifest)} ${shellQuote(t.lockfile)} && ${reinstall}`, first: "  ", paint: dim });
 
   return commands;
 }
@@ -1662,7 +1662,7 @@ async function addWithYarn(input: YarnInput): Promise<number> {
 
   if (check.blocked.length > 0) {
     say("yarn installed these and ran their install scripts before apm could check them. To take this add back, run:");
-    sayCommand({ command: `cd ${shellQuote(layout.root)} && git checkout -- ${shellQuote(t.manifest)} ${shellQuote(t.lockfile)} && yarn install`, first: "  " });
+    sayCommand({ command: `cd ${shellQuote(layout.root)} && git --literal-pathspecs checkout -- ${shellQuote(t.manifest)} ${shellQuote(t.lockfile)} && yarn install`, first: "  " });
     emitJson({ ok: false, det, results, error: lastError, installed: reportOf(check, { source: "node_modules", touched: true, stage: "done" }) });
 
     return 1;
