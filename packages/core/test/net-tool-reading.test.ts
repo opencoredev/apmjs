@@ -98,7 +98,9 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
     const unread = analyze({ name: "probe-pkg", manifest: m, files: [pj], publisher: "a", previousPublishers: [], notHeld: new Set([pj]) });
     const other = analyze({ name: "probe-pkg", manifest: m, files: [{ ...pj, data: new TextEncoder().encode(JSON.stringify({ ...m, scripts: { postinstall: "node x.js" } })) }], publisher: "a", previousPublishers: [] });
 
-    for (const a of [unread, other]) expect(finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null }).signals.map((s) => s.id)).toContain("install-download");
+    const twin = analyze({ name: "probe-pkg", manifest: m, files: [pj, { ...pj, path: "Package.json" }], publisher: "a", previousPublishers: [] });
+
+    for (const a of [unread, other, twin]) expect(finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null }).signals.map((s) => s.id)).toContain("install-download");
   });
 
   test("a package with bins of its own keeps the reading, since npm puts them on the PATH first", () => {

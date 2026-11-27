@@ -1132,8 +1132,16 @@ function withoutInertNetFindings(cmd: string, shipsNetTool: boolean): ReturnType
  * Whether the archive's own package.json was read whole and holds the scripts and bins `manifest` does, so what the
  * hooks are read from is what npm installs.
  */
-function archiveManifestMatches(pj: TarEntry | undefined, notHeld: ReadonlySet<TarEntry>, manifest: AnalyzeInput["manifest"]): boolean {
+function archiveManifestMatches(
+  pj: TarEntry | undefined,
+  notHeld: ReadonlySet<TarEntry>,
+  manifest: AnalyzeInput["manifest"],
+  files: readonly TarEntry[],
+): boolean {
   if (pj === undefined || notHeld.has(pj) || pj.data.length !== pj.size) return false;
+  // one root manifest under case-insensitive, trailing-dot-and-space-dropping extraction, so no other entry can be the
+  // one a filesystem keeps
+  if (files.some((f) => f !== pj && f.path.toLowerCase().replace(/[. ]+$/, "") === "package.json")) return false;
   const pick = (m: Record<string, unknown>): string => JSON.stringify([m.scripts, m.bin, m.directories]);
 
   try {
@@ -1883,7 +1891,7 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   // a root file named like curl or wget, a binding.gyp, whose build npm may run at install, or a bin of the package's
   // own, which npm links onto the PATH before its install scripts run, keeps the reading
   const ownBins = manifest.bin !== undefined || (isRecord(manifest.directories) && manifest.directories.bin !== undefined);
-  const hookEvidence = analyzeHooks(found, manifest, hooks, ownBins || !archiveManifestMatches(byPath.get("package.json"), notHeld, manifest) || files.some((f) => /^(?:curl|wget)(?:\.[^/]*)?$/i.test(f.path) || /^binding\.gyp$/i.test(f.path)));
+  const hookEvidence = analyzeHooks(found, manifest, hooks, ownBins || !archiveManifestMatches(byPath.get("package.json"), notHeld, manifest, files) || files.some((f) => /^(?:curl|wget)(?:\.[^/]*)?$/i.test(f.path) || /^binding\.gyp$/i.test(f.path)));
 
   // what runs on the installing machine: install hooks, and the git hooks npm runs when it installs from git
   // every hook's commands before what only the shell reading adds to any of them (HookCommand.added)
