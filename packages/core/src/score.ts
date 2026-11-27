@@ -1128,6 +1128,24 @@ function withoutInertNetFindings(cmd: string, shipsNetTool: boolean): ReturnType
  * Signals from the lifecycle scripts: what runs at install, at a git install, and on the publisher's machine. Returns
  * the evidence it cited from commands that run at install, so the risk signals can tell install-time use apart.
  */
+/** A path as a case-insensitive filesystem that drops each segment's trailing dots and spaces looks it up. */
+function lookupPath(path: string): string {
+  return path
+    .split("/")
+    .map((s) => s.toLowerCase().replace(/[. ]+$/, ""))
+    .join("/");
+}
+
+/**
+ * Whether a file of the package may stand in for curl or wget or build native code at install: a root file of that name,
+ * a binding.gyp, or anything under a node_modules of its own, whose .bin npm puts on the hook's PATH.
+ */
+function shadowsNetTool(f: TarEntry): boolean {
+  const p = lookupPath(f.path);
+
+  return /^(?:curl|wget)(?:\.[^/]*)?$/.test(p) || p === "binding.gyp" || p === "node_modules" || p.startsWith("node_modules/") || p.includes("/node_modules/") || p.endsWith("/node_modules");
+}
+
 /**
  * Whether the archive's own package.json was read whole and holds the scripts and bins `manifest` does, so what the
  * hooks are read from is what npm installs.
@@ -1141,7 +1159,7 @@ function archiveManifestMatches(
   if (pj === undefined || notHeld.has(pj) || pj.data.length !== pj.size) return false;
   // one root manifest under case-insensitive, trailing-dot-and-space-dropping extraction, so no other entry can be the
   // one a filesystem keeps
-  if (files.some((f) => f !== pj && f.path.toLowerCase().replace(/[. ]+$/, "") === "package.json")) return false;
+  if (files.some((f) => f !== pj && lookupPath(f.path) === "package.json")) return false;
   const pick = (m: Record<string, unknown>): string => JSON.stringify([m.scripts, m.bin, m.directories]);
 
   try {
@@ -1891,7 +1909,7 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   // a root file named like curl or wget, a binding.gyp, whose build npm may run at install, or a bin of the package's
   // own, which npm links onto the PATH before its install scripts run, keeps the reading
   const ownBins = manifest.bin !== undefined || (isRecord(manifest.directories) && manifest.directories.bin !== undefined);
-  const hookEvidence = analyzeHooks(found, manifest, hooks, ownBins || !archiveManifestMatches(byPath.get("package.json"), notHeld, manifest, files) || files.some((f) => /^(?:curl|wget)(?:\.[^/]*)?$/i.test(f.path) || /^binding\.gyp$/i.test(f.path)));
+  const hookEvidence = analyzeHooks(found, manifest, hooks, ownBins || !archiveManifestMatches(byPath.get("package.json"), notHeld, manifest, files) || files.some(shadowsNetTool));
 
   // what runs on the installing machine: install hooks, and the git hooks npm runs when it installs from git
   // every hook's commands before what only the shell reading adds to any of them (HookCommand.added)
