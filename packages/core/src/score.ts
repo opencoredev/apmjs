@@ -10,7 +10,7 @@ import { boundedManifest, MANIFEST_LIMITS, measureManifest } from "./manifest.ts
 import { MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { charge, chargeText, inPhase, MAX_ANALYSIS_WORK, Meter, MeterExhausted, PHASE_NAMES, withMeter, type Phase } from "./meter.ts";
 import { isEstablishedName, typoConflicts, type NameHistory } from "./names.ts";
-import { commandWords, commandWordsWithin, expandHooks, gypCommands, isInlineDownload, otherScripts, withoutInertNetTools, type ExpandedHook, type HookKind, type ShellWords } from "./scripts.ts";
+import { commandWords, commandWordsWithin, expandHooks, gypCommands, isInlineDownload, otherScripts, sameRootLauncher, withoutInertNetTools, type ExpandedHook, type HookKind, type ShellWords } from "./scripts.ts";
 import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type Lang, type ExecutedCode, type FlowFinding, type Hidden, type Imports, type TextFinding } from "./source.ts";
 import { scanTextRules } from "./textrules.ts";
 import { keptBytes, MAX_KEPT_VIEW_BYTES, scanBinaryImports, scanBinaryText, type BinaryTextScan } from "./binary-text.ts";
@@ -1131,9 +1131,6 @@ function withoutInertNetFindings(cmd: string, shipsNetTool: boolean): ReturnType
 // a hook command expandHooks found inside another (`sh -c`) or decoded from a string
 const NESTED_COMMAND = / \((?:sh -c|decoded [^)]*)\)$/;
 
-// a command that may move the shell or a package manager to another package's folder
-const MOVES_PACKAGE = /\b(?:cd|chdir|pushd|popd)\b|--(?:prefix|workspace|cwd|dir|filter)\b|(?:^|\s)-[Cw]\b/i;
-
 function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: readonly ExpandedHook[], shipsNetTool: boolean): Set<string> {
   const atInstall = new Set<string>();
   const installed = depNames(manifest, ["dependencies", "optionalDependencies", "peerDependencies"]);
@@ -1145,14 +1142,15 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
 
     if (h.kind === "install") found.add("install-script", `package.json scripts.${h.hook}: ${own.slice(0, 80)}`);
     let risky = false;
-    const moves = h.commands.some((c) => MOVES_PACKAGE.test(c.text));
+    // every command the hook runs is a plain run of this package's scripts, so a script it follows is the one npm runs
+    const sameRoot = h.commands.every((c) => NESTED_COMMAND.test(c.from) || sameRootLauncher(c.text));
 
     for (const c of h.commands) {
       const label = `package.json ${c.from}: ${c.text.slice(0, 80)}`;
       // only a script's own text runs from the package's root with npm's shell; one npm runs inside another shell or
       // decoded from a string is read as before, and so is a script followed in a hook that may run npm elsewhere, where
       // a script of that name may be another package's
-      const root = NESTED_COMMAND.test(c.from) || (c.from !== `scripts.${h.hook}` && moves) ? null : { shipsNetTool };
+      const root = NESTED_COMMAND.test(c.from) || (c.from !== `scripts.${h.hook}` && !sameRoot) ? null : { shipsNetTool };
 
       if (h.kind !== "publish" && isInlineDownload(c.text, { viaEval: c.viaEval, localBins: h.kind === "git" ? gitInstalled : installed, hook: root ?? undefined })) {
         found.add("install-download", label);

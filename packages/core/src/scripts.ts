@@ -724,6 +724,20 @@ export function netToolsInert(cmd: string, shipsNetTool = false): boolean {
     .every((c) => NET_TOOL_INFO_CALL.test(c) || PRINTED_LITERAL.test(c));
 }
 
+// a run of one of the package's own scripts by name, from where npm runs the hook
+const PLAIN_RUN = /^npm run(?: -s| --silent)? [\w:.-]+$/;
+
+/**
+ * Whether `cmd` only runs the package's own scripts (`npm run -s check`) and the shapes netToolsInert clears, joined by
+ * `&&` or `||`, so a script it runs is the one in this package.json, run from its folder.
+ */
+export function sameRootLauncher(cmd: string): boolean {
+  return cmd
+    .split(LIST_SEPARATOR)
+    .map(trimSpaces)
+    .every((c) => PLAIN_RUN.test(c) || NET_TOOL_INFO_CALL.test(c) || PRINTED_LITERAL.test(c));
+}
+
 /** `cmd` with every curl and wget mention blanked when netToolsInert holds, else `cmd` as it is. */
 export function withoutInertNetTools(cmd: string, shipsNetTool = false): string {
   return netToolsInert(cmd, shipsNetTool) ? cmd.replace(NET_TOOL_MENTIONS, (m) => "_".repeat(m.length)) : cmd;
