@@ -55,6 +55,13 @@ let failLists: number | null;
 /** How long the stand-in takes to answer each request: a slow API. */
 let delayMs: number;
 
+/** After a Worker has been posted to, this many list reads answer at once and every later one takes 400 ms: Cloudflare going slow mid-confirmation. */
+let hangListsAfterPost: number | null;
+let listsAfterPost: number;
+
+/** Whether a slow read stalls before its headers or partway through its body. */
+let hangWhere: "answer" | "body";
+
 /** A change the stand-in makes to a Worker's deployments on the nth list of them: someone deploying mid-rollback. */
 let onList: Map<string, { at: number; change: () => void }>;
 let lists: Map<string, number>;
@@ -96,6 +103,9 @@ function reset(): void {
   versionVars = new Map();
   failLists = null;
   delayMs = 0;
+  hangListsAfterPost = null;
+  listsAfterPost = 0;
+  hangWhere = "answer";
   // one line per deploy run: rv2 and wv1 went out together, rv3 and wv2, rv4 and wv3; rv1 was built before the newest
   // migration existed
   releases = [
@@ -128,6 +138,11 @@ beforeAll(() => {
         return Response.json({ success: true, result: { id: v[2], number: 1, metadata: {}, resources: { bindings, script: {}, script_runtime: {} } } });
       }
 
+      if (failLists !== null && req.method === "GET" && hangWhere === "body") {
+        // the failure status at once, its body never finished
+        return new Response(new ReadableStream({ start: (c) => c.enqueue(new TextEncoder().encode('{"success":false,')) }), { status: failLists, headers: { "content-type": "application/json" } });
+      }
+
       if (failLists !== null && req.method === "GET") return Response.json({ success: false, errors: [{ code: 10013, message: "service unavailable" }] }, { status: failLists });
       const m = new RegExp(`^/client/v4/accounts/${ACCOUNT}/workers/scripts/([^/]+)/deployments$`).exec(url.pathname);
       const script = decodeURIComponent(m?.[1] ?? "");
@@ -143,8 +158,26 @@ beforeAll(() => {
         if (onList.get(script)?.at === n) onList.get(script)?.change();
 
         const stale = posted.some((p) => p.script === script) ? staleAfterPost.get(script) : undefined;
+        const listed = JSON.stringify({ success: true, result: { deployments: [...(stale ?? deployments.get(script) ?? list)].reverse() } });
+        const slow = hangListsAfterPost !== null && posted.some((p) => p.script === script) && ++listsAfterPost > hangListsAfterPost;
 
-        return Response.json({ success: true, result: { deployments: [...(stale ?? deployments.get(script) ?? list)].reverse() } });
+        if (slow && hangWhere === "body") {
+          // the headers and half the body at once, the rest 400 ms later
+          const body = new ReadableStream<Uint8Array>({
+            async start(c) {
+              c.enqueue(new TextEncoder().encode(listed.slice(0, 10)));
+              await Bun.sleep(400);
+              c.enqueue(new TextEncoder().encode(listed.slice(10)));
+              c.close();
+            },
+          });
+
+          return new Response(body, { headers: { "content-type": "application/json" } });
+        }
+
+        if (slow) await Bun.sleep(400);
+
+        return new Response(listed, { headers: { "content-type": "application/json" } });
       }
 
       if (failPosts) return Response.json({ success: false, errors: [{ code: 10021, message: "deployment refused" }] }, { status: 400 });
@@ -1006,6 +1039,23 @@ describe("Cloudflare's answers", () => {
     }
   });
 
+  test.each([
+    ["before its headers", "answer"],
+    ["partway through its body", "body"],
+  ] as const)("a read cut short by the deadline (stalled %s) does not hide what the last answered read showed", async (_, where) => {
+    // CI run 45555060547: on a slow runner the last read before the deadline timed out, and the reason became
+    // "could not be read (The operation timed out.)" instead of the stale list every earlier read had shown
+    answer = "no-id";
+    applyPosts = false;
+    staleAfterPost.set("apmjs-web-production", [dep("w1", "wv1", "2026-11-15T10:01:00Z")]);
+    hangListsAfterPost = 1;
+    hangWhere = where;
+    const lines: string[] = [];
+
+    expect(await rollBack(cf(), [web()], "m", (l) => lines.push(l), { confirm: { deadlineMs: 300, intervalMs: 50 } })).toBe(false);
+    expect(lines[1]).toBe("FAILED to roll back apmjs-web-production: Cloudflare's answer named no deployment, and after 300 ms no deployment newer than w2 runs version wv1 (its live deployment is w1 of 2026-11-15T10:01:00Z, running wv1)");
+  });
+
   test("an accepted id confirms only on that deployment: a newer one running the target under another id does not count", async () => {
     answer = "id-only";
     applyPosts = false;
@@ -1034,6 +1084,13 @@ describe("Cloudflare's answers", () => {
     const resume = resumeCommand({ action: "to", stage: "production", argv: ["to", "--stage", "production", "--worker", "web", "--version", "it's a b", "--yes"], steps: [], releases: [] });
 
     expect(resume?.command).toBe("bun packages/infra/rollback.ts to --stage production --worker web --version 'it'\\''s a b' --yes");
+  });
+
+  test("a failure status whose body is cut short by the timeout is reported by its status, not as a timeout", async () => {
+    failLists = 503;
+    hangWhere = "body";
+
+    await expect(listDeployments(cf(), "apmjs-web-production", 200)).rejects.toThrow("Cloudflare answered 503 for GET /workers/scripts/apmjs-web-production/deployments");
   });
 
   test("lists and settings with fields missing, null or new still parse; a list missing what rollback relies on does not", async () => {
