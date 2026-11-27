@@ -1178,6 +1178,9 @@ function archiveManifestMatches(
 // a lifecycle step npm may run on an install from the registry or from git, or its pre or post script
 const LIFECYCLE_STEP = /^(?:pre|post)?(?:install|preinstall|postinstall|prepare|prepack|postpack|prepublish|prepublishOnly|publish|dependencies)$/;
 
+// the steps an install from the registry runs
+const REGISTRY_HOOK = /^(?:preinstall|install|postinstall)$/;
+
 function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: readonly ExpandedHook[], shipsNetTool: boolean): Set<string> {
   const atInstall = new Set<string>();
   const installed = depNames(manifest, ["dependencies", "optionalDependencies", "peerDependencies"]);
@@ -1199,8 +1202,9 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
     for (const c of h.commands) {
       const label = `package.json ${c.from}: ${c.text.slice(0, 80)}`;
       // only the hook's own text: a script it follows may be another package's (a workspace, a moved shell), and one
-      // inside another shell or decoded from a string runs elsewhere, so those are read as before
-      const root = stableRoot && c.from === `scripts.${h.hook}` ? { shipsNetTool } : null;
+      // inside another shell or decoded from a string runs elsewhere, so those are read as before; and only on an install
+      // from the registry, the archive being all it runs with: a source or git step runs with configuration packing omits
+      const root = stableRoot && h.kind === "install" && REGISTRY_HOOK.test(h.hook) && c.from === `scripts.${h.hook}` ? { shipsNetTool } : null;
 
       if (h.kind !== "publish" && isInlineDownload(c.text, { viaEval: c.viaEval, localBins: h.kind === "git" ? gitInstalled : installed, hook: root ?? undefined })) {
         found.add("install-download", label);

@@ -122,6 +122,9 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
     expect(scoreOf({ preinstall: "node make-marker.js", postinstall: "curl --version" }).ids).toContain("install-download");
     expect(scoreOf({ preinstall: "echo 'checking'", postinstall: "curl --version" }).ids).not.toContain("install-download");
 
+    expect(scoreOf({ prepare: "curl --version" }).ids).toContain("install-download");
+    expect(scoreOf({ prepare: "echo 'curl is optional'" }).ids).toContain("install-download");
+
     for (const before of [{ prepublish: "node make-marker.js" }, { preprepare: "node make-marker.js" }] as Record<string, string>[]) {
       expect(scoreOf({ ...before, prepare: "curl --version" }).ids).toContain("install-download");
     }
