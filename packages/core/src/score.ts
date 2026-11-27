@@ -1128,6 +1128,9 @@ function withoutInertNetFindings(cmd: string, shipsNetTool: boolean): ReturnType
  * Signals from the lifecycle scripts: what runs at install, at a git install, and on the publisher's machine. Returns
  * the evidence it cited from commands that run at install, so the risk signals can tell install-time use apart.
  */
+// root files npm, yarn and pnpm read as the project's own configuration
+const PROJECT_CONFIG = new Set(["binding.gyp", ".npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmfile.cjs", ".pnpmfile.mjs", "pnpm-workspace.yaml"]);
+
 /** A path as a case-insensitive filesystem that drops each segment's trailing dots and spaces looks it up. */
 function lookupPath(path: string): string {
   return path
@@ -1138,12 +1141,13 @@ function lookupPath(path: string): string {
 
 /**
  * Whether a file of the package may stand in for curl or wget or build native code at install: a root file of that name,
- * a binding.gyp, or anything under a node_modules of its own, whose .bin npm puts on the hook's PATH.
+ * a binding.gyp, a package manager's project configuration (which may pick the shell a hook runs in), or anything under
+ * a node_modules of its own, whose .bin npm puts on the hook's PATH.
  */
 function shadowsNetTool(f: TarEntry): boolean {
   const p = lookupPath(f.path);
 
-  return /^(?:curl|wget)(?:\.[^/]*)?$/.test(p) || p === "binding.gyp" || p === "node_modules" || p.startsWith("node_modules/") || p.includes("/node_modules/") || p.endsWith("/node_modules");
+  return /^(?:curl|wget)(?:\.[^/]*)?$/.test(p) || PROJECT_CONFIG.has(p) || p.split("/").includes("node_modules");
 }
 
 /**
