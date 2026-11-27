@@ -1128,8 +1128,14 @@ function withoutInertNetFindings(cmd: string, shipsNetTool: boolean): ReturnType
  * Signals from the lifecycle scripts: what runs at install, at a git install, and on the publisher's machine. Returns
  * the evidence it cited from commands that run at install, so the risk signals can tell install-time use apart.
  */
+// what npm installs beside a package, each dependency's bins put on its hooks' PATH
+const DEPENDENCY_FIELDS = ["dependencies", "optionalDependencies", "peerDependencies", "bundleDependencies", "bundledDependencies"] as const;
+
 // root files npm, yarn and pnpm read as the project's own configuration
 const PROJECT_CONFIG = new Set(["binding.gyp", ".npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmfile.cjs", ".pnpmfile.mjs", "pnpm-workspace.yaml"]);
+
+// the manifest fields that decide what an install runs and with what on its PATH
+const MANIFEST_RUN_FIELDS = ["scripts", "bin", "directories", ...DEPENDENCY_FIELDS] as const;
 
 /** A path as a case-insensitive filesystem that drops each segment's trailing dots and spaces looks it up. */
 function lookupPath(path: string): string {
@@ -1165,7 +1171,7 @@ function archiveManifestMatches(
   // one root manifest under case-insensitive, trailing-dot-and-space-dropping extraction, so no other entry can be the
   // one a filesystem keeps
   if (files.some((f) => f !== pj && lookupPath(f.path) === "package.json")) return false;
-  const pick = (m: { scripts?: unknown; bin?: unknown; directories?: unknown }): string => JSON.stringify([m.scripts, m.bin, m.directories]);
+  const pick = (m: object): string => JSON.stringify(MANIFEST_RUN_FIELDS.map((k): unknown => Reflect.get(m, k)));
 
   try {
     const archive: unknown = JSON.parse(new TextDecoder().decode(pj.data));
@@ -1194,6 +1200,9 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
   // clears, so none writes a program cmd.exe would find first
   const stableRoot = Object.entries(rawScriptsOf(manifest)).every(([name, body]) => !LIFECYCLE_STEP.test(name) || body === "" || onlyInertCommands(body));
 
+  // no dependency declared in any form: one npm may resolve (an array, a string) is not proven empty
+  const noDependencies = DEPENDENCY_FIELDS.every((k) => manifest[k] === undefined || (isRecord(manifest[k]) && Object.keys(manifest[k]).length === 0));
+
   for (const h of hooks) {
     const own = h.commands[0]?.text ?? "";
 
@@ -1206,7 +1215,7 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
       // inside another shell or decoded from a string runs elsewhere, so those are read as before; and only on an install
       // from the registry, the archive being all it runs with: a source or git step runs with configuration packing omits;
       // and never with dependencies, whose bins npm puts on the hook's PATH ahead of the system's curl
-      const root = stableRoot && installed.size === 0 && h.kind === "install" && REGISTRY_HOOK.test(h.hook) && c.from === `scripts.${h.hook}` ? { shipsNetTool } : null;
+      const root = stableRoot && noDependencies && h.kind === "install" && REGISTRY_HOOK.test(h.hook) && c.from === `scripts.${h.hook}` ? { shipsNetTool } : null;
 
       if (h.kind !== "publish" && isInlineDownload(c.text, { viaEval: c.viaEval, localBins: h.kind === "git" ? gitInstalled : installed, hook: root ?? undefined })) {
         found.add("install-download", label);

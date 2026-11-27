@@ -103,6 +103,7 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
     const unread = analyze({ name: "probe-pkg", manifest: m, files: [pj], publisher: "a", previousPublishers: [], notHeld: new Set([pj]) });
     const other = analyze({ name: "probe-pkg", manifest: m, files: [{ ...pj, data: new TextEncoder().encode(JSON.stringify({ ...m, scripts: { postinstall: "node x.js" } })) }], publisher: "a", previousPublishers: [] });
 
+    const withDep = analyze({ name: "probe-pkg", manifest: m, files: [{ ...pj, data: new TextEncoder().encode(JSON.stringify({ ...m, dependencies: { "probe-tool": "1.0.0" } })) }], publisher: "a", previousPublishers: [] });
     const twin = analyze({ name: "probe-pkg", manifest: m, files: [pj, { ...pj, path: "Package.json" }], publisher: "a", previousPublishers: [] });
 
     const gyp = analyze({ name: "probe-pkg", manifest: m, files: [pj, { ...pj, path: "binding.gyp.", data: new TextEncoder().encode("{}") }], publisher: "a", previousPublishers: [] });
@@ -110,7 +111,7 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
 
     const rc = analyze({ name: "probe-pkg", manifest: m, files: [pj, { ...pj, path: ".npmrc", data: new TextEncoder().encode("script-shell=./sh\n") }], publisher: "a", previousPublishers: [] });
 
-    for (const a of [unread, other, twin, gyp, bin, rc]) expect(finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null }).signals.map((s) => s.id)).toContain("install-download");
+    for (const a of [unread, other, withDep, twin, gyp, bin, rc]) expect(finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null }).signals.map((s) => s.id)).toContain("install-download");
   });
 
   test("a package with bins of its own keeps the reading, since npm puts them on the PATH first", () => {
@@ -132,7 +133,11 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
 
     expect(scoreOf({ preinstall: "\u00a0", postinstall: "curl --version" }).ids).toContain("install-download");
 
-    for (const deps of ["dependencies", "optionalDependencies", "peerDependencies"]) expect(scoreOf({ postinstall: "curl --version" }, { [deps]: { "probe-tool": "1.0.0" } }).ids).toContain("install-download");
+    for (const deps of ["dependencies", "optionalDependencies", "peerDependencies", "bundleDependencies"]) {
+      for (const value of [{ "probe-tool": "1.0.0" }, ["probe-tool"], "probe-tool"]) expect(scoreOf({ postinstall: "curl --version" }, { [deps]: value }).ids).toContain("install-download");
+    }
+
+    expect(scoreOf({ postinstall: "curl --version" }, { dependencies: {} }).ids).not.toContain("install-download");
     expect(scoreOf({ preinstall: "", postinstall: "curl --version" }).ids).not.toContain("install-download");
 
     const befores: Record<string, string>[] = [{ prepublish: "node make-marker.js" }, { preprepare: "node make-marker.js" }];
