@@ -7,6 +7,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CliVersion, parseSums, type Target } from "./cli-install.ts";
+import { smokeTimeouts, spawnBounded, type SmokeTimeouts } from "./smoke-checks.ts";
 
 export type CheckResult = { ok: boolean; detail: string };
 
@@ -45,15 +46,17 @@ export async function sha256Stream(stream: ReadableStream<Uint8Array>): Promise<
 /**
  * Installs from `site` (an origin, no trailing slash) the way the docs say, in a new HOME under TMPDIR, and checks the
  * result. TMPDIR must not be /tmp on the deploy box (a stray /tmp/package-lock.json there confuses package-manager
- * detection), which deploys already arrange (TMPDIR=/home/leo/.cache/apm-smoke-tmp).
+ * detection), which deploys already arrange (TMPDIR=/home/leo/.cache/apm-smoke-tmp). `timeouts` bound the install
+ * command and the SHA256SUMS read, so a hung site fails the check instead of waiting on it.
  */
-export async function installCheck(site: string): Promise<CheckResult> {
+export async function installCheck(site: string, timeouts: SmokeTimeouts = smokeTimeouts({})): Promise<CheckResult> {
   const home = mkdtempSync(join(tmpdir(), "apm-cli-install-"));
 
   try {
     const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: tmpdir() };
-    const proc = Bun.spawn(["sh", "-c", 'curl -fsSL "$1/install" | sh', "sh", site], { env, cwd: home, stdout: "pipe", stderr: "pipe" });
-    const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    const { stdout: out, stderr: err, code, stopped } = await spawnBounded(["sh", "-c", 'curl -fsSL "$1/install" | sh', "sh", site], { env, cwd: home }, timeouts.commandMs);
+
+    if (stopped) return { ok: false, detail: `the install gave no result within ${timeouts.commandMs} ms` };
 
     if (code !== 0) return { ok: false, detail: `the install exited ${code}: ${(err || out).trim().split("\n").at(-1) ?? ""}` };
     const said = /^apm (\S+) \((\S+)\) installed to (\S+)$/m.exec(out);
@@ -65,14 +68,14 @@ export async function installCheck(site: string): Promise<CheckResult> {
 
     if (installed !== bin || !existsSync(bin)) return { ok: false, detail: `apm was not installed at ${bin} (the script said ${installed})` };
     const version = CliVersion.parse(versionText);
-    const ran = Bun.spawnSync([bin, "--version"], { env, cwd: home });
-    const reported = ran.stdout.toString().trim();
+    const ran = await spawnBounded([bin, "--version"], { env, cwd: home }, timeouts.commandMs);
+    const reported = ran.stdout.trim();
     const actual = await sha256File(bin);
-    const sumsRes = await fetch(`${site}/cli/${version}/SHA256SUMS`);
+    const sumsRes = await fetch(`${site}/cli/${version}/SHA256SUMS`, { signal: AbortSignal.timeout(timeouts.httpMs) });
     const published = sumsRes.ok ? (parseSums(version, await sumsRes.text()).find((s) => s.target === target)?.sha256 ?? null) : null;
 
     const problems = [
-      ran.exitCode === 0 && reported === version ? null : `apm --version exited ${ran.exitCode} and printed "${reported}"`,
+      ran.stopped ? `apm --version gave no result within ${timeouts.commandMs} ms` : ran.code === 0 && reported === version ? null : `apm --version exited ${ran.code} and printed "${reported}"`,
       actual === printed ? null : `the installed file's SHA-256 is ${actual}, not the ${printed} the script printed`,
       published === printed ? null : `SHA256SUMS of ${version} lists ${published ?? "nothing"} for ${target} (HTTP ${sumsRes.status})`,
       target === hostTarget() ? null : `the script installed ${target} on a ${hostTarget() ?? "unknown"} machine`,

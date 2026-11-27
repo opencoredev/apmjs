@@ -17,19 +17,22 @@ afterEach(() => {
 });
 
 function start(subdomain: string) {
-  return Bun.spawn(["bun", SMOKE, "--stage", "staging", "--subdomain", subdomain], { env: { PATH: process.env.PATH ?? "", TMPDIR: dir, APM_SECRETS_DIR: join(dir, "secrets") }, stdout: "pipe", stderr: "pipe" });
+  const env = { PATH: process.env.PATH ?? "", TMPDIR: dir, APM_SECRETS_DIR: join(dir, "secrets"), APM_SMOKE_HTTP_TIMEOUT_MS: "2000", APM_SMOKE_COMMAND_TIMEOUT_MS: "5000" };
+
+  return Bun.spawn(["bun", SMOKE, "--stage", "staging", "--subdomain", subdomain], { env, stdout: "pipe", stderr: "pipe" });
 }
 
 describe("smoke.ts's workspace", () => {
-  test("is removed when a check throws and the run crashes", async () => {
-    // a subdomain with a space makes every stage URL invalid: the first fetch throws without touching the network
+  test("is removed when every check throws", async () => {
+    // a subdomain with a space makes every stage URL invalid: each check throws without touching the network
     const proc = start("bad host");
-    const [code, err] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+    const [code, out] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
 
-    expect(code).not.toBe(0);
-    expect(err).toContain("docsSite");
+    expect(code).toBe(1);
+    expect(out).toContain("FAIL: the docs site (stopped: ");
+    expect(out).toMatch(/^0\/\d+ passed$/m);
     expect(readdirSync(dir).filter((f) => f.startsWith("apm-smoke-"))).toEqual([]);
-  });
+  }, 60_000);
 
   test.each([
     ["SIGHUP", 129],
