@@ -87,6 +87,8 @@ export const KEPT_VERSION_FIELDS: ReadonlySet<string> = new Set([
   "typings",
   "type",
   "gitHead",
+  // npm's own: true when the package builds with node-gyp (binding.gyp)
+  "gypfile",
 ]);
 
 /**

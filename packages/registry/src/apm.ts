@@ -3915,6 +3915,11 @@ export function upstreamPackument(input: {
     for (const [i, v] of kept.entries()) {
       // a view's tarballs stay inside the view, so a lockfile written from it keeps being checked
       const doc: Record<string, unknown> = { ...manifests[i], dist: { tarball: tarballUrl(`${base}${view?.prefix ?? ""}`, src.name, v.version), shasum: v.shasum, integrity: v.integrity } };
+
+      // npm's full document has no hasInstallScript (npm derives it for its abbreviated one), so it is derived here as npm
+      // does: an empty hook (async-lock@1.1.3's postinstall) runs nothing and does not count
+      if (Object.values(scriptsOf(v.manifest)).some((s) => s !== "")) doc.hasInstallScript = true;
+
       const r = reportFor(v, at);
 
       if (r) doc._apmScore = compact(r);

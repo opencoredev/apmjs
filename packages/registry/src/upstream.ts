@@ -572,7 +572,7 @@ const ETAG_HEADER = "x-apm-npm-etag";
  * however many 304s came since: then npm's packument is read whole again, and what a whole read runs (the AI review's
  * look at new versions, upstreamFetched) runs, retried if it failed before. INSTALL_COPY_FORMAT names the copy's shape, so one written by another build is never read.
  */
-const INSTALL_COPY_FORMAT = "install-v1";
+const INSTALL_COPY_FORMAT = "install-v2";
 const INSTALL_STAMP_HEADER = "x-apm-install-stamp";
 const INSTALL_FORMAT_HEADER = "x-apm-install-format";
 /**
