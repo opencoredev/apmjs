@@ -140,6 +140,11 @@ export type Scripts = z.infer<typeof ScriptsSchema>;
 /** The part of a manifest the lifecycle analysis reads. */
 export type ScriptsManifest = { readonly scripts?: unknown };
 
+/** package.json `scripts` as written, a value that is not a string read as empty: what npm hands the shell, untrimmed. */
+export function rawScriptsOf(manifest: ScriptsManifest): Scripts {
+  return ScriptsSchema.parse(manifest.scripts);
+}
+
 function scriptsOf(manifest: ScriptsManifest): Scripts {
   const out: Scripts = {};
 
@@ -681,11 +686,60 @@ export type DownloadContext = {
   viaEval?: boolean;
   /** Packages installed alongside this one: running their bins with npx downloads nothing. */
   localBins?: ReadonlySet<string>;
+  /** A lifecycle hook's own text, which npm runs with its shell from the package's root: `shipsNetTool` as netToolsInert reads it. */
+  hook?: { shipsNetTool: boolean };
 };
+
+const NET_TOOL_MENTION = /\b(?:curl|wget)\b/i;
+const NET_TOOL_MENTIONS = /\b(?:curl|wget)\b/gi;
+
+// one simple command whose curl or wget fetches nothing, in plain words one space apart: a call that only prints help
+// or a version, or an echo of one single-quoted literal of plain characters
+const NET_TOOL_INFO_CALL = /^(?:curl|wget) (?:--version|-V|--help|-h)$/;
+const PRINTED_LITERAL = /^echo '[A-Za-z0-9 ._,:/@+-]*'$/;
+
+// the commands between `&&` and `||`, which sh and cmd.exe both read as lists
+const LIST_SEPARATOR = /&&|\|\|/;
+
+/** `s` without the ASCII spaces around it. */
+function trimSpaces(s: string): string {
+  let a = 0;
+  let b = s.length;
+
+  while (a < b && s[a] === " ") a++;
+
+  while (b > a && s[b - 1] === " ") b--;
+
+  return s.slice(a, b);
+}
+
+/**
+ * Whether every curl or wget mention in a hook command is a call that fetches nothing (`curl --version`) or a
+ * literal an echo prints (`echo 'run curl --version'`), read only in those exact shapes: `cmd` is a list of
+ * commands joined by `&&` or `||`, each one of those shapes, so nothing before a call moves where it is looked up.
+ * `shipsNetTool`: the package has a file at its root named like curl or wget, which
+ * cmd.exe runs before the one on the PATH. Anything else is read as fetching, as before.
+ */
+export function netToolsInert(cmd: string, shipsNetTool = false): boolean {
+  return !shipsNetTool && NET_TOOL_MENTION.test(cmd) && onlyInertCommands(cmd);
+}
+
+/** Whether `cmd` is a list of only the shapes netToolsInert clears, so it runs none of the package's code. */
+export function onlyInertCommands(cmd: string): boolean {
+  return cmd
+    .split(LIST_SEPARATOR)
+    .map(trimSpaces)
+    .every((c) => NET_TOOL_INFO_CALL.test(c) || PRINTED_LITERAL.test(c));
+}
+
+/** `cmd` with every curl and wget mention blanked when netToolsInert holds, else `cmd` as it is. */
+export function withoutInertNetTools(cmd: string, shipsNetTool = false): string {
+  return netToolsInert(cmd, shipsNetTool) ? cmd.replace(NET_TOOL_MENTIONS, (m) => "_".repeat(m.length)) : cmd;
+}
 
 /** The canonical dropper shape: a command that fetches remote code, or fetches a package and runs it. */
 export function isInlineDownload(cmd: string, ctx: DownloadContext = {}): boolean {
-  if (/\b(?:curl|wget|iwr|Invoke-WebRequest)\b/i.test(cmd)) return true;
+  if (/\b(?:curl|wget|iwr|Invoke-WebRequest)\b/i.test(ctx.hook ? withoutInertNetTools(cmd, ctx.hook.shipsNetTool) : cmd)) return true;
 
   if (/\|\s*(?:ba|z)?sh\b/.test(cmd)) return true;
 

@@ -10,7 +10,7 @@ import { boundedManifest, MANIFEST_LIMITS, measureManifest } from "./manifest.ts
 import { MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { charge, chargeText, inPhase, MAX_ANALYSIS_WORK, Meter, MeterExhausted, PHASE_NAMES, withMeter, type Phase } from "./meter.ts";
 import { isEstablishedName, typoConflicts, type NameHistory } from "./names.ts";
-import { commandWords, commandWordsWithin, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook, type HookKind, type ShellWords } from "./scripts.ts";
+import { commandWords, commandWordsWithin, expandHooks, gypCommands, isInlineDownload, onlyInertCommands, rawScriptsOf, otherScripts, withoutInertNetTools, type ExpandedHook, type HookKind, type ShellWords } from "./scripts.ts";
 import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type Lang, type ExecutedCode, type FlowFinding, type Hidden, type Imports, type TextFinding } from "./source.ts";
 import { scanTextRules } from "./textrules.ts";
 import { keptBytes, MAX_KEPT_VIEW_BYTES, scanBinaryImports, scanBinaryText, type BinaryTextScan } from "./binary-text.ts";
@@ -1099,14 +1099,107 @@ function depNames(manifest: AnalyzeInput["manifest"], fields: readonly string[])
 }
 
 /**
+ * The text rules' findings in a hook command, less the shell and network ones only its curl and wget mentions gave when
+ * none of those fetches (withoutInertNetTools): every other finding is the command's as written, cited as before.
+ */
+function withoutInertNetFindings(cmd: string, shipsNetTool: boolean): ReturnType<typeof scanText> {
+  // the analysis' own allowance per hook command for the second reading
+  const MAX_NET_TOOL_WORK = MAX_ANALYSIS_WORK / 64;
+  const found = scanText(cmd, "plain");
+  const masked = withoutInertNetTools(cmd, shipsNetTool);
+
+  if (masked === cmd) return found;
+  let left: Set<string>;
+
+  // the second reading runs on a meter of its own: running it out keeps the findings as written, and never costs what
+  // the analysis has
+  try {
+    left = withMeter(new Meter(MAX_NET_TOOL_WORK), () => new Set(scanText(masked, "plain").map((f) => f.id)));
+  } catch (e) {
+    if (!(e instanceof MeterExhausted)) throw e;
+
+    return found;
+  }
+
+  return found.filter((f) => (f.id !== "shell-exec" && f.id !== "network") || left.has(f.id));
+}
+
+/**
  * Signals from the lifecycle scripts: what runs at install, at a git install, and on the publisher's machine. Returns
  * the evidence it cited from commands that run at install, so the risk signals can tell install-time use apart.
  */
-function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: readonly ExpandedHook[]): Set<string> {
+// what npm installs beside a package, each dependency's bins put on its hooks' PATH
+const DEPENDENCY_FIELDS = ["dependencies", "optionalDependencies", "peerDependencies", "bundleDependencies", "bundledDependencies"] as const;
+
+// root files npm, yarn and pnpm read as the project's own configuration
+const PROJECT_CONFIG = new Set(["binding.gyp", ".npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmfile.cjs", ".pnpmfile.mjs", "pnpm-workspace.yaml"]);
+
+/** A path as a case-insensitive filesystem that drops each segment's trailing dots and spaces looks it up. */
+function lookupPath(path: string): string {
+  return path
+    .split("/")
+    .map((s) => s.toLowerCase().replace(/[. ]+$/, ""))
+    .join("/");
+}
+
+/**
+ * Whether a file of the package may stand in for curl or wget or build native code at install: a root file of that name,
+ * a binding.gyp, a package manager's project configuration (which may pick the shell a hook runs in), or anything under
+ * a node_modules of its own, whose .bin npm puts on the hook's PATH.
+ */
+function shadowsNetTool(f: TarEntry): boolean {
+  const p = lookupPath(f.path);
+
+  return /^(?:curl|wget)(?:\.[^/]*)?$/.test(p) || PROJECT_CONFIG.has(p) || p.split("/").includes("node_modules");
+}
+
+/**
+ * Whether the archive's own package.json was read whole and holds the scripts and bins `manifest` does, so what the
+ * hooks are read from is what npm installs.
+ */
+function archiveManifestMatches(
+  pj: TarEntry | undefined,
+  notHeld: ReadonlySet<TarEntry>,
+  manifest: AnalyzeInput["manifest"],
+  files: readonly TarEntry[],
+): boolean {
+  if (pj === undefined || notHeld.has(pj) || pj.data.length !== pj.size) return false;
+
+  // one root manifest under case-insensitive, trailing-dot-and-space-dropping extraction, so no other entry can be the
+  // one a filesystem keeps
+  if (files.some((f) => f !== pj && lookupPath(f.path) === "package.json")) return false;
+  // the fields that decide what an install runs and with what on its PATH
+  const pick = (m: AnalyzeInput["manifest"]): string => JSON.stringify([m.scripts, m.bin, m.directories, ...DEPENDENCY_FIELDS.map((k) => m[k])]);
+
+  try {
+    const archive: unknown = JSON.parse(new TextDecoder().decode(pj.data));
+
+    return isRecord(archive) && pick(archive) === pick(manifest);
+  } catch {
+    return false;
+  }
+}
+
+// a lifecycle step npm may run on an install from the registry or from git, or its pre or post script
+const LIFECYCLE_STEP = /^(?:pre|post)?(?:install|preinstall|postinstall|prepare|prepack|postpack|prepublish|prepublishOnly|publish|dependencies)$/;
+
+// the steps an install from the registry runs
+const REGISTRY_HOOK = /^(?:preinstall|install|postinstall)$/;
+
+function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: readonly ExpandedHook[], shipsNetTool: boolean): Set<string> {
   const atInstall = new Set<string>();
   const installed = depNames(manifest, ["dependencies", "optionalDependencies", "peerDependencies"]);
   // a git install also installs devDependencies before it runs prepare
   const gitInstalled = depNames(manifest, ["dependencies", "optionalDependencies", "peerDependencies", "devDependencies"]);
+
+  // a hook's own text is surely what npm runs from the package's root with its shell, and the root holds what the
+  // tarball does only when nothing of this package runs before it at install: every script npm may run as a lifecycle
+  // step or its pre and post script, on any install from the registry or from git, is one of the shapes netToolsInert
+  // clears, so none writes a program cmd.exe would find first
+  const stableRoot = Object.entries(rawScriptsOf(manifest)).every(([name, body]) => !LIFECYCLE_STEP.test(name) || body === "" || onlyInertCommands(body));
+
+  // no dependency declared in any form: one npm may resolve (an array, a string) is not proven empty
+  const noDependencies = DEPENDENCY_FIELDS.every((k) => manifest[k] === undefined || (isRecord(manifest[k]) && Object.keys(manifest[k]).length === 0));
 
   for (const h of hooks) {
     const own = h.commands[0]?.text ?? "";
@@ -1116,13 +1209,18 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
 
     for (const c of h.commands) {
       const label = `package.json ${c.from}: ${c.text.slice(0, 80)}`;
+      // only the hook's own text: a script it follows may be another package's (a workspace, a moved shell), and one
+      // inside another shell or decoded from a string runs elsewhere, so those are read as before; and only on an install
+      // from the registry, the archive being all it runs with: a source or git step runs with configuration packing omits;
+      // and never with dependencies, whose bins npm puts on the hook's PATH ahead of the system's curl
+      const root = stableRoot && noDependencies && h.kind === "install" && REGISTRY_HOOK.test(h.hook) && c.from === `scripts.${h.hook}` ? { shipsNetTool } : null;
 
-      if (h.kind !== "publish" && isInlineDownload(c.text, { viaEval: c.viaEval, localBins: h.kind === "git" ? gitInstalled : installed })) {
+      if (h.kind !== "publish" && isInlineDownload(c.text, { viaEval: c.viaEval, localBins: h.kind === "git" ? gitInstalled : installed, hook: root ?? undefined })) {
         found.add("install-download", label);
         risky = true;
       }
 
-      for (const f of scanText(c.text, "plain")) {
+      for (const f of root === null ? scanText(c.text, "plain") : withoutInertNetFindings(c.text, shipsNetTool)) {
         const ev = `${label}${f.how === "as written" ? "" : ` (${f.how})`}`;
         found.add(f.id, ev, f.confidence);
 
@@ -1825,7 +1923,10 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
 
   // a hook whose commands apm stopped expanding runs commands apm did not read
   for (const h of hooks) if (h.cut !== null && h.kind !== "publish") add("incomplete", `scripts.${h.hook}: apm stopped reading the commands it runs at ${h.cut}`);
-  const hookEvidence = analyzeHooks(found, manifest, hooks);
+  // a root file named like curl or wget, a binding.gyp, whose build npm may run at install, or a bin of the package's
+  // own, which npm links onto the PATH before its install scripts run, keeps the reading
+  const ownBins = manifest.bin !== undefined || (isRecord(manifest.directories) && manifest.directories.bin !== undefined);
+  const hookEvidence = analyzeHooks(found, manifest, hooks, ownBins || !archiveManifestMatches(byPath.get("package.json"), notHeld, manifest, files) || files.some(shadowsNetTool));
 
   // what runs on the installing machine: install hooks, and the git hooks npm runs when it installs from git
   // every hook's commands before what only the shell reading adds to any of them (HookCommand.added)
