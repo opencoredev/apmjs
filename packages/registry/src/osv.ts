@@ -21,6 +21,7 @@ import semver from "semver";
 import { z } from "zod";
 import { isPossibleNpmName, isValidPackageName } from "@apm/core";
 import { matchWithin, within } from "./deadline.ts";
+import { readCapped } from "./http.ts";
 
 export type PackageVersion = { readonly name: string; readonly version: string };
 
@@ -69,6 +70,21 @@ const BACKOFF = new Map<string, number>();
 
 /** How long a read of, or a write to, the data center's copy of a name's advisories is waited for. */
 const SHARED_MS = 150;
+
+/**
+ * The most MAL- advisories of one name read whole (advisoriesFor), and the most of one read. A page's advisories are
+ * read all at once, so none of them starts after the request's OSV budget is spent. An advisory past these bounds is not
+ * read, so which versions it names is not known: it withholds every version of the name (everyVersion), and the answer
+ * is partial, so it is not kept.
+ */
+export const MAX_ADVISORIES = 64;
+export const MAX_ADVISORY_BYTES = 256 * 1024;
+
+/** An answer from OSV over the bytes the read allows. */
+class OverCap extends Error {}
+
+/** What a MAL- advisory apm did not read for being past a bound is taken to name: every version of the name. */
+const everyVersion = (id: string): Advisory => ({ id, versions: [], ranges: [[{ introduced: "0" }]] });
 
 /** Pages of one version's advisories followed past the batch answer's first. */
 const MAX_PAGES = 3;
@@ -248,17 +264,25 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
   return Layer.sync(KnownMalicious, () => {
     /** Time this request has spent waiting on OSV, and whether it stopped asking (a failure). */
     let spentMs = 0;
+    /** Reads of OSV in flight, and since when one has been (wall clock): waits that overlap count once. */
+    let inFlight = 0;
+    let busySince = 0;
+    const spent = (): number => spentMs + (inFlight > 0 ? Date.now() - busySince : 0);
     let stopped = false;
     const cacheKey = (p: PackageVersion): string => `${baseUrl} ${keyOf(p)}`;
 
-    /** Asks OSV at `path` (a POST of `body`, or a GET when it is null) within the request's budget and parses the answer with `schema`. */
-    const post = <S extends z.ZodType>(path: string, body: OsvBatchQuery | OsvPageQuery | null, schema: S) =>
+    /**
+     * Asks OSV at `path` (a POST of `body`, or a GET when it is null) within the request's budget and parses the answer
+     * with `schema`, reading at most `maxBytes` of it when given.
+     */
+    const post = <S extends z.ZodType>(path: string, body: OsvBatchQuery | OsvPageQuery | null, schema: S, maxBytes: number | null = null) =>
       Effect.tryPromise({
         try: async (): Promise<z.output<S>> => {
-          const left = REQUEST_BUDGET_MS - spentMs;
+          const left = REQUEST_BUDGET_MS - spent();
 
           if (left <= 0) throw new Error("the request's OSV budget is spent");
-          const t0 = Date.now();
+
+          if (inFlight++ === 0) busySince = Date.now();
 
           try {
             const init: RequestInit =
@@ -273,13 +297,16 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
               throw new Error(`OSV answered ${res.status}`);
             }
 
-            const parsed = schema.safeParse(await res.json());
+            const bytes = maxBytes === null ? null : await readCapped(res, maxBytes);
+
+            if (maxBytes !== null && bytes === null) throw new OverCap(`OSV answered more than ${maxBytes} bytes`);
+            const parsed = schema.safeParse(bytes === null ? await res.json() : JSON.parse(new TextDecoder().decode(bytes)));
 
             if (!parsed.success) throw new Error("OSV answered in an unexpected shape");
 
             return parsed.data;
           } finally {
-            spentMs += Date.now() - t0;
+            if (--inFlight === 0) spentMs += Date.now() - busySince;
           }
         },
         catch: (cause) => cause,
@@ -332,6 +359,8 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
         const advisories: Advisory[] = [];
         /** The MAL- ids whose advisory was read: what OSV says of them now is in `advisories`, a withdrawal included. */
         const read = new Set<string>();
+        /** Every MAL- id whose advisory was asked for (at most MAX_ADVISORIES), read or not, or withheld whole past that bound. */
+        const requested = new Set<string>();
         let token: string | undefined;
         let complete = true;
 
@@ -348,12 +377,22 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
             break;
           }
 
-          const ids = malOnly(first.vulns).filter((id) => !read.has(id));
-          const details = yield* Effect.forEach(ids, (id) => Effect.result(post(`v1/vulns/${encodeURIComponent(id)}`, null, VulnAnswer)), { concurrency: "unbounded" });
+          const fresh = [...new Set(malOnly(first.vulns))].filter((id) => !read.has(id) && !requested.has(id));
+          const ids = fresh.slice(0, Math.max(0, MAX_ADVISORIES - requested.size));
+
+          for (const id of fresh.slice(ids.length)) {
+            complete = false;
+            advisories.push(everyVersion(id));
+          }
+
+          fresh.forEach((id) => requested.add(id));
+          const details = yield* Effect.forEach(ids, (id) => Effect.result(post(`v1/vulns/${encodeURIComponent(id)}`, null, VulnAnswer, MAX_ADVISORY_BYTES)), { concurrency: "unbounded" });
 
           details.forEach((r, i) => {
             if (Result.isFailure(r)) {
               complete = false;
+
+              if (r.failure instanceof OverCap) advisories.push(everyVersion(ids[i] ?? ""));
 
               return;
             }
@@ -399,7 +438,7 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
           const newest = [local, shared].flatMap((e) => (e !== null && youngerThan(e, NAME_STALE_MS) ? [e] : [])).toSorted((a, b) => b.fetchedAt - a.fetchedAt)[0] ?? null;
           const kept = newest?.advisories ?? [];
 
-          if (stopped || spentMs >= REQUEST_BUDGET_MS || (BACKOFF.get(baseUrl) ?? 0) > now) return kept;
+          if (stopped || spent() >= REQUEST_BUDGET_MS || (BACKOFF.get(baseUrl) ?? 0) > now) return kept;
           const got = yield* Effect.result(askName(name));
 
           if (Result.isSuccess(got) && got.success.complete) {
@@ -445,7 +484,7 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
             else missing.push(p);
           }
 
-          for (let i = 0; i < missing.length && !stopped && spentMs < REQUEST_BUDGET_MS; i += OSV_BATCH) {
+          for (let i = 0; i < missing.length && !stopped && spent() < REQUEST_BUDGET_MS; i += OSV_BATCH) {
             const chunk = missing.slice(i, i + OSV_BATCH);
             const got = yield* Effect.result(ask(chunk));
 
