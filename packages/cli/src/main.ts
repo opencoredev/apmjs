@@ -114,7 +114,7 @@ function printCard(title: string, report: Report | null, opts: { maxEvidence?: n
   const info = report.signals.filter((s) => s.points >= 0);
   const summary = bad.length === 0 ? green("no risk signals") : yellow(`${bad.length} risk ${bad.length === 1 ? "signal" : "signals"}`);
 
-  say(`${bold(title)}  ${c(`score ${report.score}/100 (${report.grade})`)}  ${dim("·")} ${summary}`);
+  say(`${bold(title)}  ${c(`score ${report.score}/100 (${report.grade})`)} ${dim("·")} ${summary}`);
   const shown = new Set<string>();
 
   for (const s of bad) {
@@ -164,7 +164,7 @@ function printRefusal(input: { title: string; report: Report | null; reason: str
   }
 
   if (rest.length > 0) say(`    ${dim("signals")}   ${bad.map((s) => `${red(String(s.points))} ${oneLine(s.id)}`).join(dim(" · "))}`);
-  say(`    ${dim("score")}     ${dim(`its score, ${report.score}/100 (${report.grade}), does not count: apm refuses it whatever it scores`)}`);
+  say(`    ${dim("score")}     ${dim(`${report.score}/100 (${report.grade}), not counted for a malicious version`)}`);
 }
 
 /** What the package can do, with its declaration and the variables read outside it. Never scored on its own. */

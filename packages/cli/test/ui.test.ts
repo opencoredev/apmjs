@@ -38,6 +38,14 @@ describe("terminal layout", () => {
     for (const l of lines.slice(1)) expect(l).toStartWith(`  ${RED}`);
   });
 
+  test("a run of spaces the wrap folds does not repeat or drop a character at the break", () => {
+    const line = "   -10 install-script  Runs a script at install time (preinstall, install or postinstall)";
+    const out = wrap(line, 76);
+
+    expect(out.split("\n")[1]).toBe(`${" ".repeat(23)}postinstall)`);
+    expect(out.replace(/\n +/g, " ")).toBe(line);
+  });
+
   test("a word longer than the width is broken, not left to overflow", () => {
     const out = wrap(`  - https://example.com/${"a".repeat(120)}`, 50);
 

@@ -343,13 +343,13 @@ describe("apm's messages for first-time users", () => {
     expect(r.code).toBe(1);
     expect(lines[0]).toBe("✗ lodahs@0.0.1-security  refused · known malicious");
     expect(lines[1]).toBe("    advisory  MAL-2025-25502 (OSSF malicious-packages feed)");
-    expect(r.text).toContain("    score     its score, 80/100 (B), does not count: apm refuses it whatever it scores");
+    expect(r.text).toContain("    score     80/100 (B), not counted for a malicious version");
     expect(r.text).not.toContain("score 80/100 (B)");
 
     // an owner's yank reason is not apm's word that a version is malicious: the card stays as it was
     const yanked = await apm(["add", "yanked-pkg", "--pm", "npm"], { cwd });
 
-    expect(yanked.text.split("\n")[0]).toStartWith("✗ yanked-pkg@0.0.1-security  score 80/100 (B)  · ");
+    expect(yanked.text.split("\n")[0]).toStartWith("✗ yanked-pkg@0.0.1-security  score 80/100 (B) · ");
   });
 
   test("D2: apm publish --dry-run without a login says the real publish needs apm login", async () => {

@@ -99,9 +99,12 @@ function openCodes(head: string): string {
   return codes.slice(reset + 1).join("");
 }
 
-/** Where in `body` the visible text of `first` ends, so the rest of the line can be wrapped at its own width. */
+/**
+ * Where in `body` the visible text of `first` ends, so the rest of the line can be wrapped at its own width. Counted in
+ * characters other than spaces: wrapAnsi may fold a run of spaces into one.
+ */
 function sliceEnd(body: string, first: string): number {
-  const want = Bun.stripANSI(first).trimEnd().length;
+  const want = Bun.stripANSI(first).replace(/ /g, "").length;
   let seen = 0;
   let i = 0;
 
@@ -113,7 +116,7 @@ function sliceEnd(body: string, first: string): number {
       continue;
     }
 
-    seen += 1;
+    if (body[i] !== " ") seen += 1;
     i += 1;
   }
 
