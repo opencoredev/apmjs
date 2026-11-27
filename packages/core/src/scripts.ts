@@ -712,11 +712,14 @@ export function netToolsInert(cmd: string): boolean {
 
   // a redirection to anything but the null device or another descriptor may do something of its own
   let redirectsElsewhere = false;
+  // the redirection's operator, its descriptor included (`2>&`)
+  let op = "";
 
   const flush = (): void => {
     if (word !== null && !target) seg.words.push(word);
 
-    if (word !== null && target) redirectsElsewhere ||= !/^(?:\/dev\/null|nul|\d)$/i.test(word);
+    // only output to the null device (`>/dev/null`, `2>>/dev/null`) or a copy of an output descriptor (`2>&1`)
+    if (word !== null && target) redirectsElsewhere ||= !((/^[12]?>>?$/.test(op) && word === "/dev/null") || (/^[12]?>&$/.test(op) && /^[12]$/.test(word)));
 
     if (word !== null) target = false;
     word = null;
@@ -744,11 +747,14 @@ export function netToolsInert(cmd: string): boolean {
       word ??= "";
     } else if (c === "<" || c === ">") {
       // a file descriptor before it (`2>`) is part of the redirection, as are `>>`, `>&` and `>|`
-      if (word !== null && /^\d+$/.test(word)) word = null;
+      op = word !== null && /^\d+$/.test(word) ? word : "";
+
+      if (op !== "") word = null;
       else flush();
       seg.redirected = true;
+      op += c;
 
-      while (/[<>&|]/.test(cmd[i + 1] ?? "")) i++;
+      while (/[<>&|]/.test(cmd[i + 1] ?? "")) op += cmd[++i] ?? "";
       target = true;
     } else if (c === "|" && next !== "|") {
       seg.piped = true;
