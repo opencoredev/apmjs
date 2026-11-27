@@ -154,7 +154,7 @@ EOF
 }
 
 die() {
-  if [ ! -t 2 ]; then
+  if ! terminal 2; then
     printf 'apm install: %s\\n' "$1" >&2
   elif colors 2; then
     printf '\\n  \\033[1;31merror:\\033[0m %s\\n' "$1" >&2
@@ -164,9 +164,15 @@ die() {
   exit 1
 }
 
+# Is file descriptor $1 a person's terminal? CI (CI set, other than false or 0) gets the plain lines even on one.
+terminal() {
+  [ -t "$1" ] || return 1
+  case "\${CI:-}" in "" | false | 0) ;; *) return 1 ;; esac
+}
+
 # Can file descriptor $1 take color? Only a terminal, and not with NO_COLOR set (no-color.org) or TERM=dumb.
 colors() {
-  [ -t "$1" ] && [ -z "\${NO_COLOR:-}" ] && [ "\${TERM:-}" != dumb ]
+  terminal "$1" && [ -z "\${NO_COLOR:-}" ] && [ "\${TERM:-}" != dumb ]
 }
 
 # A step that is done, shown only to a person at a terminal.
@@ -174,14 +180,17 @@ step() {
   [ -z "$tty" ] || printf '  %s✓%s %s\\n' "$g" "$x" "$1"
 }
 
+# A long value (a hash, a path) on its own dim line under a step, so a wrapped line never lands under a mark.
+value() {
+  [ -z "$tty" ] || printf '    %s%s%s\\n' "$d" "$1" "$x"
+}
+
 # Everything runs from main, called on the last line, so a download cut short runs nothing.
 main() {
   # A person at a terminal gets a header, steps and next steps; pipes, CI and agents get the plain lines at the end.
-  tty="" b="" d="" g="" c="" x="" up=""
-  if [ -t 1 ]; then
+  tty="" b="" d="" g="" c="" x=""
+  if terminal 1; then
     tty=1
-    # moves back over the "Downloading" line to mark it done
-    [ "\${TERM:-}" = dumb ] || up=$(printf '\\033[1A\\033[2K')
     if colors 1; then
       b=$(printf '\\033[1m') d=$(printf '\\033[2m') g=$(printf '\\033[32m') c=$(printf '\\033[36m') x=$(printf '\\033[0m')
     fi
@@ -248,14 +257,12 @@ main() {
   url="$site/cli/$version/apm-$target"
   [ -z "$tty" ] || printf '  %s↓%s Downloading apm %s from %s\\n' "$c" "$x" "$version" "\${site#*://}"
   curl -fsSL -o "$tmp" "$url" || die "could not download $url"
-  [ -z "$tty" ] || printf '%s' "$up"
-  step "Downloaded apm $version"
   got=$($sha "$tmp" | awk '{ print $1 }')
   if [ "$got" != "$want" ]; then
     die "SHA-256 mismatch for $url: expected $want, got $got. Nothing was installed."
   fi
   step "Checked SHA-256 against this script"
-  [ -z "$tty" ] || printf '    %s%s%s\\n' "$d" "$got" "$x"
+  value "$got"
   chmod 755 "$tmp"
   ran=$("$tmp" --version 2>/dev/null) || die "the downloaded apm did not run on this machine.$hint Nothing was installed."
   [ "$ran" = "$version" ] || die "the downloaded apm reports version $ran, not $version. Nothing was installed."
@@ -275,10 +282,11 @@ main() {
     esac
     return
   fi
-  step "Installed apm $version to $dir/apm"
+  step "Installed apm $version"
+  value "$dir/apm"
   case ":\${PATH:-}:" in
     *":$dir:"*) ;;
-    *) printf '\\n  %s is not on your PATH.\\n  Run this, and add it to ~/.zshrc, ~/.bashrc or ~/.profile to keep it:\\n\\n    %sexport PATH="%s:$PATH"%s\\n' "$dir" "$c" "$dir" "$x" ;;
+    *) printf '\\n  This folder is not on your PATH:\\n    %s%s%s\\n  Run this, and add it to ~/.zshrc, ~/.bashrc or ~/.profile to keep it:\\n\\n    %sexport PATH="%s:$PATH"%s\\n' "$d" "$dir" "$x" "$c" "$dir" "$x" ;;
   esac
   printf '\\n  %sNext%s\\n' "$b" "$x"
   printf '    %sapm --version%s   %scheck that it runs%s\\n' "$c" "$x" "$d" "$x"

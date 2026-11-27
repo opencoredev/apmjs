@@ -26,7 +26,7 @@ import { makeTemp, removeTemp } from "./sandbox.ts";
 import { CLI_VERSION } from "./version.ts";
 import { manifestChecks, registryChecks, VALID_NAME_RULE, type BuildMetadata, type Existing, type PublishCheck, type RegistryView } from "./publish-checks.ts";
 import { argsError, bareInstallArgs, commandOf, helpTopic } from "./commands.ts";
-import { columnsOf, reflow, truncate, wrap } from "./ui.ts";
+import { columnsOf, inCi, reflow, truncate, wrap } from "./ui.ts";
 
 function flag(a: Args, k: string): string | null {
   const v = a.flags.get(k);
@@ -71,21 +71,26 @@ function sayRun(command: string, why: string | null = null): void {
   if (why !== null) say(dim(`  ${why}`));
 }
 
-function say(line = "", how: "wrap" | "cut" = "wrap"): void {
-  const stream = jsonMode ? process.stderr : process.stdout;
+/** `line` on `stream`, laid out for it: without color where that stream is not a color terminal (a redirected stderr, CI). */
+function write(stream: NodeJS.WriteStream, line: string, how: "wrap" | "cut"): void {
+  const colored = stream.isTTY === true && !process.env.NO_COLOR && !inCi();
 
-  stream.write(`${fit(line, stream, how)}\n`);
+  stream.write(`${fit(colored ? line : Bun.stripANSI(line), stream, how)}\n`);
+}
+
+function say(line = "", how: "wrap" | "cut" = "wrap"): void {
+  write(jsonMode ? process.stderr : process.stdout, line, how);
 }
 function warn(line: string): void {
   lastWarn = line;
-  process.stderr.write(`${fit(line, process.stderr, "wrap")}\n`);
+  write(process.stderr, line, "wrap");
 }
 
 /** A failure: printed to stderr with a mark, and kept for the --json result as it was given. */
 function fail(line: string): void {
   lastError = line;
   lastWarn = red(line);
-  process.stderr.write(`${fit(`${red("✗")} ${red(line)}`, process.stderr, "wrap")}\n`);
+  write(process.stderr, `${red("✗")} ${red(line)}`, "wrap");
 }
 
 /** With --json every apm command prints exactly one JSON document on stdout; the first one wins. */
@@ -140,8 +145,9 @@ function advisoryOf(reason: string): string | null {
 }
 
 /**
- * The card of a version refused whatever it scores (known malicious): the refusal, the advisory that lists it, the one
- * signal that costs the most with its evidence, the other signals on one line, and the score that does not count.
+ * The card of a version refused whatever it scores (known malicious): the refusal, the advisory that lists it and why
+ * that refuses it, then what apm's own scan saw (the signal that costs the most with its evidence, the others on one
+ * line) and the score that does not count.
  */
 function printRefusal(input: { title: string; report: Report | null; reason: string }): void {
   const { report } = input;
@@ -152,18 +158,21 @@ function printRefusal(input: { title: string; report: Report | null; reason: str
   say(`${bold(input.title)}  ${red(bold("refused"))} ${dim("·")} ${red(feed ? "known malicious" : "confirmed malicious")}`);
   say(advisory !== null ? `    ${dim("advisory")}  ${bold(advisory)} ${dim(`(${feed ? "OSSF malicious-packages feed" : "apm reviewer"})`)}` : `    ${dim("source")}    ${reason}`);
 
+  say(`    ${dim("reason")}    ${feed ? "listed as malicious; refused whatever it scores" : reason}`);
+
   if (report === null) return;
   const bad = report.signals.filter((s) => s.points < 0).toSorted((a, b) => a.points - b.points);
   const [top, ...rest] = bad;
+  const possible = (s: Report["signals"][number]): string => (s.confidence === "possible" ? " (possible)" : "");
 
   if (top !== undefined) {
-    say(`    ${dim("reason")}    ${oneLine(top.label)}`);
+    say(`    ${dim("scan")}      ${oneLine(top.label)}${possible(top)}`);
     const evidence = top.evidence[0];
 
     if (evidence !== undefined) say(`              ${dim(oneLine(evidence))}`, "cut");
   }
 
-  if (rest.length > 0) say(`    ${dim("signals")}   ${bad.map((s) => `${red(String(s.points))} ${oneLine(s.id)}`).join(dim(" · "))}`);
+  if (rest.length > 0) say(`    ${dim("also")}      ${rest.map((s) => `${red(String(s.points))} ${oneLine(s.id)}${possible(s)}`).join(dim(" · "))}`);
   say(`    ${dim("score")}     ${dim(`${report.score}/100 (${report.grade}), not counted for a malicious version`)}`);
 }
 
@@ -172,10 +181,18 @@ function printCapabilities(list: readonly Capability[]): void {
   for (const line of capabilityLines(list, { bold, dim, green, yellow })) say(line, "cut");
 }
 
-/** The capabilities on one line, the ones its declaration leaves out in yellow. Never scored on its own. */
+/**
+ * The capabilities on one line: each one seen, marked when its declaration leaves it out or the evidence is only
+ * possible, then the declared ones not seen used. Never scored on its own.
+ */
 function printCapabilityLine(list: readonly Capability[]): void {
-  if (list.length === 0) return;
-  say(`  ${dim("can")}  ${list.map((c) => (c.status === "undeclared" ? yellow(c.id) : c.id)).join(dim(" · "))}  ${dim("(what it can do; not scored)")}`);
+  const seen = list.filter((c) => c.status !== "unused");
+  const unused = list.filter((c) => c.status === "unused");
+  const note = (c: Capability): string => [c.status === "undeclared" ? "not declared" : "", c.basis === "possible" ? "possible" : c.basis === "text" ? "text mention" : ""].filter((x) => x !== "").join(", ");
+
+  if (seen.length > 0) say(`  ${dim("can")}  ${seen.map((c) => (note(c) === "" ? c.id : `${c.status === "undeclared" ? yellow(c.id) : c.id} ${dim(`(${note(c)})`)}`)).join(dim(" · "))}  ${dim("(what it can do; not scored)")}`);
+
+  if (unused.length > 0) say(`  ${dim(`declared, not seen used: ${unused.map((c) => c.id).join(", ")}`)}`);
 }
 
 // ---------- shared ----------
@@ -960,7 +977,7 @@ async function checkLock(input: { api: Api; graph: LockGraph; strict: boolean; r
 
   const lookalikes = input.results.filter((r) => lookalikeOf(r.report) !== null).map((r) => r.name);
 
-  if (!refused && verdict.warnings.length === 0) say(lookalikes.length > 0 ? `${yellow("!")} ${yellow(`no other warnings; the name ${lookalikes.join(", ")} looks like a popular package's (above)`)}` : `${green("✓")} no warnings`);
+  if (!refused && verdict.warnings.length === 0) say(lookalikes.length > 0 ? `${yellow("!")} ${yellow(`no other warnings; the name ${lookalikes.join(", ")} looks like a popular package's (above)`)}` : input.results.some((r) => r.warnings.length > 0 || r.explained !== null) ? `${green("✓")} no new warnings in the lockfile` : `${green("✓")} no warnings`);
 
   return { graph, blocked, warnings: verdict.warnings, refused };
 }
@@ -968,7 +985,9 @@ async function checkLock(input: { api: Api; graph: LockGraph; strict: boolean; r
 /** The closing line of an add that went through: what was added, how much was checked, the warnings and the time. */
 function sayAdded(input: { results: readonly Resolved[]; check: LockCheck }): void {
   const checked = checkedCount(input.check.graph);
-  const warnings = input.check.warnings.length + input.results.reduce((n, r) => n + r.warnings.length + (r.explained === null ? 0 : 1), 0);
+  // a warning the early check and the lockfile check both found is one warning
+  const keys = new Set([...input.results.flatMap((r) => r.warnings), ...input.check.warnings].map((w) => `${idOf(w)}:${w.kind}`));
+  const warnings = keys.size + input.results.filter((r) => r.explained !== null).length;
   const seconds = ((performance.now() - STARTED) / 1000).toFixed(1);
 
   say();
@@ -2011,7 +2030,7 @@ async function checkedRemoval(input: { cwd: string; det: Detection & { pm: LockP
   }
 
   say();
-  say(`${green("✓")} ${bold(`removed ${names.join(", ")}`)}  ${dim(`${t.lockfile} is the one apm checked; nothing new was installed`)}`);
+  say(`${green("✓")} ${bold(`removed ${names.join(", ")}`)}  ${dim(after === null ? "no dependencies are left; nothing new was installed" : `${t.lockfile} is the one apm checked; nothing new was installed`)}`);
 
   return 0;
 }
@@ -3432,9 +3451,10 @@ jsonMode = has(args, "json");
 
 if (help !== null) {
   // help goes to stdout with or without --json, and nothing else runs; a terminal gets its commands in bold, wrapped
-  const laid = columnsOf(process.stdout) === null ? help : reflow(help);
+  // with --json, or off a terminal, the help text is written exactly as it is
+  const laid = jsonMode || columnsOf(process.stdout) === null ? help : reflow(help.replace("explained security score     apm name <name>   is this name free?", "explained security score\n  apm name <name>            is this name free?"));
 
-  process.stdout.write(`${fit(useColor ? laid.replace(/^( {2}apm [^\n]*?)(?= {2,}|$)/gm, (c) => bold(c)).replace(/^(usage:|Flags:|Registry:)/gm, (h) => bold(h)) : laid, process.stdout, "wrap")}\n`);
+  process.stdout.write(jsonMode ? `${help}\n` : `${fit(useColor && !inCi() ? laid.replace(/^( {2}apm [^\n]*?)(?= {2,}|$)/gm, (c) => bold(c)).replace(/^(usage:|Flags:|Registry:)/gm, (h) => bold(h)) : laid, process.stdout, "wrap")}\n`);
 } else {
   try {
     process.exitCode = await main(args);

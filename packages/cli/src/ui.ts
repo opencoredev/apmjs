@@ -1,32 +1,76 @@
 // How apm lays out its human output for a terminal: width-aware wrapping and truncation that keep ANSI colors intact.
 // Only a terminal is wrapped: a pipe, a file or CI gets every line whole, so nothing that reads apm's output changes.
 
-/** The columns a stream shows, or null when it is not a terminal (then nothing is wrapped or cut). */
-export function columnsOf(stream: { isTTY?: boolean; columns?: number }): number | null {
-  if (stream.isTTY !== true) return null;
+const ESC = String.fromCharCode(27);
+const BEL = String.fromCharCode(7);
+const RESET = `${ESC}[0m`;
 
-  return Math.max(MIN_COLUMNS, stream.columns !== undefined && stream.columns > 0 ? stream.columns : 80);
+/** A CSI sequence (colors among them) or an OSC one (a link): built from ESC so no control sits in a regex literal. */
+const ESCAPES = new RegExp(`(${ESC}\\[[0-9;?]*[ -/]*[@-~]|${ESC}\\][^${BEL}${ESC}]*(?:${BEL}|${ESC}\\\\))`);
+const SGR = new RegExp(`^${ESC}\\[[0-9;]*m$`);
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/** Whether CI is set: a CI job gets plain whole lines even on a terminal. */
+export function inCi(env: Record<string, string | undefined> = process.env): boolean {
+  const ci = env.CI;
+
+  return ci !== undefined && ci !== "" && ci !== "0" && ci !== "false";
 }
 
-/** An ANSI color code (SGR), the only escape apm's own lines carry; built from ESC so no control sits in a regex literal. */
-const SGR = `${String.fromCharCode(27)}\\[[0-9;]*m`;
-const SGR_ALL = new RegExp(SGR, "g");
-const SGR_AT_START = new RegExp(`^${SGR}`);
-const LEADING_SPACE = new RegExp(`^((?:${SGR})*) +`);
+/** The columns a stream shows, or null when it is not a terminal or this is CI (then nothing is wrapped or cut). */
+export function columnsOf(stream: { isTTY?: boolean; columns?: number }, env: Record<string, string | undefined> = process.env): number | null {
+  if (stream.isTTY !== true || inCi(env)) return null;
 
-/** Below this a terminal is taken as this wide: a wrap at a handful of columns helps nobody. */
-const MIN_COLUMNS = 40;
+  return stream.columns !== undefined && stream.columns > 0 ? stream.columns : 80;
+}
 
-/** How many columns `text` takes on screen: ANSI escapes take none, wide characters two. */
+/** How many columns `text` takes on screen: escapes take none, wide characters two. */
 export function widthOf(text: string): number {
   return Bun.stringWidth(text);
 }
 
-/** `text` cut to `width` columns with an ellipsis, colors kept and closed. */
+/** One piece of a line: an escape sequence (no width), or one grapheme with its width. */
+type Piece = { kind: "escape"; text: string } | { kind: "grapheme"; text: string; width: number };
+
+function piecesOf(text: string): Piece[] {
+  return text.split(ESCAPES).flatMap((part, i): Piece[] => {
+    if (part === "") return [];
+
+    if (i % 2 === 1) return [{ kind: "escape", text: part }];
+
+    return [...graphemes.segment(part)].map((g) => ({ kind: "grapheme", text: g.segment, width: Bun.stringWidth(g.segment) }));
+  });
+}
+
+/** The color codes still open after `pieces`: every SGR code since the last reset. */
+function openColors(pieces: readonly Piece[]): string[] {
+  const open: string[] = [];
+
+  for (const p of pieces) {
+    if (p.kind !== "escape" || !SGR.test(p.text)) continue;
+
+    if (p.text === RESET || p.text === `${ESC}[m`) open.length = 0;
+    else open.push(p.text);
+  }
+
+  return open;
+}
+
+/** `text` cut to `width` columns with an ellipsis, cut between characters and closing only the colors it opened. */
 export function truncate(text: string, width: number): string {
   if (widthOf(text) <= width) return text;
+  const kept: Piece[] = [];
+  let used = 0;
 
-  return `${Bun.sliceAnsi(text, 0, Math.max(1, width - 1))}\x1b[0m…`;
+  for (const p of piecesOf(text)) {
+    if (p.kind === "escape") kept.push(p);
+    else if (used + p.width <= width - 1) {
+      kept.push(p);
+      used += p.width;
+    } else break;
+  }
+
+  return `${kept.map((p) => p.text).join("")}…${openColors(kept).length > 0 ? RESET : ""}`;
 }
 
 /**
@@ -73,52 +117,74 @@ export function reflow(text: string): string {
   return out.join("\n");
 }
 
-/** `line` wrapped to `width` columns: each continuation is indented under the text it continues, colors carried over. */
+/** The fewest columns a wrapped line keeps for its text: a deeper indent is given up first. */
+const MIN_TEXT = 16;
+
+/**
+ * `line` wrapped to `width` columns: at spaces where it can, between characters where a word is longer than a line.
+ * Each continuation is indented under the text it continues, and the colors open at a break are closed and reopened.
+ */
 export function wrap(line: string, width: number): string {
   if (widthOf(line) <= width) return line;
   const plain = Bun.stripANSI(line);
-  const hang = Math.min(hangOf(plain), Math.floor(width / 2));
-  const indent = /^ */.exec(plain)?.[0].length ?? 0;
-  // the line's own indent is kept by hand: wrapAnsi trims each line's leading space
-  const body = line.replace(LEADING_SPACE, "$1");
-  const first = Bun.wrapAnsi(body, width - indent, { hard: true }).split("\n")[0] ?? "";
-  const end = sliceEnd(body, first);
-  const rest = `${openCodes(body.slice(0, end))}${body.slice(end)}`;
-  const lines = [`${" ".repeat(indent)}${first}`];
+  const room = Math.max(0, width - MIN_TEXT);
+  const indent = Math.min(/^ */.exec(plain)?.[0].length ?? 0, room);
+  const hang = Math.min(hangOf(plain), room);
+  const all = piecesOf(line);
+  // the line's own leading spaces become the first line's indent
+  const lead = all.findIndex((p) => p.kind === "grapheme" && p.text !== " ");
+  const pieces = all.filter((p, i) => !(i < lead && p.kind === "grapheme"));
+  const lines: Piece[][] = [[]];
+  let used = 0;
+  let avail = width - indent;
 
-  if (rest.trim() !== "") for (const l of Bun.wrapAnsi(rest.replace(/^ +/, ""), width - hang, { hard: true }).split("\n")) lines.push(`${" ".repeat(hang)}${l}`);
+  const current = (): Piece[] => lines[lines.length - 1] ?? [];
 
-  return lines.join("\n");
-}
+  const breakLine = (): void => {
+    const open = openColors(lines.flat());
 
-/** The color codes still open at the end of `head`, to reopen them where the next line starts. */
-function openCodes(head: string): string {
-  const codes = head.match(SGR_ALL) ?? [];
-  const reset = codes.findLastIndex((c) => c === "\x1b[0m" || c === "\x1b[m");
+    if (open.length > 0) current().push({ kind: "escape", text: RESET });
+    lines.push(open.map((text): Piece => ({ kind: "escape", text })));
+    used = 0;
+    avail = Math.max(1, width - hang);
+  };
 
-  return codes.slice(reset + 1).join("");
-}
+  // words and the runs of spaces between them, each kept whole where it fits
+  const runs: { pieces: Piece[]; width: number; space: boolean }[] = [];
 
-/**
- * Where in `body` the visible text of `first` ends, so the rest of the line can be wrapped at its own width. Counted in
- * characters other than spaces: wrapAnsi may fold a run of spaces into one.
- */
-function sliceEnd(body: string, first: string): number {
-  const want = Bun.stripANSI(first).replace(/ /g, "").length;
-  let seen = 0;
-  let i = 0;
+  for (const p of pieces) {
+    const space = p.kind === "grapheme" && p.text === " ";
+    const last = runs.at(-1);
 
-  while (i < body.length && seen < want) {
-    const esc = SGR_AT_START.exec(body.slice(i));
+    if (last !== undefined && (p.kind === "escape" || last.space === space)) {
+      last.pieces.push(p);
+      last.width += p.kind === "grapheme" ? p.width : 0;
+    } else runs.push({ pieces: [p], width: p.kind === "grapheme" ? p.width : 0, space });
+  }
 
-    if (esc !== null) {
-      i += esc[0].length;
+  for (const run of runs) {
+    if (run.space) {
+      // spaces at a break are dropped; their colors are kept
+      if (used + run.width >= avail) {
+        breakLine();
+        current().push(...run.pieces.filter((p) => p.kind === "escape"));
+      } else {
+        current().push(...run.pieces);
+        used += run.width;
+      }
+
       continue;
     }
 
-    if (body[i] !== " ") seen += 1;
-    i += 1;
+    // a word longer than a whole line starts where it is and is cut between characters
+    if (used > 0 && used + run.width > avail && run.width <= width - hang) breakLine();
+
+    for (const p of run.pieces) {
+      if (p.kind === "grapheme" && used + p.width > avail && used > 0) breakLine();
+      current().push(p);
+      used += p.kind === "grapheme" ? p.width : 0;
+    }
   }
 
-  return i;
+  return lines.map((l, i) => `${" ".repeat(i === 0 ? indent : hang)}${l.map((p) => p.text).join("").trimEnd()}`).join("\n");
 }

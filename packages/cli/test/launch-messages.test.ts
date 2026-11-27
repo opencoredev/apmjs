@@ -343,6 +343,9 @@ describe("apm's messages for first-time users", () => {
     expect(r.code).toBe(1);
     expect(lines[0]).toBe("✗ lodahs@0.0.1-security  refused · known malicious");
     expect(lines[1]).toBe("    advisory  MAL-2025-25502 (OSSF malicious-packages feed)");
+    // the advisory is the reason; what apm's own scan saw is labelled as the scan's
+    expect(lines[2]).toBe("    reason    listed as malicious; refused whatever it scores");
+    expect(lines[3]).toStartWith("    scan      ");
     expect(r.text).toContain("    score     80/100 (B), not counted for a malicious version");
     expect(r.text).not.toContain("score 80/100 (B)");
 

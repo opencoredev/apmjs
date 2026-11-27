@@ -294,35 +294,57 @@ describe.each(SHELLS)("install script under $name", ({ cmd }) => {
   });
 
   describe.skipIf(SCRIPT === null)("on a terminal", () => {
-    const ok = { platform: { os: "Linux", arch: "x86_64" }, served: served("0.2.0", "linux-x64"), terminal: true, shell: cmd };
+    let home = "";
+    const ok = { platform: { os: "Linux", arch: "x86_64" }, served: served("0.2.0", "linux-x64"), setup: (h: string) => (home = h), terminal: true, shell: cmd };
     const hash = sha(fakeBinary("0.2.0", "linux-x64"));
 
-    test("it shows each step in color, the full SHA-256 and what to run next", () => {
+    test("it shows each step in color, with the full SHA-256, path and PATH command on lines of their own", () => {
       const r = install({ ...ok, env: { TERM: "xterm-256color" } });
+      const dir = `${home}/.apm/bin`;
 
       expect(r.code).toBe(0);
       expect(r.installed).toBe(fakeBinary("0.2.0", "linux-x64"));
       expect(r.out).toContain("\x1b[1mapm installer\x1b[0m  \x1b[2mhttps://apmjs.test\x1b[0m\r\n");
       expect(r.out).toContain("\x1b[32m✓\x1b[0m Detected linux-x64\r\n");
-      expect(r.out).toContain("Downloading apm 0.2.0 from apmjs.test\r\n\x1b[1A\x1b[2K  \x1b[32m✓\x1b[0m Downloaded apm 0.2.0\r\n");
-      expect(r.out).toContain(`✓\x1b[0m Checked SHA-256 against this script\r\n    \x1b[2m${hash}\x1b[0m\r\n`);
-      expect(r.out).toContain("✓\x1b[0m Installed apm 0.2.0 to ");
-      expect(r.out).toContain('export PATH="');
+      expect(r.out).toContain(`  \x1b[36m↓\x1b[0m Downloading apm 0.2.0 from apmjs.test\r\n  \x1b[32m✓\x1b[0m Checked SHA-256 against this script\r\n    \x1b[2m${hash}\x1b[0m\r\n`);
+      expect(r.out).toContain(`  \x1b[32m✓\x1b[0m Installed apm 0.2.0\r\n    \x1b[2m${dir}/apm\x1b[0m\r\n`);
+      expect(r.out).toContain(`\r\n    \x1b[2m${dir}\x1b[0m\r\n`);
+      expect(r.out).toContain(`\r\n    \x1b[36mexport PATH="${dir}:$PATH"\x1b[0m\r\n`);
       expect(r.out).toContain("apm --version");
+      expect(r.out).not.toContain("Downloaded");
+      expect(r.out).not.toContain("\x1b[1A");
       expect(r.out).not.toContain("checked against this script\r\n");
     });
 
-    test("NO_COLOR and TERM=dumb turn color off", () => {
-      const plain = install({ ...ok, env: { TERM: "xterm-256color", NO_COLOR: "1" } });
-      const dumb = install({ ...ok, env: { TERM: "dumb" } });
+    test("NO_COLOR and TERM=dumb print no escape codes at all", () => {
+      const envs: Record<string, string>[] = [{ TERM: "xterm-256color", NO_COLOR: "1" }, { TERM: "dumb" }];
 
-      for (const r of [plain, dumb]) {
+      for (const env of envs) {
+        const r = install({ ...ok, env });
+
         expect(r.code).toBe(0);
         expect(r.out).toContain(`  ✓ Checked SHA-256 against this script\r\n    ${hash}\r\n`);
-        expect(r.out.split("\x1b[").slice(1).some((s) => /^[0-9;]*m/.test(s))).toBe(false);
-      }
+        expect(r.out).not.toContain("\x1b");
+        const bad = install({ ...ok, served: served("0.2.0", "linux-x64", "tampered"), env });
 
-      expect(dumb.out).not.toContain("\x1b");
+        expect(bad.code).toBe(1);
+        expect(bad.out).toContain("\r\n  error: SHA-256 mismatch");
+        expect(bad.out).not.toContain("\x1b");
+      }
+    });
+
+    test("in CI it prints the plain lines even on a terminal", () => {
+      const r = install({ ...ok, env: { TERM: "xterm-256color", CI: "1" } });
+      const dir = `${home}/.apm/bin`;
+
+      expect(r.code).toBe(0);
+      expect(r.out).toBe(`apm 0.2.0 (linux-x64) installed to ${dir}/apm\r\nSHA-256 ${hash}, checked against this script\r\n\r\n${dir} is not on your PATH. Add this line to ~/.zshrc, ~/.bashrc or ~/.profile:\r\n  export PATH="${dir}:$PATH"\r\n`);
+      const bad = install({ ...ok, served: served("0.2.0", "linux-x64", "tampered"), env: { TERM: "xterm-256color", CI: "true" } });
+
+      expect(bad.code).toBe(1);
+      expect(bad.out).toMatch(/^apm install: SHA-256 mismatch .*Nothing was installed\.\r\n$/);
+
+      for (const CI of ["false", "0", ""]) expect(install({ ...ok, env: { TERM: "xterm-256color", CI } }).out).toContain("apm installer");
     });
 
     test("an error is a red error line that still says nothing was installed", () => {
