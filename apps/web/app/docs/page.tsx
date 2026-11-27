@@ -23,7 +23,7 @@ const AGENTS_GUIDE = "https://github.com/opencoredev/apmjs/blob/main/docs/AGENTS
 
 // The ids stay stable: package pages and the AI review section link to /docs#bun, #npm, #cli, #capabilities and #ai-review; llms.txt and the MCP server link to #agents.
 const SECTIONS = [
-  { id: "bun", title: "Use it with Bun", body: "Point bunfig.toml at https://registry.apmjs.dev/, or use `apm add`. For strict mode use ~safe/ instead, which hides versions under 24 hours old, versions scoring under 40 and versions apm has not fully analysed. The optional @apm/bun-scanner package is not on a registry yet; see the guide for trying it from a local checkout.", href: `${DOCS}/guides/bun-scanner`, link: "Bun scanner" },
+  { id: "bun", title: "Use it with Bun", body: "Point bunfig.toml at https://registry.apmjs.dev/, or use apm add. For strict mode use ~safe/ instead, which hides versions under 24 hours old, versions scoring under 40 and versions apm has not fully analysed. The optional @apm/bun-scanner package is not on a registry yet; see the guide for trying it from a local checkout.", href: `${DOCS}/guides/bun-scanner`, link: "Bun scanner" },
   { id: "npm", title: "Use it with npm or pnpm", body: "Set registry=https://registry.apmjs.dev/ in .npmrc, and npm and pnpm install through apm. For strict mode use https://registry.apmjs.dev/~safe/ instead: it hides versions under 24 hours old, versions scoring under 40 and versions apm has not fully analysed, so some large packages have no version there.", href: `${DOCS}/quickstart`, link: "Quick start" },
   {
     id: "cli",
@@ -76,7 +76,7 @@ function AgentsSection() {
       <Code wrap>{INSTRUCTIONS_LINE}</Code>
       <Text>
         Before adding a dependency, the agent asks for the verdict and gets install, review-first, do-not-install, not-found or unknown, with the reasons, the command to run and notes on
-        what apm did not finish. review-first means a person should look: a real risk signal, or an analysis apm could not finish; apm&apos;s own work not yet done is a note. The same
+        what apm did not finish. review-first means a person should look: a real risk signal, or an analysis apm could not finish. A version apm has no score for is unknown: while apm scores it, the agent asks again after about 1, 2 and 4 minutes, and if it is still unknown it tells you why and does not install; the rest of apm&apos;s own work not yet done is a note. The same
         answers come as JSON over HTTP and from the CLI with <code className="font-mono text-[15px] text-foreground">--json</code>:
       </Text>
       <Code>{`curl ${siteUrl("/api/explain?package=zod@^4")}   # the install verdict as JSON

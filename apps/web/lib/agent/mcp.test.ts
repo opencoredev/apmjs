@@ -4,7 +4,9 @@ import { z } from "zod";
 import { mcpGet, mcpOptions, mcpPost } from "./mcp-http";
 import type { Json } from "./json";
 import { PROTOCOL_VERSIONS, TOOLS } from "./mcp";
-import { fakeSource, NETWORK, pkg, REVIEW_CLEAN, type Fake } from "./testing";
+import { KNOWN_VULNERABILITIES } from "../limitations";
+import { fakeSource, NETWORK, pkg, resolvedTo, REVIEW_CLEAN, UGENT_REFUSED, type Fake } from "./testing";
+import { inlineCode } from "./text";
 
 const allow = () => ({ ok: true }) as const;
 
@@ -93,7 +95,7 @@ describe("tools", () => {
   });
 
   test("check_package returns the Markdown view and the score, signals and capabilities as data", async () => {
-    const r = await call("check_package", { name: "Left-Pad" }, { packages: { "left-pad": pkg() }, reviews: { "left-pad@1.3.0": REVIEW_CLEAN } });
+    const r = await call("check_package", { name: "left-pad" }, { packages: { "left-pad": pkg() }, reviews: { "left-pad@1.3.0": REVIEW_CLEAN } });
 
     expect(r.text).toContain("# left-pad");
     expect(r.text).toContain("## Risk signals");
@@ -107,6 +109,32 @@ describe("tools", () => {
 
     expect(r.isError).toBe(true);
     expect(r.text).toBe("No package named nope on apm or npm.");
+  });
+
+  // npm names are case-sensitive: JSONStream (1.3.5) and jsonstream (1.0.3) are two packages
+  test("lookups keep the name's case; check_name lowercases the name to claim", async () => {
+    const checked = await call("check_package", { name: "JSONStream" }, { packages: { JSONStream: pkg({ name: "JSONStream" }) } });
+
+    expect(checked.isError).toBe(false);
+    expect(checked.calls[0]).toBe("package JSONStream");
+    expect(checked.text).toContain("# JSONStream");
+    expect((await call("explain_install", { name: "JSONStream" })).calls[0]).toBe("resolve JSONStream@latest");
+    expect((await call("get_file_excerpt", { name: "JSONStream", version: "1.3.5", path: "index.js" })).calls[0]).toBe("excerpt JSONStream@1.3.5 index.js:1±20");
+    expect((await call("check_name", { name: "My-Name" })).calls).toEqual(["names my-name -"]);
+    expect((await call("check_package", { name: "\u212Aelvin" })).isError).toBe(true);
+  });
+
+  test("check_package lists known vulnerabilities as not checked in its text and its data, with or without a score", async () => {
+    const scored = await call("check_package", { name: "left-pad" }, { packages: { "left-pad": pkg() } });
+
+    expect(scored.structured.notChecked).toEqual(["what the code does at runtime", "dependency foo@1 (could not score)", KNOWN_VULNERABILITIES]);
+    expect(scored.text).toContain(`- ${inlineCode(KNOWN_VULNERABILITIES)}`);
+
+    const unscored = await call("check_package", { name: "left-pad" }, { packages: { "left-pad": pkg({ score: null }) } });
+
+    expect(unscored.structured.score).toBeNull();
+    expect(unscored.structured.notChecked).toEqual([KNOWN_VULNERABILITIES]);
+    expect(unscored.text).toContain(`- ${inlineCode(KNOWN_VULNERABILITIES)}`);
   });
 
   test("check_name checks alternatives under the scope given, without its @", async () => {
@@ -201,5 +229,104 @@ describe("HTTP", () => {
     expect(pre.status).toBe(204);
     expect(pre.headers.get("access-control-allow-origin")).toBe("*");
     expect(pre.headers.get("access-control-allow-headers")).toContain("mcp-protocol-version");
+  });
+});
+
+// HOME-502 Sol review findings 6 and 9: check_package's text said "do not install" and "Network: seen" while its data
+// said active and not seen; check_name called a bare name "available" though apm publishes new packages under a scope
+describe("structured answers agree with the text", () => {
+  test("check_package: a version apm refuses carries the refusal, and capabilities match the scorer's list", async () => {
+    const p = pkg({ name: "ugent_uws", latest: "9.0.0", distTags: { latest: "9.0.0" } });
+    const base = p.score;
+
+    if (!base) throw new Error("pkg() has a score");
+    const score = { ...base, signals: [], scorer: "apm-score-v11", capabilities: [{ id: "network" as const, label: "Network: makes requests or opens sockets", status: "not-declared" as const, basis: "code" as const, evidence: ["package.json scripts.preinstall: wget"] }] };
+    const refused = { kind: "known-malicious" as const, ids: ["MAL-2026-20430"] };
+    const r = await call("check_package", { name: "ugent_uws", version: "10.9.11" }, { packages: { ugent_uws: p }, versions: { "ugent_uws@10.9.11": { version: "10.9.11", status: "active", statusReason: null, deprecated: null, facts: null, score } }, resolve: () => UGENT_REFUSED });
+
+    expect(r.text).toContain("- Status: do not install.");
+    expect(r.structured.refusal).toEqual(refused);
+    expect(r.structured.installPolicy).toBe("refused");
+    expect(r.structured.install).toEqual({ kind: "refused", refusal: refused });
+    expect(r.text).toContain("- Network (makes requests or opens sockets): seen");
+    expect(r.structured.scorerCapabilities).toMatchObject({ kind: "listed", capabilities: [{ id: "network", basis: "code" }] });
+    expect(r.structured.capabilities).toContainEqual({ id: "network", label: "Network access", state: "seen" });
+  });
+
+  test("check_package: an installable version's commands are the text's", async () => {
+    const r = await call("check_package", { name: "left-pad" }, { packages: { "left-pad": pkg() }, resolve: () => resolvedTo("1.3.0") });
+
+    expect(r.structured.refusal).toBeNull();
+    // a clean, scored version: resolve is not asked (lib/refusal.ts looksRisky), and the commands are today's
+    expect(r.structured.installPolicy).toBe("not-asked");
+    expect(r.structured.install).toEqual({ kind: "commands", via: "default", commands: { apm: "apm add left-pad", bun: "bun add left-pad@1.3.0", npm: "npm install left-pad@1.3.0", pnpm: "pnpm add left-pad@1.3.0" } });
+    expect(r.text).toContain("apm add left-pad\nbun add left-pad@1.3.0\nnpm install left-pad@1.3.0\npnpm add left-pad@1.3.0");
+  });
+
+  test("check_name: a free bare name is free on npm and needs a scope on apm, so it is not available", async () => {
+    const r = await call("check_name", { name: "fresh-name" }, {
+      names: { query: "fresh-name", valid: true, taken: false, source: null, unknown: false, available: true, owners: [], latest: null, description: null, conflicts: [], lookalikes: [], similar: [], scope: null, suggestions: [] },
+    });
+
+    const line = "fresh-name is not taken, needs a scope. New packages on apm go under your GitHub login, like @you/fresh-name.";
+
+    expect(r.text).toContain(line);
+    expect(r.structured.available).toBe(false);
+    expect(r.structured.reason).toBe(line);
+    expect(r.structured.publishable).toEqual({ kind: "needs-scope", suggestion: "@you/fresh-name" });
+  });
+
+  test("check_name: a free name under a scope is not available, whatever scope the caller claims", async () => {
+    const names = { query: "@sindresorhus/h638-probe", valid: true, taken: false, source: null, unknown: false, available: true, owners: [], latest: null, description: null, conflicts: [], lookalikes: [], similar: [], scope: null, suggestions: [] };
+    const anonymous = await call("check_name", { name: "@sindresorhus/h638-probe" }, { names });
+    const claimed = await call("check_name", { name: "@sindresorhus/h638-probe", scope: "sindresorhus" }, { names: { ...names, scope: "sindresorhus" } });
+
+    for (const r of [anonymous, claimed]) {
+      expect(r.text).toContain("@sindresorhus/h638-probe is free; only the owner of @sindresorhus (a GitHub login) can publish it.");
+      expect(r.structured.available).toBe(false);
+      expect(r.structured.reason).toBe("@sindresorhus/h638-probe is free; only the owner of @sindresorhus (a GitHub login) can publish it.");
+      expect(r.structured.publishable).toEqual({ kind: "scoped", scope: "@sindresorhus" });
+    }
+  });
+
+  test("check_name: a taken name is not available and says why", async () => {
+    const r = await call("check_name", { name: "left-pad" }, {
+      names: { query: "left-pad", valid: true, taken: true, source: "npm", unknown: false, available: false, owners: ["stevemao"], latest: null, description: null, conflicts: [], lookalikes: [], similar: [], scope: null, suggestions: [] },
+    });
+
+    expect(r.structured.available).toBe(false);
+    expect(r.structured.reason).toBe("left-pad is taken by `stevemao`.");
+  });
+
+  test("check_name: a free bare name follows the registry's name policy", async () => {
+    const names = { query: "open-lib", valid: true, taken: false, source: null, unknown: false, available: true, owners: [], latest: null, description: null, conflicts: [], lookalikes: [], similar: [], scope: null, suggestions: [] };
+    const open = await call("check_name", { name: "open-lib" }, { names, namePolicy: "open" });
+    const unread = await call("check_name", { name: "open-lib" }, { names, namePolicy: null });
+
+    expect(open.text.split("\n")[0]).toBe("open-lib is available.");
+    expect(open.structured.available).toBe(true);
+    expect(open.structured.reason).toBeNull();
+    expect(open.structured.publishable).toEqual({ kind: "open" });
+    expect(unread.structured.available).toBe(false);
+    expect(unread.structured.reason).toBe(unread.text.split("\n")[0]);
+    expect(unread.structured.reason).toContain("could not read this registry's rules for new names");
+  });
+
+  test("check_name: every name it cannot offer says why, in the text's first line", async () => {
+    const base = { valid: true, taken: false, source: null, unknown: false, available: false, owners: [], latest: null, description: null, conflicts: [], lookalikes: [], similar: [], scope: null, suggestions: [] };
+
+    const cases = [
+      { query: "registry-refuses", ...base, valid: false },
+      { query: "npm-down", ...base, unknown: true },
+      { query: "expresss", ...base, conflicts: [{ name: "express", reason: "too close to express" }] },
+    ];
+
+    for (const names of cases) {
+      const r = await call("check_name", { name: names.query }, { names, namePolicy: "open" });
+
+      expect(r.structured.available).toBe(false);
+      expect(r.structured.reason).toBe(r.text.split("\n")[0]);
+      expect(r.structured.publishable).toEqual({ kind: "not-free" });
+    }
   });
 });

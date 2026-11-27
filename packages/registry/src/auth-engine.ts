@@ -8,13 +8,16 @@ import { genericOAuth, twoFactor, deviceAuthorization } from "better-auth/plugin
 import { passkey } from "@better-auth/passkey";
 import { Pool } from "pg";
 import { z } from "zod";
-import type { AuthOptions, GitHubEndpoints } from "./auth.ts";
+import { optedOut, signInMethod, type AccountEvents } from "./account-events.ts";
+import type { AuthOptions, GitHubEndpoints, PasskeyUses } from "./auth.ts";
 import type { Store } from "./db.ts";
 import type { StoreError } from "./errors.ts";
 
 export { hashPassword, symmetricDecrypt, symmetricEncrypt, verifyPassword } from "better-auth/crypto";
 
 export { generateAuthenticationOptions, verifyAuthenticationResponse } from "@simplewebauthn/server";
+
+export { getAuthenticatorName } from "@better-auth/passkey";
 
 export { Pool };
 
@@ -28,12 +31,26 @@ const GITHUB: GitHubEndpoints = {
 const GitHubUser = z.object({ id: z.number(), login: z.string(), name: z.string().nullish(), email: z.string().nullish(), avatar_url: z.string().nullish() });
 const GitHubEmails = z.array(z.object({ email: z.string(), primary: z.boolean(), verified: z.boolean() }));
 
-export function buildBetterAuth(input: { pool: Pool; options: AuthOptions; baseURL: string; store: Store["Service"]; now: () => number; cliClientId: string }) {
-  const { pool, options, store, now, cliClientId } = input;
+/** The part of a passkey sign-in's body that names the passkey that answered. */
+const PasskeySignIn = z.object({ response: z.object({ id: z.string().min(1).max(1024) }) });
+
+export function buildBetterAuth(input: {
+  pool: Pool;
+  options: AuthOptions;
+  baseURL: string;
+  store: Store["Service"];
+  now: () => number;
+  cliClientId: string;
+  accountEvents: AccountEvents | null;
+  passkeyUses: PasskeyUses | null;
+}) {
+  const { pool, options, store, now, cliClientId, accountEvents, passkeyUses } = input;
   const baseURL = input.baseURL.replace(/\/$/, "");
   const web = new URL(baseURL);
   const gh = options.github ? { ...options.github, endpoints: options.github.endpoints ?? GITHUB } : null;
   const record = (effect: Effect.Effect<void, StoreError>): Promise<void> => Effect.runPromise(effect);
+  // the accounts this instance (one request) made: their first session is the sign-up, not a returning sign-in
+  const created = new Set<string>();
 
   return betterAuth({
     appName: "apm",
@@ -43,6 +60,45 @@ export function buildBetterAuth(input: { pool: Pool; options: AuthOptions; baseU
     secret: options.secret,
     trustedOrigins: [web.origin],
     telemetry: { enabled: false },
+    // Sign-up and sign-in counts (account-events.ts): queued for after the answer, and never able to fail a sign-in.
+    databaseHooks: {
+      user: {
+        create: {
+          after: async (user, ctx) => {
+            created.add(user.id);
+
+            try {
+              accountEvents?.send({ name: "account_created", method: signInMethod(ctx) ?? "other", authUserId: user.id, optedOut: optedOut(ctx?.request?.headers) });
+            } catch {
+              // counting never fails a sign-up
+            }
+          },
+        },
+      },
+      session: {
+        create: {
+          after: async (session, ctx) => {
+            try {
+              // the account page's "last used" for the passkey that signed in, written after the answer
+              const signIn = signInMethod(ctx) === "passkey" ? PasskeySignIn.safeParse(ctx?.body) : null;
+
+              if (signIn?.success) passkeyUses?.({ authUserId: session.userId, credentialID: signIn.data.response.id, at: now() });
+            } catch {
+              // a lost "last used" never reaches the person signing in
+            }
+
+            try {
+              const method = signInMethod(ctx);
+
+              if (method === null || created.has(session.userId)) return;
+              accountEvents?.send({ name: "sign_in", method, authUserId: session.userId, optedOut: optedOut(ctx?.request?.headers) });
+            } catch {
+              // counting never fails a sign-in
+            }
+          },
+        },
+      },
+    },
     account: { accountLinking: { enabled: true, trustedProviders: ["github", "vercel"], allowDifferentEmails: true } },
     ...(options.vercel ? { socialProviders: { vercel: { clientId: options.vercel.clientId, clientSecret: options.vercel.clientSecret } } } : {}),
     plugins: [

@@ -6,8 +6,12 @@ import { dirname, join } from "node:path";
 
 export const DEFAULT_REGISTRY = "https://registry.apmjs.dev/";
 
-/** `withheld` names the registry APM_TOKEN belongs to when apm talks to a different one and so sends no token. */
-export type Config = { registry: string; token: string | null; userconfig: string; withheld: string | null };
+/**
+ * `withheld` names the registry APM_TOKEN belongs to when apm talks to a different one and so sends no token.
+ * `registrySource`: the project .npmrc whose `registry=` apm uses; null when it comes from the environment, the user
+ * .npmrc or the default.
+ */
+export type Config = { registry: string; token: string | null; userconfig: string; withheld: string | null; registrySource: string | null };
 
 function withSlash(u: string): string {
   return u.endsWith("/") ? u : `${u}/`;
@@ -81,19 +85,37 @@ export function loadConfig(cwd: string, env: Record<string, string | undefined>)
   const userDirs = new Set<string>([homedir(), dirname(userconfig)]);
 
   if (env.HOME) userDirs.add(env.HOME);
-  const files = [...projectNpmrcs(cwd, userDirs), userconfig].map(readNpmrc);
-  const registry = withSlash(env.APM_REGISTRY ?? env.npm_config_registry ?? env.NPM_CONFIG_REGISTRY ?? files.find((f) => f.has("registry"))?.get("registry") ?? DEFAULT_REGISTRY);
+  const project = projectNpmrcs(cwd, userDirs);
+  const files = [...project, userconfig].map(readNpmrc);
+  const fromEnv = env.APM_REGISTRY ?? env.npm_config_registry ?? env.NPM_CONFIG_REGISTRY;
+  const at = fromEnv === undefined ? files.findIndex((f) => f.has("registry")) : -1;
+  const registry = withSlash(fromEnv ?? files[at]?.get("registry") ?? DEFAULT_REGISTRY);
+  const registrySource = project[at] ?? null;
   const envToken = env.APM_TOKEN || null;
 
   if (envToken) {
     const bound = tokenRegistry(env);
 
-    if (sameRegistry(bound, registry)) return { registry, token: envToken, userconfig, withheld: null };
+    if (sameRegistry(bound, registry)) return { registry, token: envToken, userconfig, withheld: null, registrySource };
 
-    return { registry, token: fileToken(files, registry, env), userconfig, withheld: bound };
+    return { registry, token: fileToken(files, registry, env), userconfig, withheld: bound, registrySource };
   }
 
-  return { registry, token: fileToken(files, registry, env), userconfig, withheld: null };
+  return { registry, token: fileToken(files, registry, env), userconfig, withheld: null, registrySource };
+}
+
+/**
+ * A registry as apm prints it: the origin of an http or https URL and nothing else, since an .npmrc or a variable can
+ * carry a credential in the user, the path, the query or the fragment. Null for anything else, which apm then does not name.
+ */
+export function displayRegistry(url: string): string | null {
+  try {
+    const u = new URL(url);
+
+    return u.protocol === "https:" || u.protocol === "http:" ? `${u.origin}/` : null;
+  } catch {
+    return null;
+  }
 }
 
 /** The token .npmrc files hold for exactly this registry host (never one keyed to another host). */

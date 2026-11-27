@@ -4,6 +4,7 @@
 // explain that answers with a transient state is asked again a bounded number of times. The fetch is injected, so the
 // unit tests (test/smoke-probes.test.ts) need no network.
 import { z } from "zod";
+import { tarballPath } from "./smoke-commands.ts";
 
 export type Fetch = (url: string, init: { headers: Record<string, string>; signal: AbortSignal; redirect: "follow" | "manual" }) => Promise<Response>;
 
@@ -186,4 +187,32 @@ export async function ossfListed(deps: ProbeDeps): Promise<Check[]> {
   }
 
   return out;
+}
+
+const INSTALL_VIEW = "application/vnd.npm.install-v1+json";
+
+const SafePackument = z.object({ name: z.string(), versions: z.record(z.string(), z.object({ version: z.string(), dist: z.object({ tarball: z.string() }) })), "dist-tags": z.record(z.string(), z.string()) });
+
+/**
+ * The registry's ~safe install packument of a known-good large package answers 200, as that view and for that package:
+ * on 2026-11-26 every ~safe packument of next answered 503 (the registry read its whole history of analyses as one row,
+ * which the database connection dropped), and nothing probed it. Every version it lists is under its own key with its
+ * tarball at exactly the registry's ~safe URL for it, and latest is one of them. It may list none: the view hides what apm read only in part, as it reads
+ * next@16.4.6, so how many pass is the stage's data, not the route's health.
+ */
+export async function safeLarge(deps: ProbeDeps): Promise<Check> {
+  const { name } = LARGE;
+  const r = await boundedGet(deps.fetch, `${deps.registry}~safe/${name}`, { timeoutMs: REGISTRY_MS, schema: SafePackument, accept: INSTALL_VIEW });
+  const p = r.data;
+  const docs = p ? Object.entries(p.versions) : [];
+  const inView = docs.every(([key, doc]) => doc.version === key && doc.dist.tarball === `${deps.registry}~safe/${tarballPath(name, key)}`);
+  const latest = p?.["dist-tags"].latest;
+  const tagged = docs.length === 0 || (latest !== undefined && p !== null && Object.hasOwn(p.versions, latest));
+  const ok = r.status === 200 && r.media === INSTALL_VIEW && p?.name === name && inView && tagged;
+
+  return {
+    ok,
+    name: `the registry's ~safe install packument of ${name} answers 200, every version it lists served from ~safe`,
+    detail: p ? `HTTP ${r.status ?? "none"}, ${r.media ?? "no media type"}, name ${p.name}, ${docs.length} versions${inView ? "" : " (one outside ~safe)"}, latest ${latest ?? "none"}` : answerOf(r),
+  };
 }

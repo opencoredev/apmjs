@@ -1,7 +1,8 @@
 // upstreamAnalysesOf sends each stored analysis as a row of its own: every stored analysis of next as one jsonb_agg
-// value was tens of MB, and production's connection dropped it, so resolve answered 503 for next (2026-11-25). Against
-// the real Postgres store: what it returns is what upstreamAnalyses (one package, one statement) returns, and no row the
-// server sends holds more than one analysis.
+// value was tens of MB, and production's connection dropped it, so resolve answered 503 for next (2026-11-25).
+// upstreamAnalyses (one package) kept that one-row shape, so the ~safe and full packuments of next answered 503 too
+// (2026-11-26). Against the real Postgres store: what upstreamAnalysesOf returns is what upstreamAnalyses returns, and no
+// row the server sends either of them holds more than one analysis.
 import { describe, expect, test } from "bun:test";
 import { Effect } from "effect";
 import { Client } from "pg";
@@ -74,6 +75,15 @@ describe("upstreamAnalysesOf reads one analysis a row", () => {
         expect([...(got?.unscorable ?? [])]).toEqual([...one.unscorable]);
       }
 
+      // written out, since upstreamAnalyses is upstreamAnalysesOf for one name: every v11 row, v10's complete reading
+      // reused and its partial one left out, and the outcome decided
+      for (const name of ["one", "two"]) {
+        const got = many.get(name);
+
+        expect([...(got?.scores.keys() ?? [])].sort()).toEqual([...Array.from({ length: count }, (_, i) => `1.0.${i} d${i}`), "2.0.0 e1"].sort());
+        expect([...(got?.unscorable ?? [])]).toEqual([["3.0.0", { reason: "unreadable", detail: "x", digest: "f1" }]]);
+      }
+
       // the dismissal is for evidence the analysis has: it moves from the signal to dismissed, for those bytes only
       expect(base().signals.some((s) => s.id === "credential-mention")).toBe(true);
       const dismissed = parseAnalysis(many.get("one")?.scores.get("1.0.1 d1"));
@@ -98,18 +108,21 @@ describe("upstreamAnalysesOf reads one analysis a row", () => {
       );
       const [sizes] = await sql("SELECT max(octet_length(analysis::text)) AS one, sum(octet_length(analysis::text)) AS every FROM upstream_analysis");
       const { one, every } = z.object({ one: z.coerce.number(), every: z.coerce.number() }).parse(sizes);
-      const proxy = await measured(url);
+      expect(every).toBeGreaterThan(10 * one);
 
-      try {
-        const got = await run(proxy.url, Effect.flatMap(Store, (s) => s.upstreamAnalysesOf([name])));
+      for (const read of [(s: Store["Service"]) => Effect.map(s.upstreamAnalysesOf([name]), (m) => m.get(name)), (s: Store["Service"]) => s.upstreamAnalyses(name)]) {
+        const proxy = await measured(url);
 
-        expect(got.get(name)?.scores.size).toBe(count);
-        expect(every).toBeGreaterThan(10 * one);
-        expect(proxy.largest()).toBeGreaterThan(one);
-        // the analysis and its key, kind and place in the reply
-        expect(proxy.largest()).toBeLessThan(one + 1024);
-      } finally {
-        proxy.close();
+        try {
+          const got = await run(proxy.url, Effect.flatMap(Store, read));
+
+          expect(got?.scores.size).toBe(count);
+          expect(proxy.largest()).toBeGreaterThan(one);
+          // the analysis and its key, kind and place in the reply
+          expect(proxy.largest()).toBeLessThan(one + 1024);
+        } finally {
+          proxy.close();
+        }
       }
     });
   });

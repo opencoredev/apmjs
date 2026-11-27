@@ -2,7 +2,7 @@
 // packument passes only as the view asked for and for the package asked about, with a valid version left and latest
 // listed, and explain is asked again only for a transient answer.
 import { describe, expect, test } from "bun:test";
-import { BODY_CAP, boundedGet, largeExplain, LARGE, NPM_CLIENT, OSSF_LISTED, ossfListed, type Fetch, type ProbeDeps } from "../smoke-probes.ts";
+import { BODY_CAP, boundedGet, largeExplain, LARGE, NPM_CLIENT, OSSF_LISTED, ossfListed, safeLarge, type Fetch, type ProbeDeps } from "../smoke-probes.ts";
 import { z } from "zod";
 
 const REGISTRY = "https://registry.test/";
@@ -212,5 +212,46 @@ describe("largeExplain", () => {
 
   test("an answer about another version fails", async () => {
     expect((await largeExplain(stage({ explain: () => answer(explained({ version: "16.4.7" })) }).deps)).ok).toBe(false);
+  });
+});
+
+describe("safeLarge", () => {
+  type SafeBody = { name: string; versions: Record<string, { version: string; dist: { tarball: string } }>; "dist-tags": Record<string, string> };
+
+  const doc = (version: string, prefix = "~safe/") => ({ version, dist: { tarball: `${REGISTRY}${prefix}${LARGE.name}/-/${LARGE.name}-${version}.tgz` } });
+  const safe = (over: Partial<SafeBody> = {}): SafeBody => ({ name: LARGE.name, versions: { "15.5.4": doc("15.5.4") }, "dist-tags": { latest: "15.5.4" }, ...over });
+  const serve = (body: SafeBody | { error: string }, status = 200, type?: string) => (accept: string) => new Response(JSON.stringify(body), { status, headers: { "content-type": `${type ?? accept}; charset=utf-8` } });
+
+  test("the ~safe install packument of the large package passes, asked for as that view", async () => {
+    const s = stage({ packument: serve(safe()) });
+
+    expect((await safeLarge(s.deps)).ok).toBe(true);
+    expect(s.calls).toEqual([`${REGISTRY}~safe/${LARGE.name}`]);
+  });
+
+  test("a view that lists no version passes: which versions pass the policy is the stage's data", async () => {
+    expect((await safeLarge(stage({ packument: serve(safe({ versions: {}, "dist-tags": {} })) }).deps)).ok).toBe(true);
+  });
+
+  test("a 503, as the registry answered on 2026-11-26, fails", async () => {
+    const check = await safeLarge(stage({ packument: serve({ error: "database-unavailable" }, 503) }).deps);
+
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain("HTTP 503");
+  });
+
+  test("the plain packument, a tarball elsewhere, another package, the full view, a key its document disagrees with or a latest it does not list fails", async () => {
+    for (const over of [
+      serve(safe({ versions: { "15.5.4": doc("15.5.4", "") } })),
+      serve(safe({ name: "other" })),
+      serve(safe(), 200, FULL),
+      serve(safe({ versions: { "15.5.4": doc("15.5.5") } })),
+      serve(safe({ "dist-tags": { latest: "16.4.7" } })),
+      serve(safe({ "dist-tags": { latest: "constructor" } })),
+      serve(safe({ versions: { "15.5.4": { version: "15.5.4", dist: { tarball: `https://elsewhere.test/~safe/${LARGE.name}/-/${LARGE.name}-15.5.4.tgz` } } } })),
+      serve(safe({ versions: { "15.5.4": { version: "15.5.4", dist: { tarball: `${REGISTRY}${LARGE.name}/-/${LARGE.name}-15.5.4.tgz?hint=/~safe/` } } } })),
+    ]) {
+      expect((await safeLarge(stage({ packument: over }).deps)).ok).toBe(false);
+    }
   });
 });

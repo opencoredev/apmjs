@@ -9,6 +9,7 @@ import { newestFirst, satisfies } from "../../../../packages/registry/src/semver
 import { belowFreshRun, COOLDOWN_MS, explainFor, MAX_OLDER_LOOKUPS, olderRange, parsePackageSpec } from "./explain";
 import { CoverageField, parseResolve, type ResolveOutcome } from "./source";
 import { fakeSource, NETWORK, pkg, REVIEW_CLEAN, signal } from "./testing";
+import { KNOWN_VULNERABILITIES } from "../limitations";
 import { ReviewAnswer } from "../review-schema";
 import { AI_REVIEW_COVERAGE, AS_VERSION, DEPENDENCY_COVERAGE, ESTABLISHED_DEPENDENCY_NAMES, explainInstall, GAP_SIGNALS, isRisky, LEGACY_RISK_SIGNALS, NOTE_KINDS, reviewInput, readingOf, RISK_SIGNALS, riskSignalsOf, VERDICTS, verdictText, type OlderSearch, type ReviewInput } from "./verdict";
 
@@ -156,6 +157,8 @@ describe("the shared verdict cases (tests/fixtures/explain-verdicts.json)", () =
       expect(c.resolve.risks.filter((r) => isRisky(r, { kind: "dependency", name: r.name }))).toEqual([]);
       expect(c.resolve.depReviews.kind === "off" || (c.resolve.depReviews.kind === "on" && c.resolve.depReviews.underReview.length + c.resolve.depReviews.confirmed.length === 0)).toBe(true);
       expect(c.resolve.warnings.some((w) => w.via.length === 0 && w.kind === "cooldown")).toBe(false);
+      // a version with no score never installs: nothing has read its code
+      expect(c.resolve.score).not.toBeNull();
       expect(c.resolve.warnings.some((w) => w.via.length > 0 && w.kind === "cooldown" && w.signals === undefined)).toBe(false);
 
       const review = reviewOf(c.review);
@@ -552,14 +555,40 @@ test("the rendered verdict lists the notes and says the install goes ahead", () 
   expect(text).toContain("Run: apm add zod@1.3.0");
 });
 
+// an install verdict for lodash@4.17.20 (known CVEs) said it passes apm's checks and listed nothing about CVEs
+test("every verdict says known vulnerabilities are not checked, and where to find them", () => {
+  const install = explainInstall({ name: "zod", range: null, resolve: ok(92), review: { kind: "queued" } });
+  const missing = explainInstall({ name: "zod", range: null, resolve: { kind: "missing", reason: "no such package" }, review: { kind: "unreadable" } });
+
+  expect(KNOWN_VULNERABILITIES).toMatch(/published security advisories/);
+  expect(KNOWN_VULNERABILITIES).toMatch(/apm audit or npm audit lists the advisories for what is installed/);
+  expect(install.notChecked).toEqual([KNOWN_VULNERABILITIES]);
+  expect(missing.notChecked).toEqual([KNOWN_VULNERABILITIES]);
+  expect(verdictText(install)).toContain(`Not checked:\n- ${KNOWN_VULNERABILITIES}`);
+});
+
 describe("parsePackageSpec", () => {
   test("splits name and range, scoped names included", () => {
     expect(parsePackageSpec("zod")).toEqual({ name: "zod", range: null });
     expect(parsePackageSpec("zod@^4")).toEqual({ name: "zod", range: "^4" });
-    expect(parsePackageSpec("@scope/Name@1.2.3")).toEqual({ name: "@scope/name", range: "1.2.3" });
+    expect(parsePackageSpec("@scope/Name@1.2.3")).toEqual({ name: "@scope/Name", range: "1.2.3" });
     expect(parsePackageSpec("@scope/name")).toEqual({ name: "@scope/name", range: null });
     expect(parsePackageSpec("")).toBeNull();
     expect(parsePackageSpec("../etc")).toBeNull();
+  });
+
+  // npm names are case-sensitive: JSONStream (1.3.5) and jsonstream (1.0.3) are two packages
+  test("keeps the name's case, so a legacy mixed-case name is the package asked for", () => {
+    expect(parsePackageSpec("JSONStream")).toEqual({ name: "JSONStream", range: null });
+    expect(parsePackageSpec("JSONStream@^1.3")).toEqual({ name: "JSONStream", range: "^1.3" });
+    expect(parsePackageSpec("JSON Stream")).toBeNull();
+  });
+
+  // the Kelvin sign lowercases to an ASCII k: a name is checked as given, in ASCII, never in a folded form
+  test("a non-ASCII character that lowercases to ASCII is not a name", () => {
+    expect(parsePackageSpec("\u212Aelvin")).toBeNull();
+    expect(parsePackageSpec("@\u212A/x")).toBeNull();
+    expect(parsePackageSpec("@Scope/X@1.2.3")).toEqual({ name: "@Scope/X", range: "1.2.3" });
   });
 });
 

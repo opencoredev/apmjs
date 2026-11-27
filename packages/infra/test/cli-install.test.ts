@@ -14,13 +14,16 @@ const work = mkdtempSync(join(tmpdir(), "apm-install-test-"));
 afterAll(() => rmSync(work, { recursive: true, force: true }));
 
 const SITE = SiteUrl.parse("https://apmjs.test");
+
+// a color code, built from ESC so no control character sits in a regex literal
+const SGR = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
 const sha = (text: string) => createHash("sha256").update(text).digest("hex");
 const fakeBinary = (version: string, target: string) => `#!/bin/sh\n# apm ${version} ${target}\necho ${version}\n`;
 const TARGETS_UNDER_TEST: Target[] = ["linux-x64", "linux-arm64", "linux-x64-musl", "darwin-x64", "darwin-arm64"];
 const index: CliSum[] = ["0.1.0", "0.2.0"].flatMap((version) => TARGETS_UNDER_TEST.map((target) => ({ version, target, sha256: sha(fakeBinary(version, target)) })));
 
 /** Real tools the script may call, linked into a folder of their own. */
-const REAL = ["awk", "grep", "mkdir", "mktemp", "chmod", "mv", "rm", "cat", "tr", "uniq", "printf"];
+const REAL = ["awk", "grep", "mkdir", "mktemp", "chmod", "mv", "rm", "cat", "tr", "uniq", "printf", "stty"];
 
 type Platform = { os: string; arch: string; rosetta?: boolean; musl?: boolean };
 
@@ -31,7 +34,7 @@ function which(tool: string): string | null {
 let n = 0;
 
 /** Runs the script on `platform` with the files `served` (path under the site → body). */
-function install(input: { platform: Platform; index?: CliSum[]; cut?: number; setup?: (home: string) => void; raceMv?: boolean; served?: Record<string, string>; args?: string[]; env?: Record<string, string>; sha?: "sha256sum" | "shasum" | "none"; shell?: string[] }) {
+function install(input: { platform: Platform; index?: CliSum[]; cut?: number; setup?: (home: string) => void; raceMv?: boolean; served?: Record<string, string>; args?: string[]; env?: Record<string, string>; sha?: "sha256sum" | "shasum" | "none"; shell?: string[]; terminal?: boolean; cols?: number }) {
   const dir = join(work, `run-${n++}`);
   const bin = join(dir, "bin");
   const site = join(dir, "site");
@@ -74,7 +77,10 @@ function install(input: { platform: Platform; index?: CliSum[]; cut?: number; se
   const text = installScript({ site: SITE, index: input.index ?? index });
   writeFileSync(script, input.cut === undefined ? text : text.slice(0, Math.floor(text.length * input.cut)));
   const shell = input.shell ?? ["/bin/sh"];
-  const r = Bun.spawnSync([...shell, script, ...(input.args ?? [])], { env: { PATH: bin, HOME: home, ...input.env }, cwd: dir });
+  const argv = [...shell, script, ...(input.args ?? [])];
+  // on a terminal: util-linux script gives the run a pty, which carries stdout and stderr together, with \r\n
+  const size = input.cols === undefined ? "" : `${which("stty") ?? "stty"} cols ${input.cols} rows 40; `;
+  const r = Bun.spawnSync(input.terminal === true ? [SCRIPT ?? "script", "-q", "-e", "-c", size + argv.map(quote).join(" "), "/dev/null"] : argv, { env: { PATH: bin, HOME: home, ...input.env }, cwd: dir });
   const fetched = existsSync(join(dir, "fetched")) ? readFileSync(join(dir, "fetched"), "utf8").trim().split("\n") : [];
   const installDir = join(input.env?.APM_INSTALL ?? join(home, ".apm"), "bin");
 
@@ -87,6 +93,13 @@ function install(input: { platform: Platform; index?: CliSum[]; cut?: number; se
     leftovers: existsSync(installDir) ? readdirSync(installDir).filter((f) => f !== "apm") : [],
   };
 }
+
+function quote(arg: string): string {
+  return `'${arg.replaceAll("'", "'\\''")}'`;
+}
+
+/** util-linux script, which runs a command on a pseudo-terminal; macOS's script takes other arguments. */
+const SCRIPT = process.platform === "linux" ? which("script") : null;
 
 function fake(bin: string, name: string, body: string): void {
   writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`);
@@ -145,7 +158,7 @@ describe.each(SHELLS)("install script under $name", ({ cmd }) => {
       const r = install({ platform: { os, arch: "x86_64" }, shell: cmd });
 
       expect(r.code).toBe(1);
-      expect(r.err).toBe("apm install: Windows is not supported yet; apm runs on macOS and Linux.\n");
+      expect(r.err).toBe("apm install: Windows is not supported yet. Run this in WSL, or use the apm registry without the CLI: https://docs.apmjs.dev/quickstart#1-point-your-package-manager-at-apm\n");
       expect(r.fetched).toEqual([]);
     }
   });
@@ -272,6 +285,118 @@ describe.each(SHELLS)("install script under $name", ({ cmd }) => {
     expect(r.code).toBe(1);
     expect(r.err).toBe(`apm install: could not download ${SITE}/cli/0.2.0/apm-linux-x64\n`);
     expect(r.leftovers).toEqual([]);
+  });
+
+  // agents and the /publish prompt read these lines, so off a terminal they never change
+  test("off a terminal it prints only the plain lines", () => {
+    let home = "";
+    const r = install({ platform: { os: "Linux", arch: "x86_64" }, served: served("0.2.0", "linux-x64"), setup: (h) => (home = h), env: { TERM: "xterm-256color" }, shell: cmd });
+    const dir = `${home}/.apm/bin`;
+
+    expect(r.code).toBe(0);
+    expect(r.out).toBe(`apm 0.2.0 (linux-x64) installed to ${dir}/apm\nSHA-256 ${sha(fakeBinary("0.2.0", "linux-x64"))}, checked against this script\n\n${dir} is not on your PATH. Add this line to ~/.zshrc, ~/.bashrc or ~/.profile:\n  export PATH="${dir}:$PATH"\n`);
+  });
+
+  describe.skipIf(SCRIPT === null)("on a terminal", () => {
+    let home = "";
+    const ok = { platform: { os: "Linux", arch: "x86_64" }, served: served("0.2.0", "linux-x64"), setup: (h: string) => (home = h), terminal: true, shell: cmd };
+    const hash = sha(fakeBinary("0.2.0", "linux-x64"));
+
+    test("it shows each step in color, with the full SHA-256, path and PATH command on lines of their own", () => {
+      const r = install({ ...ok, env: { TERM: "xterm-256color" } });
+      const dir = `${home}/.apm/bin`;
+
+      expect(r.code).toBe(0);
+      expect(r.installed).toBe(fakeBinary("0.2.0", "linux-x64"));
+      expect(r.out).toContain("\x1b[1mapm installer\x1b[0m  \x1b[2mhttps://apmjs.test\x1b[0m\r\n");
+      expect(r.out).toContain("\x1b[32m✓\x1b[0m Detected linux-x64\r\n");
+      expect(r.out).toContain(`  \x1b[36m↓\x1b[0m Downloading apm 0.2.0 from apmjs.test\r\n  \x1b[32m✓\x1b[0m Checked SHA-256 against this script\r\n    ${hash}\r\n`);
+      expect(r.out).toContain(`  \x1b[32m✓\x1b[0m Installed apm 0.2.0\r\n    ${dir}/apm\r\n`);
+      expect(r.out).toContain(`This folder is not on your PATH:\r\n    ${dir}\r\n`);
+      expect(r.out).toContain(`\r\n    \x1b[36mexport PATH="${dir}:$PATH"\x1b[0m\r\n`);
+      expect(r.out).toContain("apm --version");
+      expect(r.out).not.toContain("Downloaded");
+      expect(r.out).not.toContain("\x1b[1A");
+      expect(r.out).not.toContain("checked against this script\r\n");
+    });
+
+    test("NO_COLOR and TERM=dumb print no escape codes at all", () => {
+      const envs: Record<string, string>[] = [{ TERM: "xterm-256color", NO_COLOR: "1" }, { TERM: "dumb" }];
+
+      for (const env of envs) {
+        const r = install({ ...ok, env });
+
+        expect(r.code).toBe(0);
+        expect(r.out).toContain(`  ✓ Checked SHA-256 against this script\r\n    ${hash}\r\n`);
+        expect(r.out).not.toContain("\x1b");
+        const bad = install({ ...ok, served: served("0.2.0", "linux-x64", "tampered"), env });
+
+        expect(bad.code).toBe(1);
+        expect(bad.out).toContain("\r\n  error: SHA-256 mismatch");
+        expect(bad.out).not.toContain("\x1b");
+      }
+    });
+
+    test("in CI it prints the plain lines even on a terminal", () => {
+      const r = install({ ...ok, env: { TERM: "xterm-256color", CI: "1" } });
+      const dir = `${home}/.apm/bin`;
+
+      expect(r.code).toBe(0);
+      expect(r.out).toBe(`apm 0.2.0 (linux-x64) installed to ${dir}/apm\r\nSHA-256 ${hash}, checked against this script\r\n\r\n${dir} is not on your PATH. Add this line to ~/.zshrc, ~/.bashrc or ~/.profile:\r\n  export PATH="${dir}:$PATH"\r\n`);
+      const bad = install({ ...ok, served: served("0.2.0", "linux-x64", "tampered"), env: { TERM: "xterm-256color", CI: "true" } });
+
+      expect(bad.code).toBe(1);
+      expect(bad.out).toMatch(/^apm install: SHA-256 mismatch .*Nothing was installed\.\r\n$/);
+
+      for (const CI of ["false", "0", ""]) expect(install({ ...ok, env: { TERM: "xterm-256color", CI } }).out).toContain("apm installer");
+    });
+
+    // Lines wider than the terminal, other than a whole value (a hash, a path, a URL) or the export command.
+    function overflowing(out: string, cols: number): string[] {
+      return out
+        .replace(SGR, "")
+        .split("\r\n")
+        .filter((l) => [...l].length > cols && / /.test(l.trim()) && !l.trim().startsWith('export PATH="'));
+    }
+
+    test("on a 25-column terminal every line of prose fits, and values stay whole", () => {
+      const r = install({ ...ok, cols: 25, env: { TERM: "xterm-256color" } });
+      const dir = `${home}/.apm/bin`;
+      const plain = r.out.replace(SGR, "");
+
+      expect(r.code).toBe(0);
+      expect(r.installed).toBe(fakeBinary("0.2.0", "linux-x64"));
+      expect(overflowing(r.out, 25)).toEqual([]);
+      expect(plain).toContain("\r\n  ↓ Downloading apm 0.2.0\r\n    from apmjs.test\r\n");
+      expect(plain).toContain(`\r\n    ${hash}\r\n`);
+      expect(plain).toContain(`\r\n    ${dir}/apm\r\n`);
+      expect(plain).toContain(`\r\n    ${dir}\r\n`);
+      expect(plain).toContain(`\r\n    export PATH="${dir}:$PATH"\r\n`);
+    });
+
+    test("on a 25-column terminal an error fits too, with the hashes whole", () => {
+      const r = install({ ...ok, cols: 25, served: served("0.2.0", "linux-x64", "tampered"), env: { TERM: "xterm-256color" } });
+      const plain = r.out.replace(SGR, "");
+
+      expect(r.code).toBe(1);
+      expect(r.installed).toBeNull();
+      expect(overflowing(r.out, 25)).toEqual([]);
+      expect(plain).toContain("\r\n  error: SHA-256 mismatch\r\n         for\r\n");
+      expect(plain).toContain(`\r\n         ${hash},\r\n`);
+      expect(plain).toContain(`\r\n         ${sha("tampered")}.\r\n`);
+      expect(plain).toContain("Nothing was\r\n         installed.\r\n");
+    });
+
+    test("an error is a red error line that still says nothing was installed", () => {
+      const r = install({ ...ok, served: served("0.2.0", "linux-x64", "tampered"), env: { TERM: "xterm-256color" } });
+
+      expect(r.code).toBe(1);
+      expect(r.out).toContain(`\r\n  \x1b[1;31merror:\x1b[0m SHA-256 mismatch for ${SITE}/cli/0.2.0/apm-linux-x64:\r\n`);
+      expect(r.out).toContain(`\r\n         ${hash}, got\r\n`);
+      expect(r.out).toContain("Nothing was installed.\r\n");
+      expect(r.installed).toBeNull();
+      expect(r.leftovers).toEqual([]);
+    });
   });
 });
 

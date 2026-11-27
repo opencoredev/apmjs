@@ -151,6 +151,7 @@ export const NameResponse = z.object({
   valid: z.boolean(),
   taken: z.boolean(),
   available: z.boolean(),
+  unknown: z.boolean().default(false),
   owners: z.array(z.string()),
   latest: z.object({ version: z.string(), score: z.number().nullable(), grade: z.string().nullable() }).nullable(),
   conflicts: z.array(z.object({ name: z.string(), reason: z.string() })),
@@ -223,8 +224,8 @@ export class Api {
     };
   }
 
-  async raw(path: string, init: { method?: string; body?: unknown } = {}): Promise<RawAnswer> {
-    const { status, body } = await this.answer(path, init);
+  async raw(path: string, init: { method?: string; body?: unknown } = {}, timeoutMs = REQUEST_TIMEOUT_MS): Promise<RawAnswer> {
+    const { status, body } = await this.answer(path, init, timeoutMs);
 
     return { status, body };
   }
@@ -294,6 +295,37 @@ export class Api {
 
 export function encodeName(name: string): string {
   return name.startsWith("@") ? `@${encodeURIComponent(name.slice(1))}` : encodeURIComponent(name);
+}
+
+/** A dist-tag and the version it points at. */
+export type DistTag = { tag: string; version: string };
+
+// a tag or version apm prints: short, and no character but these (tags are publisher text)
+const SAFE_TAG = /^[A-Za-z0-9][\w.+-]{0,63}$/;
+const DistTags = z.record(z.string(), z.string());
+
+/** How many of a package's tags a message names, and how long apm waits for them: the answer is already decided. */
+const SHOWN_TAGS = 5;
+const DIST_TAGS_TIMEOUT_MS = 5_000;
+
+/**
+ * The dist-tags of `name` when none of them is latest (a package with only a prerelease, tagged next), so a refusal of
+ * "no version matching latest" can say which tag to ask for: from the registry's dist-tags route, not the packument.
+ * Empty when it has latest, has no tags, or cannot be read in time.
+ */
+export async function tagsWithoutLatest(api: Api, name: string): Promise<DistTag[]> {
+  try {
+    const r = await api.raw(`-/package/${encodeName(name)}/dist-tags`, {}, DIST_TAGS_TIMEOUT_MS);
+    const tags = DistTags.safeParse(r.body);
+
+    if (r.status !== 200 || !tags.success || Object.hasOwn(tags.data, "latest")) return [];
+
+    return Object.entries(tags.data)
+      .flatMap(([tag, version]) => (SAFE_TAG.test(tag) && SAFE_TAG.test(version) ? [{ tag, version }] : []))
+      .slice(0, SHOWN_TAGS);
+  } catch {
+    return [];
+  }
 }
 
 /** Splits "name@range" (scoped names keep their leading @). */

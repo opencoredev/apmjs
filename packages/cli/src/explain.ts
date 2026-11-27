@@ -8,13 +8,14 @@
 // inside the 24-hour cooldown that apm cannot clear, or an analysis apm could not finish. The last is fail-closed: an
 // analysis that did not read everything installs only when it positively records that the one gap is whole files left
 // unread for their size or the byte budget (readingOf); every other gap, or a record that does not say, holds. apm's
-// own work that has not started never interrupts anyone: an AI review not finished or not picked, a version still
-// queued or too large to score, a dependency not scored yet or not looked up installs, and the answer lists each in
+// own work that has not started never interrupts anyone: an AI review not finished or not picked, a dependency not
+// scored yet, too large to score or not looked up installs, and the answer lists each in
 // `notes` for the agent to mention after installing. A version inside the cooldown is replaced by the newest one in range
 // past it (agent.ts), so only a range with no such version stays review-first for its age. Anything apm could not read
-// is "unknown"; "do-not-install" is only for a revoked or yanked version and one an apm reviewer confirmed malicious,
+// is "unknown", and so is a version apm has no score for (queued, recorded as never scorable, or no word on why): a queued version is pending,
+// never clean; "do-not-install" is only for a revoked or yanked version and one an apm reviewer confirmed malicious,
 // the version or anything in its tree. Like the rest of apm it never calls a version "safe".
-import type { Report, ReportCoverage } from "./api.ts";
+import type { DistTag, Report, ReportCoverage } from "./api.ts";
 
 /** "2,656 files (74.0 MB)": what a version apm did not read in full left out. */
 function omittedText(c: { omittedFiles: number; omittedBytes: number }): string {
@@ -273,7 +274,7 @@ export type DepCheck = { unchecked: number; uncheckedDeps: { dependency: string;
 /** `confirmed`: what an apm reviewer confirmed malicious, when that is why the registry refused (older registries send none). */
 export type ResolvedInput =
   | { kind: "ok"; version: string; report: Report | null; skipped: { version: string; reason: string }[]; deps: DepCheck }
-  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[]; knownMalicious?: { name: string; version: string; ids: string[] }[] }
+  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[]; knownMalicious?: { name: string; version: string; ids: string[] }[]; tags?: DistTag[] }
   | { kind: "missing"; reason: string }
   | { kind: "unavailable"; reason: string };
 
@@ -322,8 +323,8 @@ export type Coverage = { aiReview: AiReviewCoverage; dependencies: DependencyCov
 /**
  * What a note is about. older-version: the version picked is not the newest in range, which is inside the cooldown.
  * ai-review-pending, ai-review-no-answer, no-ai-review: the picked version's AI review is under way, ended without an
- * answer, or was never run. dependency-ai-review: a dependency's is under way or ended without one. not-scored: apm has
- * no score for the version yet (queued) or never will (too large to score). partial-analysis: apm left whole files
+ * answer, or was never run. dependency-ai-review: a dependency's is under way or ended without one. not-scored: no longer
+ * sent (a version with no score is unknown); kept so older answers still read. partial-analysis: apm left whole files
  * unread for their size or the bytes one analysis reads, and recorded that this was all (readingOf). lost-points: it scores under 75 for signals that are not risks. dependency-gaps: dependencies apm could not score
  * or look up. dependency-cooldown: dependencies published inside the cooldown that apm scored and found no risk in.
  */
@@ -369,11 +370,17 @@ const SHOWN = 3;
 
 /** Control characters (a terminal's escapes included), line breaks and bidi overrides: what can fake a line. */
 // oxlint-disable-next-line eslint/no-control-regex -- matching control characters is the point: they are removed
-const LINE_BREAKERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]+/g;
+const BREAKER = "[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069\\u061c]";
+const LINE_BREAKERS = new RegExp(`${BREAKER}+`, "g");
 
 /** Registry text (which carries publisher text, such as a yank reason) on one line, so none can pose as apm's. */
 export function oneLine(text: string): string {
   return text.replace(LINE_BREAKERS, " ").replace(/\s+/g, " ").trim();
+}
+
+/** A local path for the terminal: line breaks, controls and bidi overrides shown as escapes, so the path stays readable and none can pose as apm's. */
+export function escapedPath(path: string): string {
+  return path.replace(new RegExp(BREAKER, "g"), (c) => `\\u{${(c.codePointAt(0) ?? 0).toString(16)}}`);
 }
 
 /** The longest run of backticks in `text`, in one pass: a spread into Math.max overflows the stack on big input. */
@@ -726,7 +733,8 @@ export function explain(input: ExplainInput): Verdict {
   return { ...decide(input), ...shown };
 }
 
-type ExplainInput = { name: string; range: string | null; resolved: ResolvedInput; review: ReviewInput; older?: OlderSearch };
+/** `floor`: the score floor the install asked for (`apm add --floor`, 0 with `--force`) for the version itself; absent, SCORE_FLOOR. */
+type ExplainInput = { name: string; range: string | null; resolved: ResolvedInput; review: ReviewInput; older?: OlderSearch; floor?: number | undefined };
 
 /** The page link the registry gave, when it is a web address; anything else is dropped rather than shown. */
 function pageUrl(raw: string | undefined): string | null {
@@ -791,6 +799,15 @@ function decide(input: ExplainInput): Decided {
       }
 
       if (refusedAsPulled(resolved.skipped)) return { ...base, verdict: "do-not-install", version: resolved.newest, score: null, summary: `Do not install ${asked}: apm's install policy refused it. The reasons say why.`, reasons, commands: null, coverage: NOT_READ };
+
+      // no version tagged latest, but others tagged (a package with only a prerelease, tagged next): name them
+      const [tagged] = resolved.tags ?? [];
+
+      if (resolved.skipped.length === 0 && resolved.newest === null && tagged !== undefined) {
+        const tags = (resolved.tags ?? []).map((t) => `${quoted(t.tag)} (${quoted(t.version)})`).join(", ");
+
+        return { ...base, verdict: "not-found", version: null, score: null, summary: `No version of ${name} is tagged latest, the tag apm installs when no version is named. Ask about one of its other tags: the reasons list them.`, reasons: [...reasons, `Its tags: ${tags}.`, `To check what the tag ${quoted(tagged.tag)} resolves to: apm explain ${name}@${tagged.tag}`], commands: null, coverage: NOT_READ };
+      }
 
       if (resolved.skipped.length === 0 && resolved.newest === null) {
         return { ...base, verdict: "not-found", version: null, score: null, summary: `No version of ${name} matches ${plain(range)}. Check the version or range.`, reasons, commands: null, coverage: NOT_READ };
@@ -857,17 +874,29 @@ function decide(input: ExplainInput): Decided {
     return { ...known, verdict: "unknown", summary: `apm could not read the AI reviews of ${id}'s dependencies, so it cannot say. Nothing was decided; try again.`, reasons: [], commands: null };
   }
 
+  // no score: nothing has read its code, so apm cannot say and gives no command. A queued version is pending, never
+  // clean, and asking again gets its score; one the registry recorded it can never score (with the reason why) stays
+  // without one, so a person decides
+  const ownWarning = deps.warnings.find((w) => w.via.length === 0 && w.kind !== "cooldown");
+
+  if (report === null) {
+    const never = ownWarning?.kind === "unscorable" && ownWarning.unscorable !== undefined;
+    const state = ownWarning?.kind === "pending" ? `apm has not scored ${id} yet: it is still being analysed` : never ? `apm cannot score ${id}` : `apm has not scored ${id}`;
+    const next = never ? "Nothing was decided, and asking again will not change that: a person has to decide." : ownWarning?.kind === "pending" ? "Nothing was decided; scoring is usually ready within about 5 minutes, so ask again in a few minutes." : "Nothing was decided; ask again after about 1, 2 and 4 minutes.";
+
+    return { ...known, verdict: "unknown", summary: `${state}, so nothing has read its code and apm cannot say whether to install it. ${next}`, reasons: ownWarning ? [`The registry said: ${quoted(ownWarning.text)}`] : [], commands: null };
+  }
+
   // 3. a real risk in what would be installed: a person should look first (holds, most serious first). What apm did
   // not finish is a note: the install goes ahead and the agent mentions it
-  const signals = report?.signals ?? [];
+  const signals = report.signals;
   const lost = signals.filter((s) => s.points < 0).sort((a, b) => a.points - b.points);
-  const scorer = report?.scorer ?? null;
+  const scorer = report.scorer ?? null;
   const risks = riskSignalsOf(signals, scorer, AS_VERSION);
   // `scored`: the why already gives the score, so the summary does not repeat it
   const holds: { why: string; reason: string; scored?: true }[] = [];
   const depReviewNotes: Note[] = [];
-  const scoreText = report ? scoreTextOf(report) : null;
-  const ownWarning = deps.warnings.find((w) => w.via.length === 0 && w.kind !== "cooldown");
+  const scoreText = scoreTextOf(report);
   const fresh = deps.warnings.find((w) => w.via.length === 0 && w.kind === "cooldown");
 
   if (review.kind === "reviewed" && review.state === "under-review") holds.push({ why: "the AI review flagged it and a person at apm has not decided yet", reason: reviewReason(review) });
@@ -880,27 +909,21 @@ function decide(input: ExplainInput): Decided {
 
   // fail-closed: an analysis that did not read everything holds unless it records that its one gap is whole files left
   // unread for their size or the byte budget
-  const reading = report ? readingOf({ scorer, signals, coverage: report.coverage ?? null }) : null;
+  const reading = readingOf({ scorer, signals, coverage: report.coverage ?? null });
 
-  if (reading?.kind === "incomplete") {
-    const unread = report?.signals.find((s) => isGap(s.id))?.evidence[0];
+  if (reading.kind === "incomplete") {
+    const unread = report.signals.find((s) => isGap(s.id))?.evidence[0];
 
-    holds.push({ why: `apm could not fully analyse it (it ${scoreText ?? "has no score"})`, reason: unread === undefined ? "apm could not fully analyse it, and its analysis does not record that the only gap is files left unread for their size." : `apm could not fully analyse it: ${quoted(unread)}.`, scored: true });
+    holds.push({ why: `apm could not fully analyse it (it ${scoreText})`, reason: unread === undefined ? "apm could not fully analyse it, and its analysis does not record that the only gap is files left unread for their size." : `apm could not fully analyse it: ${quoted(unread)}.`, scored: true });
   }
 
   // under the floor for what apm read: an incomplete analysis's -61 is said by its own hold above
-  if (report && report.score < SCORE_FLOOR && reading?.kind !== "incomplete") {
+  const floor = input.floor ?? SCORE_FLOOR;
+
+  if (report.score < floor && reading.kind !== "incomplete") {
     const label = oneLine(lost.find((s) => !isGap(s.id))?.label ?? "see the signals");
 
-    holds.push({ why: `it ${scoreText ?? ""}, under apm's floor of ${SCORE_FLOOR}, most of it for: ${label}`, reason: "", scored: true });
-  }
-
-  // no score: queued, or too large to score, is apm's own work not done; any other reason (the analysis limit, bytes
-  // apm cannot read, a registry that does not say) holds
-  const unscorable = report === null && ownWarning?.kind !== "pending" && !(ownWarning?.kind === "unscorable" && ownWarning.unscorable === "too-large");
-
-  if (unscorable) {
-    holds.push({ why: `apm ${ownWarning?.kind === "unscorable" ? "cannot score" : "has not scored"} it, so nothing has read its code`, reason: ownWarning?.kind === "unscorable" ? `The registry said: ${quoted(ownWarning.text)}` : "" });
+    holds.push({ why: `it ${scoreText}, under apm's floor of ${floor}, most of it for: ${label}`, reason: "", scored: true });
   }
 
   const depReviews: DepReviews = deps.reviews;
@@ -976,23 +999,11 @@ function decide(input: ExplainInput): Decided {
 
   if (own) notes.push(own);
 
-  if (report === null) {
-    // a reason that holds is said by its hold
-    if (!unscorable) {
-      const text =
-        ownWarning?.kind === "pending"
-          ? `apm is still analysing ${id}: it has no score yet, so nothing has read its code. Ask again in a minute for its score.`
-          : `apm cannot score ${id}, so nothing has read its code. The registry said: ${quoted(ownWarning?.text ?? "")}`;
+  // whole files left unread for their size or the byte budget, and recorded as the only gap: apm's own gap, not a risk,
+  // so the install goes ahead with what was not read said here
+  if (reading.kind === "partial") notes.push({ kind: "partial-analysis", text: partialText({ id, reading, report }) });
 
-      notes.push({ kind: "not-scored", text });
-    }
-  } else {
-    // whole files left unread for their size or the byte budget, and recorded as the only gap: apm's own gap, not a
-    // risk, so the install goes ahead with what was not read said here
-    if (reading?.kind === "partial") notes.push({ kind: "partial-analysis", text: partialText({ id, reading, report }) });
-
-    if (reading?.kind !== "incomplete" && report.score < CLEAN_SCORE && holds.length === 0) notes.push({ kind: "lost-points", text: `${id} ${scoreTextOf(report)}, under the ${CLEAN_SCORE} the site shows as clean, for signals that are not risks; the reasons list them.` });
-  }
+  if (reading.kind !== "incomplete" && report.score < CLEAN_SCORE && holds.length === 0) notes.push({ kind: "lost-points", text: `${id} ${scoreTextOf(report)}, under the ${CLEAN_SCORE} the site shows as clean, for signals that are not risks; the reasons list them.` });
 
   notes.push(...depReviewNotes);
   const gaps = byClass("gap");
@@ -1024,7 +1035,7 @@ function decide(input: ExplainInput): Decided {
   const first = holds[0];
 
   if (first) {
-    const standing = first.scored ? "It passes apm's install policy." : scoreText ? `It passes apm's install policy and ${scoreText}.` : "It passes apm's install policy and has no score yet.";
+    const standing = first.scored ? "It passes apm's install policy." : `It passes apm's install policy and ${scoreText}.`;
 
     return { ...known, verdict: "review-first", summary: `Review ${id} before installing: ${first.why}. ${standing}${note}`, reasons, commands: run, notes };
   }
@@ -1034,12 +1045,12 @@ function decide(input: ExplainInput): Decided {
   const shown = notes.filter((n) => n.kind !== "no-ai-review");
   const head = shown[0];
 
-  // nothing apm left unfinished (a version with no score always has a note)
+  // nothing apm left unfinished
   if (head === undefined) {
     return {
       ...known,
       verdict: "install",
-      summary: `${id} passes apm's checks: it ${scoreText ?? "has no score"}, is past the 24-hour cooldown, nothing in its dependency tree was refused or flagged, and apm scored every dependency.${note}`,
+      summary: `${id} passes apm's checks: it ${scoreText}, is past the 24-hour cooldown, nothing in its dependency tree was refused or flagged, and apm scored every dependency.${note}`,
       reasons,
       commands: run,
       notes,
@@ -1048,15 +1059,8 @@ function decide(input: ExplainInput): Decided {
 
   const more = (n: number): string => (n > 0 ? `, and ${plural(n, "more note", "more notes")}` : "");
 
-  // no score: nothing has read the code, which the summary says first
-  if (report === null) {
-    const unread = ownWarning?.kind === "pending" ? "apm is still analysing it, so nothing has read its code yet" : "apm has no score for it, so nothing has read its code";
-
-    return { ...known, verdict: "install", summary: `Install ${id}: ${unread}, but nothing else apm checked needs a person to look first${more(shown.length - 1)}.${note}`, reasons, commands: run, notes };
-  }
-
   // a partial reading says how much apm left unread
-  const why = head.kind === "partial-analysis" && reading?.kind === "partial" ? `apm did not read all of ${id}: it skipped ${omittedText(reading)}, ${SKIPPED_WHY}` : noteWhy(head, id);
+  const why = head.kind === "partial-analysis" && reading.kind === "partial" ? `apm did not read all of ${id}: it skipped ${omittedText(reading)}, ${SKIPPED_WHY}` : noteWhy(head, id);
 
   return { ...known, verdict: "install", summary: `Install ${id}: it ${scoreTextOf(report)} and nothing apm found needs a person to look first, but ${why}${more(shown.length - 1)}.${note}`, reasons, commands: run, notes };
 }

@@ -1,0 +1,128 @@
+---
+title: Move an existing project to apm
+description: Switch a project from npm's registry to apm with bun, npm, pnpm or yarn, what each lockfile records, how CI and teammates follow, and how to stop using apm and switch back.
+search:
+  keywords: [migrate, migration, switch, switch back, undo, stop using apm, remove apm, revert, leave apm, back to npm, lockfile, gitignore]
+---
+
+This page moves a project that installs from npm's registry to apm, and back again. Your dependencies and their versions stay the same: apm serves the same tarballs as npm, with the same checksums, so a lockfile stays valid. What changes is where the package manager downloads from, and some lockfiles write that down.
+
+You don't need the apm CLI for any of this. The CLI adds checks to `apm add` ([Quick start](/quickstart#2-get-the-apm-cli)); the registry setting below is what makes plain installs, your teammates and CI use apm.
+
+## 1. Add the registry setting
+
+Put one line in the project folder, in the file your package manager reads:
+
+| Package manager | File | Line |
+| --- | --- | --- |
+| bun | `bunfig.toml` | `registry = "https://registry.apmjs.dev/"` under `[install]` |
+| npm, pnpm, yarn 1 | `.npmrc` | `registry=https://registry.apmjs.dev/` |
+| yarn 2 and later | `.yarnrc.yml` | `npmRegistryServer: "https://registry.apmjs.dev/"` |
+
+```toml title="bunfig.toml"
+[install]
+registry = "https://registry.apmjs.dev/"
+```
+
+For the strict view, use `https://registry.apmjs.dev/~safe/` instead (see [The ~safe registry view](/guides/safe-view)).
+
+## 2. Commit the file
+
+The setting only reaches teammates and CI if the file is in the repository. Many projects ignore `.npmrc`, because it can hold tokens. Check before you commit:
+
+```bash
+git check-ignore -v .npmrc
+```
+
+No output means the file is not ignored. A line such as `.gitignore:4:.npmrc	.npmrc` means it is, and `git add .npmrc` refuses it. (A line whose pattern starts with `!`, such as `!.npmrc`, is a rule that un-ignores it.) Everyone else then keeps installing from npm, and nothing warns them. Remove that rule from `.gitignore` and run the check again. Keep tokens out of the project file: `apm login` and `npm login` write them to your user `.npmrc` in your home folder, not to the project's.
+
+Run the same check for `bunfig.toml` or `.yarnrc.yml`, then commit the file.
+
+## 3. Install, and know what the lockfile records
+
+Run your usual install. Each lockfile treats the registry differently:
+
+| Lockfile | What it records | Existing entries after you switch | New packages |
+| --- | --- | --- | --- |
+| `bun.lock` | The full tarball URL for packages from any registry but npm's (`"https://registry.apmjs.dev/ms/-/ms-2.1.3.tgz"`), and `""` for npm's | `""` entries download from the registry you set, so through apm | Get apm URLs |
+| `package-lock.json` | The full tarball URL in `resolved` | npm swaps the host of `https://registry.npmjs.org/` URLs for the registry you set, so they download through apm. The file keeps the npm URLs | Get apm URLs |
+| `pnpm-lock.yaml` | Only the checksum, no registry | Download from the registry you set | Same |
+| `yarn.lock` (yarn 1) | The full tarball URL in `resolved` | Keep downloading from `https://registry.yarnpkg.com/`. Rewrite them (below) to go through apm | Get apm URLs |
+| `yarn.lock` (yarn 2 and later) | Only the version and checksum, no registry | Download from the registry you set | Same |
+
+For yarn 1, point the existing entries at apm, then install from the rewritten lockfile:
+
+```bash
+sed -i.bak 's#https://registry\.yarnpkg\.com/#https://registry.apmjs.dev/#g' yarn.lock && rm yarn.lock.bak
+yarn install --frozen-lockfile
+```
+
+If you chose the `~safe` view, replace with `https://registry.apmjs.dev/~safe/` instead: yarn 1 downloads from the URL in the lockfile, so entries rewritten to the plain registry would skip the view's rules.
+
+`apm add` hands its own configured registry to the package manager it runs (apm's by default). So in bun and npm projects it writes apm URLs into the lockfile even before you add the setting.
+
+`apm add` asks your package manager for the exact version it checked (`ms@2.1.3`). With their default settings, bun and pnpm then write that exact version to `package.json` (`"ms": "2.1.3"`), where `bun add ms` and `pnpm add ms` write a range (`"ms": "^2.1.3"`); npm writes a range either way. If you want a range, edit `package.json` afterwards.
+
+## 4. CI and teammates
+
+Once the setting is committed, nothing else changes for them: `bun install --frozen-lockfile`, `npm ci`, `pnpm install --frozen-lockfile`, `yarn install --frozen-lockfile` and `yarn install --immutable` read it and install through apm. They don't need the apm CLI or an account.
+
+To make CI check what it installs, add `apm audit`. Without a login token, an audit of a project with many versions apm has not scored yet does not pass, and `apm audit` reads `node_modules`, so with yarn's Plug'n'Play it checks nothing. Read [Audit in CI](/guides/ci#audit-in-ci) first.
+
+## Stop using apm
+
+To switch a project back to npm's registry, delete the registry line (or the whole file, if it held nothing else), then take the apm URLs out of the lockfile. Do both: bun, npm and yarn 1 use the URL each lockfile entry records, so without the second step they keep downloading every locked package from apm. This works for packages that are on npm; a package published only to apm cannot be installed from npm.
+
+### bun
+
+Delete the `registry` line from `bunfig.toml`, then replace each apm URL in `bun.lock` with `""`, which is what bun writes for npm's registry:
+
+```bash
+sed -i.bak 's#"https://registry\.apmjs\.dev/[^"]*"#""#g' bun.lock && rm bun.lock.bak
+bun install --frozen-lockfile
+```
+
+The result is the same `bun.lock` bun writes when it installs from npm. Deleting `bunfig.toml` and running `bun install` on its own leaves every apm URL in place.
+
+### npm
+
+Delete the `registry` line from `.npmrc`, then:
+
+```bash
+sed -i.bak -e 's#https://registry\.apmjs\.dev/~safe/#https://registry.npmjs.org/#g' -e 's#https://registry\.apmjs\.dev/#https://registry.npmjs.org/#g' package-lock.json && rm package-lock.json.bak
+npm ci
+```
+
+The first expression covers a lockfile written through the `~safe` view.
+
+### pnpm
+
+Delete the `registry` line from `.npmrc`. That's all: `pnpm-lock.yaml` records no registry, so `pnpm install --frozen-lockfile` downloads from npm from then on.
+
+### yarn
+
+yarn 1: delete the `registry` line from `.npmrc`, then:
+
+```bash
+sed -i.bak -e 's#https://registry\.apmjs\.dev/~safe/#https://registry.yarnpkg.com/#g' -e 's#https://registry\.apmjs\.dev/#https://registry.yarnpkg.com/#g' yarn.lock && rm yarn.lock.bak
+yarn install --frozen-lockfile
+```
+
+yarn 2 and later: delete the `npmRegistryServer` line from `.yarnrc.yml`. The lockfile records no registry, so there is nothing else to change.
+
+### Check and commit
+
+No apm URL should be left. This prints `0` for `bun.lock`, `package-lock.json` or `yarn.lock`:
+
+```bash
+grep -Fc 'registry.apmjs.dev' package-lock.json
+```
+
+Commit the config change and the lockfile together, so CI and your teammates switch at the same time.
+
+Then clear what is left:
+
+- In CI, remove the `apm audit` step and the `APM_TOKEN` secret, and any `APM_REGISTRY` or `npm_config_registry` that points at apm. Without a registry setting the apm CLI still talks to apm, so a leftover audit step keeps running against it.
+- If you pointed your user config at apm (`~/.npmrc`, `~/.bunfig.toml`), remove the line there too.
+- To sign out, delete the `//registry.apmjs.dev/:_authToken=` line from your user `.npmrc` and revoke the token on your account page at `https://apmjs.dev/account`.
+- To remove the CLI, delete `~/.apm/bin/apm` (or `<dir>/bin/apm` if you installed with `APM_INSTALL=<dir>`; delete only that file, since the folder may hold other software), or run `brew uninstall opencoredev/tap/apm` if you installed it with Homebrew.

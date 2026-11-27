@@ -9,7 +9,7 @@ export const SITE_NAME = "apm";
 export const SITE_TITLE = "apm: check npm packages before you install them";
 
 export const SITE_DESCRIPTION =
-  "A package registry in front of npm. Every version gets a security score with the cited line behind every lost point, new versions wait 24 hours, and bad ones can be yanked or revoked. Works with bun, npm and pnpm.";
+  "A package registry in front of npm. Every version gets a security score with the cited line behind every lost point, and bad ones can be yanked or revoked. Works with bun, npm and pnpm.";
 
 /** Search engines show about this many characters of a description. */
 const DESCRIPTION_CHARS = 158;
@@ -67,7 +67,13 @@ function scoreWords(score: { score: number; grade: string }): ScoreWords {
   };
 }
 
-export function packageMetadata(p: PackageMeta): Metadata {
+/**
+ * `v`: the ?v= a share names, when it is not the default page's. The card and the Markdown alternate keep it, so both
+ * describe the release the page shows; the canonical URL stays the package's.
+ */
+export function packageMetadata(p: PackageMeta & { v?: string }): Metadata {
+  const query = p.v === undefined ? "" : `?v=${encodeURIComponent(p.v)}`;
+
   const words = p.score ? scoreWords(p.score) : null;
   const scoreText = words ? words.alt : "not scored by apm yet";
   const verdict = words ? words.verdict : `is ${scoreText}`;
@@ -78,13 +84,13 @@ export function packageMetadata(p: PackageMeta): Metadata {
   return {
     ...pageMetadata({
       title,
-      description: `${lead}${p.name}${p.latest ? ` ${p.latest}` : ""} ${verdict}. See every risk signal with its cited line, the AI review and how to install it.`,
+      description: `${lead}${p.name}${p.latest ? ` ${p.latest}` : ""} ${verdict}. See every risk signal with its cited line, the AI review and whether apm installs it.`,
       path: canonicalPackagePath(p.name),
-      image: `/og${canonicalPackagePath(p.name).slice("/package".length)}`,
+      image: `/og${canonicalPackagePath(p.name).slice("/package".length)}${query}`,
       imageAlt: `${p.name} on apm: ${scoreText}`,
     }),
     // the Markdown view of the same page, for agents
-    alternates: { canonical: canonicalPackagePath(p.name), types: { "text/markdown": `${canonicalPackagePath(p.name)}.md` } },
+    alternates: { canonical: canonicalPackagePath(p.name), types: { "text/markdown": `${canonicalPackagePath(p.name)}.md${query}` } },
   };
 }
 
@@ -128,7 +134,24 @@ export function packageJsonLd(p: PackageMeta & { license: string | null; reposit
   };
 }
 
-export type JsonLdDocument = ReturnType<typeof websiteJsonLd> | ReturnType<typeof packageJsonLd>;
+/** The home page's Organization JSON-LD: who runs apm, its logo and where else it lives. */
+export function organizationJsonLd() {
+  return {
+    "@context": "https://schema.org",
+    "@type": "Organization",
+    name: SITE_NAME,
+    alternateName: "apmjs",
+    url: `${SITE_URL}/`,
+    logo: `${SITE_URL}/apple-icon.png`,
+    sameAs: ["https://github.com/opencoredev/apmjs"],
+  };
+}
+
+export type JsonLdDocument =
+  | ReturnType<typeof websiteJsonLd>
+  | ReturnType<typeof packageJsonLd>
+  | ReturnType<typeof organizationJsonLd>
+;
 
 /** JSON-LD as a script body: `<` escaped so publisher text can't close the script element. */
 export function jsonLdText(data: JsonLdDocument): string {

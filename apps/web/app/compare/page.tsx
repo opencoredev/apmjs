@@ -34,7 +34,8 @@ function Rich({ text, onSurface = false }: { text: string; onSurface?: boolean }
   );
 }
 
-type Row = { label: string; npm: string; apm: string; same?: true };
+/** `link`: a page the apm side points to after its text, such as the exceptions to a claim. */
+type Row = { label: string; npm: string; apm: string; same?: true; link?: { href: string; text: string } };
 
 type Group = { title: string; rows: readonly Row[] };
 
@@ -59,10 +60,15 @@ const GROUPS: readonly Group[] = [
   {
     title: "Knowing what you install",
     rows: [
-      { label: "Safety signal", npm: "`npm audit` lists known CVEs only. Silent on new malware.", apm: "Score out of 100 with file:line evidence and a “not checked” list." },
+      { label: "Safety signal", npm: "`npm install` reports published advisories by default but does not block on them. Does not scan package code for new malware.", apm: "Score out of 100 with file:line evidence and a “not checked” list. Advisories are not in the score: in a project, `apm audit` lists the ones for what is installed." },
       { label: "Granularity", npm: "Third-party scores rate the whole package.", apm: "Every version scored. A new `curl | sh` or risky dependency drops it." },
       { label: "Metadata", npm: "Trusts the publish request, so install scripts can hide.", apm: "Read from the tarball’s package.json. A mismatch is refused." },
-      { label: "Install check", npm: "Installs first, audit afterwards.", apm: "`apm add` and `apm x` check the whole tree first." },
+      {
+        label: "Install check",
+        npm: "Installs, then reports advisories. Nothing blocks the install.",
+        apm: "With npm, pnpm and bun, `apm add` and `apm x` check the lockfile the manager computes, the whole tree, for revokes, malware, scores and the cooldown before anything installs. Advisories are not part of that check: after `apm add`, `apm audit` lists them.",
+        link: { href: "https://docs.apmjs.dev/concepts/security-model#how-apm-add-installs-what-it-checked", text: "Exceptions (yarn, npm git dependencies)" },
+      },
       { label: "Fresh releases", npm: "No cooldown by default.", apm: "24h cooldown: `apm add` warns about a version under a day old, `--strict` refuses it, and `/~safe/` leaves it out for any client, with a score floor of 40." },
     ],
   },
@@ -76,14 +82,14 @@ const GROUPS: readonly Group[] = [
   {
     title: "Names",
     rows: [
-      { label: "Typosquats", npm: "Blocks punctuation variants only.", apm: "Refuses one-edit look-alikes of popular packages. Search shows them next to your query." },
+      { label: "Typosquats", npm: "Blocks punctuation variants only.", apm: "Refuses look-alikes of popular packages on first publish: a scoped name whose bare part swaps two neighbouring letters of a popular name (`@you/raect`) or adds `.js`, `js`, `-js` or `.mjs` to one (`@you/expressjs`), and a near miss of a popular scoped name (`@type/node`). Search shows them next to your query." },
       { label: "Dependency confusion", npm: "Unscoped names are first come, first served.", apm: "New packages are scoped to your GitHub login. A bare name always means the npm package." },
     ],
   },
   {
     title: "Compatibility",
     rows: [
-      { label: "Bun", npm: "Just another client.", apm: "One `bunfig.toml` line makes plain `bun install` refuse revoked and confirmed-malicious versions and warn about low scores." },
+      { label: "Bun", npm: "Bun uses the npm registry by default.", apm: "One `bunfig.toml` line points plain `bun install` at apm, so new installs skip revoked, yanked and confirmed-malicious versions. The optional Bun scanner, which also warns about low scores, is not on a registry yet." },
       { label: "Coverage", npm: "Everything on npm.", apm: "Same packages, proxied from npm and scored on first request.", same: true },
     ],
   },
@@ -162,6 +168,14 @@ export default function Compare() {
                     <Mark kind={r.same ? "same" : "yes"} />
                     <span className="min-w-0">
                       <Rich text={r.apm} onSurface />
+                      {r.link && (
+                        <>
+                          {" "}
+                          <a href={r.link.href} className="text-foreground underline underline-offset-4">
+                            {r.link.text}
+                          </a>
+                        </>
+                      )}
                     </span>
                   </div>
                 </div>

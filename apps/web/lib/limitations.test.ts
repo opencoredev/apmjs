@@ -36,7 +36,7 @@ describe("sortLimitations", () => {
     expect(l.general).toEqual(GENERAL_LIMITS);
     expect(l.complex).toEqual([{ limit: "an expression that can be more than 6 values", files: "dist/smtp.cjs" }]);
     expect(l.other).toEqual([]);
-    expect(limitationCount(l)).toBe(GENERAL_LIMITS.length + 1);
+    expect(limitationCount(l)).toBe(GENERAL_LIMITS.length + 2);
   });
 
   test("today's notes, unread files and dependencies are sorted apart", () => {
@@ -55,7 +55,7 @@ describe("sortLimitations", () => {
     ]);
     expect(l.unread).toHaveLength(1);
     expect(l.dependencies).toEqual(["left-pad", "git+https://x"]);
-    expect(limitationCount(l)).toBe(GENERAL_LIMITS.length + 3);
+    expect(limitationCount(l)).toBe(GENERAL_LIMITS.length + 4);
   });
 
   test("an entry it does not recognize is kept as written", () => {
@@ -64,13 +64,14 @@ describe("sortLimitations", () => {
 });
 
 describe("summarizeLimitations", () => {
-  test("names runtime behavior, dependencies and a compromised publisher, and counts what the list shows", () => {
+  test("names runtime behavior, dependencies, a compromised publisher and known vulnerabilities, and counts what the list shows", () => {
     const s = summarizeLimitations(STORED_V9);
     expect(s.headline).toMatch(/runtime/);
     expect(s.headline).toMatch(/dependencies/);
     expect(s.headline).toMatch(/compromised publisher/);
+    expect(s.headline).toMatch(/known vulnerabilities/);
     expect(s.extra).toBeNull();
-    expect(s.total).toBe(GENERAL_LIMITS.length + 1);
+    expect(s.total).toBe(GENERAL_LIMITS.length + 2);
   });
 
   test("adds what is specific to the version", () => {

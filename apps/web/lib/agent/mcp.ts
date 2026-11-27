@@ -4,9 +4,14 @@
 import { z } from "zod";
 import { isNotAllRead, NOT_ALL_READ } from "../coverage";
 import { packagePath } from "../package-route";
-import { looksLikePackageName } from "../search-schema";
+import { looksLikeExistingPackageName, looksLikePackageName } from "../search-schema";
+import { scorerCapabilities, type ScorerCapabilities } from "../capabilities";
+import { installCommand, INSTALL_CLIENTS, type InstallClient } from "../install-note";
+import { notCheckedList } from "../limitations";
+import { mayPublish, publishability, publishabilityText } from "../publish-name";
+import { noInstallableReason, type Refusal } from "../refusal";
 import { capabilitiesOf } from "./capabilities";
-import { packageMarkdown, unscorableOf } from "./package-md";
+import { packageMarkdown, refusalOf, unscorableOf, type PackageView } from "./package-md";
 import { loadPackageView } from "./package-view";
 import { REGISTRY } from "../registry-url";
 import { siteUrl } from "./site";
@@ -21,7 +26,7 @@ export const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "202
 
 export const SERVER_INFO = { name: "apm", title: "apm package registry", version: "1.0.0" } as const;
 
-const INSTRUCTIONS = `apm scores every npm package version out of 100 with file:line evidence, and its install policy refuses versions yanked, revoked or confirmed malicious, and warns about (never refuses) a version under 24 hours old or a score under 40. Before adding a dependency, call explain_install and follow its verdict: install (run its command, then mention its notes: what apm did not finish), review-first (a real risk signal: show the reasons to the user and wait for approval), do-not-install, not-found (check the spelling; it may be a typosquat) or unknown (the registry did not answer). A score never means a version is safe; each answer says what was not checked. ${UNTRUSTED_NOTE}`;
+const INSTRUCTIONS = `apm scores every npm package version out of 100 with file:line evidence, and its install policy refuses versions yanked, revoked or confirmed malicious, and warns about (never refuses) a version under 24 hours old or a score under 40. Before adding a dependency, call explain_install and follow its verdict: install (run its command, then mention its notes: what apm did not finish), review-first (a real risk signal: show the reasons to the user and wait for approval), do-not-install, not-found (check the spelling; it may be a typosquat) or unknown (the registry did not answer, or apm has no score for the version: do not install yet; unless the answer says asking again will not help, ask again about 1, 2 and 4 minutes after the first ask, then tell the user). A score never means a version is safe; each answer says what was not checked. Known vulnerabilities (published security advisories) are not part of the score or the verdict: in a project, apm audit or npm audit lists the advisories for what is installed. ${UNTRUSTED_NOTE}`;
 
 // ---------- JSON-RPC ----------
 
@@ -48,14 +53,18 @@ export const rpcError = (id: RequestId | null, code: number, message: string): J
 
 // ---------- tools ----------
 
-const PackageName = z.string().trim().toLowerCase().refine(looksLikePackageName, "not a valid npm package name");
+/** A package to look up, as given: npm names are case-sensitive (JSONStream is not jsonstream). */
+const PackageName = z.string().trim().refine(looksLikeExistingPackageName, "not a valid npm package name");
+
+/** A name to claim: new names are lowercase. */
+const NewPackageName = z.string().trim().toLowerCase().refine(looksLikePackageName, "not a valid npm package name");
 
 const SearchInput = z.object({ query: z.string().trim().min(1).max(214).describe("Words or a package name"), limit: z.number().int().min(1).max(20).default(10).describe("How many hits to return") });
 
-const CheckPackageInput = z.object({ name: PackageName.describe("Package name, such as zod or @scope/name"), version: z.string().min(1).max(256).optional().describe("Exact version; latest when left out") });
+const CheckPackageInput = z.object({ name: PackageName.describe("Package name, such as zod or @scope/name"), version: z.string().min(1).max(256).optional().describe("Exact version or dist-tag; the version installs get by name when left out") });
 
 const CheckNameInput = z.object({
-  name: PackageName.describe("The name to check"),
+  name: NewPackageName.describe("The name to check"),
   scope: z
     .string()
     .trim()
@@ -113,6 +122,51 @@ const searchPackages: Tool<typeof SearchInput> = {
   },
 };
 
+/**
+ * What check_package's text says about installing, as data: the commands it gives, that apm refuses the version (and
+ * why, with advisory ids), or that the package has no version to install. The same view writes both, so they agree.
+ */
+type InstallAnswer =
+  | { kind: "commands"; via: "default" | "tag" | "exact"; commands: Record<InstallClient, string> }
+  | { kind: "refused"; refusal: Refusal }
+  | { kind: "none"; reason: string };
+
+function installAnswer(view: PackageView): InstallAnswer {
+  const { pkg, install } = view;
+
+  if (install.kind === "none") return { kind: "none", reason: noInstallableReason({ name: pkg.name, why: install.why }) };
+  const refusal = refusalOf(view);
+
+  if (refusal !== null) return { kind: "refused", refusal };
+
+  const commands = { apm: "", bun: "", npm: "", pnpm: "" } satisfies Record<InstallClient, string>;
+
+  for (const client of INSTALL_CLIENTS) commands[client] = installCommand({ client, name: pkg.name, install });
+
+  return { kind: "commands", via: install.kind, commands };
+}
+
+/**
+ * The legacy four-capability list, from the signals, raised to what the scorer's own list says when it has one (the
+ * text reads that list), so the two answers never say "seen" and "not seen" about the same thing.
+ */
+function legacyCapabilities(input: { signals: Parameters<typeof capabilitiesOf>[0]; listed: ScorerCapabilities | null }) {
+  const fromSignals = capabilitiesOf(input.signals);
+  const { listed } = input;
+
+  if (fromSignals === null || listed?.kind !== "listed") return fromSignals;
+  const LISTED_ID = { network: "network", "shell-exec": "shell", eval: "eval", "credential-access": null } as const;
+  const RANK = { "not seen": 0, possible: 1, seen: 2 } as const;
+
+  return fromSignals.map((c) => {
+    const id = LISTED_ID[c.id];
+    const found = id === null ? undefined : listed.capabilities.find((l) => l.id === id);
+    const state = found === undefined || found.basis === "none" ? "not seen" : found.basis === "code" ? "seen" : "possible";
+
+    return RANK[state] > RANK[c.state] ? { ...c, state } : c;
+  });
+}
+
 const checkPackage: Tool<typeof CheckPackageInput> = {
   name: "check_package",
   title: "Check a package",
@@ -124,21 +178,31 @@ const checkPackage: Tool<typeof CheckPackageInput> = {
     if (loaded.kind === "missing") return text(loaded.reason, { name, version: version ?? null, found: false }, true);
 
     if (loaded.kind === "unavailable") return unavailable(name);
-    const { pkg, version: shown, status, facts, score, review } = loaded.view;
+    const { view } = loaded;
+    const { pkg, version: shown, status, facts, score, review } = view;
+    const install = installAnswer(view);
+    const listed = score ? scorerCapabilities(score) : null;
 
-    return text(packageMarkdown(loaded.view), {
+    return text(packageMarkdown(view), {
       name: pkg.name,
       version: shown,
       latest: pkg.latest,
-      // the shown version's own state and facts, read without a cache
+      // the shown version's own state and facts, read without a cache; `refusal` says when apm will not install it anyway
       status,
+      // null when apm installs the shown version; why it does not (withheld with advisory ids, revoked, yanked) otherwise
+      refusal: install.kind === "refused" ? install.refusal : null,
+      // what resolve said for exactly the shown version, as the text says it: "unknown" when it did not answer, so apm may not serve it
+      installPolicy: install.kind === "refused" ? "refused" : install.kind === "none" ? null : view.policy.kind,
+      install,
       score: score ? { score: score.score, grade: score.grade } : null,
       // why apm can never score the shown version ({ reason, text }, the registry's words); null when it has a score or may get one
-      unscorable: unscorableOf(loaded.view),
+      unscorable: unscorableOf(view),
       signals: score?.signals ?? [],
-      capabilities: capabilitiesOf(score?.signals ?? null),
+      capabilities: legacyCapabilities({ signals: score?.signals ?? null, listed }),
+      // the scorer's own capability list, as the text gives it: listed, not sent by this registry, or not listed by an older scorer
+      scorerCapabilities: listed?.kind === "listed" ? { kind: "listed", capabilities: [...listed.capabilities] } : listed,
       facts,
-      notChecked: score?.notChecked ?? [],
+      notChecked: notCheckedList(score?.notChecked),
       aiReview: review.kind === "ok" ? { status: review.value.status, job: review.value.job ?? null, state: review.value.review?.state ?? null, findings: review.value.review?.findings ?? [] } : null,
       url: siteUrl(packagePath(pkg.name)),
     });
@@ -152,16 +216,25 @@ const checkName: Tool<typeof CheckNameInput> = {
   input: CheckNameInput,
   async run({ name, scope }, source) {
     const bare = scope?.replace(/^@/, "") ?? null;
-    const r = await source.names({ name, scope: bare });
+    // the caller's scope is a claim nobody checked: it picks where alternatives are looked up and which scope a bare name
+    // is suggested under, but never makes a scoped name "yours"
+    const claimed = name.startsWith("@") ? null : bare;
+    const [r, policy] = await Promise.all([source.names({ name, scope: bare }), source.namePolicy()]);
 
     if (!r) return unavailable(`the name check for ${name}`);
-    const lines: string[] = [];
+    const publishable = publishability({ name, available: r.available && r.valid && !r.taken && !r.unknown, scope: claimed, policy });
 
-    if (!r.valid) lines.push(`${name} is not a valid package name.`);
-    else if (r.taken) lines.push(`${name} is taken${r.owners.length ? ` by ${r.owners.map((m) => inlineCode(m)).join(", ")}` : ""}${r.latest ? `; latest ${inlineCode(r.latest.version)}${r.latest.score !== null ? `, score ${r.latest.score}/100` : ""}` : ""}.`);
-    else if (r.unknown) lines.push(`Could not check ${name}: npm did not answer.`);
-    else if (r.available) lines.push(`${name} is available.`);
-    else lines.push(`${name} is free but cannot be published: ${r.conflicts.map((c) => c.reason).join("; ")}`);
+    const verdict = !r.valid
+      ? `${name} is not a valid package name.`
+      : r.taken
+        ? `${name} is taken${r.owners.length ? ` by ${r.owners.map((m) => inlineCode(m)).join(", ")}` : ""}${r.latest ? `; latest ${inlineCode(r.latest.version)}${r.latest.score !== null ? `, score ${r.latest.score}/100` : ""}` : ""}.`
+        : r.unknown
+          ? `Could not check ${name}: npm did not answer.`
+          : r.available
+            ? publishabilityText({ name, publishable })
+            : `${name} is free but cannot be published: ${r.conflicts.map((c) => c.reason).join("; ")}`;
+
+    const lines = [verdict];
 
     for (const l of r.lookalikes) lines.push(`Look-alike: ${oneLine(l.reason)}`);
 
@@ -169,16 +242,20 @@ const checkName: Tool<typeof CheckNameInput> = {
     const free = r.suggestions.filter((s) => s.checked && s.available).map((s) => s.name);
 
     if (free.length > 0) lines.push(`Free${r.scope ? ` under @${r.scope}` : ""}: ${free.join(", ")}`);
-    else if (!bare) lines.push("Pass scope (your GitHub login) to check names under your own scope; a scoped name is always yours.");
+    else if (!bare) lines.push("Pass scope (your GitHub login) to check names under your own scope; a name under your own scope is always yours.");
 
-    return text(lines.join("\n"), { ...r });
+    // `available` is the text's answer, as in apm name --json: true only when the caller may publish the name here, which
+    // a bare name is only under an open name policy and an unverified caller never confirms for a scoped one
+    const available = mayPublish(publishable);
+
+    return text(lines.join("\n"), { ...r, available, reason: available ? null : verdict, publishable });
   },
 };
 
 const explain: Tool<typeof ExplainInput> = {
   name: "explain_install",
   title: "Should I install this?",
-  description: "Before adding a dependency: runs apm's install policy (revokes, confirmed malice, the dependency tree, and the 24-hour cooldown and the score floor of 40 as warnings) and the AI review for name@version, and answers install, review-first, do-not-install, not-found or unknown, with reasons, the command to run and notes. review-first is for a real risk (a risk the scorer found, a score under 40, an open AI review flag, a version inside the cooldown apm cannot clear) or an analysis apm could not finish (only files left unread for their size or the byte budget install, as a note); what apm has not done yet installs, listed in notes. A version inside the cooldown is swapped for the newest one in range past it.",
+  description: "Before adding a dependency: runs apm's install policy (revokes, confirmed malice, the dependency tree, and the 24-hour cooldown and the score floor of 40 as warnings) and the AI review for name@version, and answers install, review-first, do-not-install, not-found or unknown, with reasons, the command to run and notes. review-first is for a real risk (a risk the scorer found, a score under 40, an open AI review flag, a version inside the cooldown apm cannot clear) or an analysis apm could not finish (only files left unread for their size or the byte budget install, as a note); a version apm has no score for is unknown, with no command (while it is being analysed, and unless the answer says asking again will not help, ask again about 1, 2 and 4 minutes after the first ask; scoring is usually ready within about 5 minutes; if it is still unknown after the last retry, tell the user why and do not install); the rest of what apm has not done yet installs, listed in notes. A version inside the cooldown is swapped for the newest one in range past it. Known vulnerabilities (published security advisories) are not checked: in a project, apm audit or npm audit lists the advisories for what is installed.",
   input: ExplainInput,
   async run({ name, version }, source) {
     const verdict = await explainFor({ name, range: version ?? null, source });

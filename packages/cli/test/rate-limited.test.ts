@@ -141,7 +141,7 @@ describe("the retry deadline", () => {
     });
 
     try {
-      const api = new Api({ registry: slow.url.href, token: null, userconfig: "/unused", withheld: null });
+      const api = new Api({ registry: slow.url.href, token: null, userconfig: "/unused", withheld: null, registrySource: null });
       const waits: number[] = [];
       const out = await api.rawRetryingRateLimit("-/apm/v1/resolve?name=x", (w) => waits.push(w.waitMs), { tries: 3, maxMs: 3000 });
 
@@ -179,7 +179,7 @@ describe("a retry still running at the deadline", () => {
     });
 
     try {
-      const api = new Api({ registry: slow.url.href, token: null, userconfig: "/unused", withheld: null });
+      const api = new Api({ registry: slow.url.href, token: null, userconfig: "/unused", withheld: null, registrySource: null });
       const out = await api.rawRetryingRateLimit("-/apm/v1/resolve?name=x", () => {}, { tries: 3, maxMs: 1500 });
 
       expect(out.status).toBe(429);

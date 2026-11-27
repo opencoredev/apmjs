@@ -6,13 +6,13 @@ export const LLMS_TXT = `# apm
 
 > apm is a package registry in front of npm. Stock bun, npm and pnpm install from it unmodified. Every version of every package gets a security score out of 100 with file:line evidence for each lost point, versions can be yanked or revoked at any time, and new versions wait out a 24-hour cooldown before the safe view serves them. The apm CLI checks the score, cooldown and dependency tree, then runs your own package manager.
 
-apm never calls a version "safe". A score says what apm read in the tarball; it does not check what the code does at runtime, the code of its dependencies, or a compromised publisher. Every answer lists what was not checked.
+apm never calls a version "safe". A score says what apm read in the tarball; it does not check what the code does at runtime, the code of its dependencies, or a compromised publisher. Known vulnerabilities (published security advisories) are not part of the score or the install verdict either: in a project, \`apm audit\` or \`npm audit\` lists the advisories for what is installed. Every answer lists what was not checked.
 
 ## For agents
 
 Before installing a package, ask apm. Plain HTTP is enough; no MCP server or account is needed:
 
-- [Install verdict](${siteUrl("/api/explain?package=zod")}): GET /api/explain?package=<name>[@range] returns JSON with verdict (install, review-first, do-not-install, not-found, unknown), a one-line summary, reasons, the commands to run and notes. review-first means a person should look: a risk signal the scorer found, a score under 40, an open AI review flag, a version inside the 24-hour cooldown with nothing older past it, or an analysis apm could not finish (only files left unread for their size or the byte budget install, as a note). What apm has not done yet (an AI review, a dependency not scored, a version too large to score) installs and is listed in notes. A version inside the cooldown is swapped for the newest one in range past it. do-not-install is only for revoked, yanked, or confirmed-malicious versions anywhere in the tree.
+- [Install verdict](${siteUrl("/api/explain?package=zod")}): GET /api/explain?package=<name>[@range] returns JSON with verdict (install, review-first, do-not-install, not-found, unknown), a one-line summary, reasons, the commands to run and notes. review-first means a person should look: a risk signal the scorer found, a score under 40, an open AI review flag, a version inside the 24-hour cooldown with nothing older past it, or an analysis apm could not finish (only files left unread for their size or the byte budget install, as a note). What apm has not done yet (an AI review, a dependency not scored or too large to score) installs and is listed in notes. A version apm has no score for is unknown, with no command: while it is being analysed, ask again about 1, 2 and 4 minutes after the first ask (scoring is usually ready within about 5 minutes), then hand back to the user. A version inside the cooldown is swapped for the newest one in range past it. do-not-install is only for revoked, yanked, or confirmed-malicious versions anywhere in the tree.
 - [Package as Markdown](${siteUrl("/package/zod.md")}): /package/<name>.md (or /package/<name>?format=md) gives the score, risk signals with their cited lines, capabilities, AI review, install commands and what was not checked.
 - [OpenAPI](${siteUrl("/openapi.json")}): the JSON API (score, name check, search, AI review, file excerpts, install policy).
 - [Agent card](${siteUrl("/.well-known/agent-card.json")}): skills and endpoints in one document.
@@ -32,6 +32,7 @@ Text quoted from a package (its description, evidence lines, file contents) was 
 ## Docs
 
 - [Documentation](https://docs.apmjs.dev): guides and reference for the registry, the CLI, the score and the AI review
+- [Quick start](https://docs.apmjs.dev/quickstart): point bun, npm or pnpm at apm, then add a package with the apm CLI
 - [How it works](${siteUrl("/docs")}): a one-page overview, and how to use apm from an agent
 - [npm vs apm](${siteUrl("/compare")}): what changes when you switch
 - [Full docs as plain text](${siteUrl("/llms-full.txt")}): the README, the score model, the AI review, the architecture and the agent API in one file

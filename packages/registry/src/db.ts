@@ -1,6 +1,6 @@
 // Postgres storage for the registry (Neon through Hyperdrive in production). Rows are parsed into domain
 // types here, at the storage boundary. Every method is an Effect that fails with StoreError.
-import { Context, Effect, Layer } from "effect";
+import { Context, Duration, Effect, Layer } from "effect";
 import type { SqlError } from "effect/sql/SqlError";
 import * as SqlClient from "effect/sql/SqlClient";
 import { PgClient } from "@effect/sql-pg";
@@ -357,14 +357,12 @@ export type AnalysesWithin = { analyses: Map<string, UpstreamAnalyses>; sizes: M
  */
 export type AnalysisKey = { readonly package: string; readonly version: string; readonly digest: string | null; readonly trimmed?: boolean };
 
-/** An upstream package's analyses, its live dismissals and what it cannot score, as upstreamAnalyses reads them. */
+/** An upstream package's analyses, its live dismissals and what it cannot score, as pageRead reads them. */
 const AnalysesColumns = {
   analyses: z.array(z.object({ version: z.string(), digest: z.string(), analysis: z.unknown() })),
   dismissals: z.array(DismissalRow),
   unscorable: z.array(z.object({ version: z.string(), outcome: UnscorableReason, detail: z.string().nullable(), digest: z.string().nullable() })),
 };
-
-const AnalysesRow = z.object(AnalysesColumns);
 
 /** Store.pageRead's one row: the local columns, empty unless `pkg` is there, and the upstream ones, empty unless it is not. */
 const PageReadRow = z.object({
@@ -424,6 +422,23 @@ const PasskeyRow = z.object({ id: z.string(), credentialID: z.string(), publicKe
 
 /** One of an account's passkeys (Better Auth's table): the public key is base64 COSE, as WebAuthn registered it. */
 export type PasskeyRecord = z.infer<typeof PasskeyRow>;
+
+const PasskeyListRow = z.object({ id: z.string(), name: z.string().nullable(), aaguid: z.string().nullable(), created_at: IntOrNull, last_used_at: IntOrNull });
+
+/** One of an account's passkeys as the account page lists it: no key material. Times are epoch ms; null when unknown. */
+export type PasskeySummary = { id: string; name: string | null; aaguid: string | null; createdAt: number | null; lastUsedAt: number | null };
+
+/** How removing a passkey ended: `last-way-in` when it is the account's only passkey and no enabled provider is linked. */
+export type PasskeyRemoval = "removed" | "missing" | "last-way-in";
+
+/** The OAuth providers an account can sign in with, when the deploy has them on. */
+export type SignInProvider = "github" | "vercel";
+
+/** One answer from one of the account's passkeys: `credentialID` as WebAuthn names it, `at` in epoch ms. */
+export type PasskeyUse = { authUserId: string; credentialID: string; at: number };
+
+/** How long the write of a passkey's last use may take before it is dropped. */
+export const PASSKEY_USE_WAIT_MS = 500;
 
 /** Faults a test can switch on for one request (worker-test.ts); the deployed Worker never passes any. */
 export type StoreFault = "event-insert";
@@ -603,9 +618,9 @@ export type StoreApi = {
   readonly publishedSince: (user: string, since: number) => Effect.Effect<VersionRecord[], StoreError>;
 
   /**
-   * The current scorer's analyses of this package and the versions it decided it cannot score, in one query: its whole
-   * history as one value (next: 61 analyses, 16 MB), charged to no lease. No route reads it (Upstream.probeFor and
-   * chosen read only the versions they name, within their lease); the tests hold the narrower reads to it.
+   * The current scorer's analyses of this package and the versions it decided it cannot score: upstreamAnalysesOf for
+   * one name, charged to no lease. No route reads it (Upstream.probeFor and chosen read only the versions they name,
+   * within their lease); the tests hold the narrower reads to it.
    */
   readonly upstreamAnalyses: (name: string) => Effect.Effect<UpstreamAnalyses, StoreError>;
   /** upstreamAnalyses for several packages in three statements, keyed by package name; a package with neither is left out. */
@@ -852,6 +867,18 @@ export type StoreApi = {
   /** The account's passkeys, as WebAuthn verifies them. */
   readonly passkeysOf: (authUserId: string) => Effect.Effect<PasskeyRecord[], StoreError>;
   readonly setPasskeyCounter: (input: { id: string; counter: number }) => Effect.Effect<void, StoreError>;
+  /** The account's passkeys for the account page, oldest first: the same rows authFactors counts. */
+  readonly passkeyList: (authUserId: string) => Effect.Effect<PasskeySummary[], StoreError>;
+  /**
+   * Records that the account's passkey `credentialID` answered at `at` (a sign-in or a factor check), giving up after
+   * PASSKEY_USE_WAIT_MS. Display only: the Worker runs it after the response on a Store of its own (worker.ts).
+   */
+  readonly notePasskeyUse: (input: PasskeyUse) => Effect.Effect<void, StoreError>;
+  /**
+   * Deletes the account's passkey `id`, unless it is the account's last way to sign in: its only passkey, with no linked
+   * account of a provider in `providers` (the ones this deploy signs in with).
+   */
+  readonly removePasskey: (input: { authUserId: string; id: string; providers: readonly SignInProvider[] }) => Effect.Effect<PasskeyRemoval, StoreError>;
   /** A factor check made for one action from one session: what that action spends. */
   readonly issueConfirmation: (input: {
     sessionToken: string;
@@ -1054,7 +1081,7 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
     rows.length === 0 ? Effect.succeed(rows) : Effect.map(dismissalsOf([...new Set(rows.map((v) => v.package))]), (ds) => dismissedFrom(rows, ds));
 
   /** An upstream package's scores keyed by "<version> <digest>", each with its dismissed evidence left out, and what it cannot score. */
-  const analysesOf = (analyses: z.output<typeof AnalysesRow>["analyses"], dismissals: readonly DismissalRecord[], unscorable: z.output<typeof AnalysesRow>["unscorable"]): UpstreamAnalyses => ({
+  const analysesOf = (analyses: z.output<typeof PageReadRow>["analyses"], dismissals: readonly DismissalRecord[], unscorable: z.output<typeof PageReadRow>["unscorable"]): UpstreamAnalyses => ({
     // rows come oldest scorer first, so the current scorer's analysis of the same bytes replaces a reused v10 one
     scores: new Map(analyses.flatMap((a) => currentScore(a.analysis, dismissalsFor(dismissals, a.version, a.digest)).map((score) => [`${a.version} ${a.digest}`, score] as const))),
     unscorable: new Map(unscorable.map((u) => [u.version, { reason: u.outcome, detail: u.detail ?? "", digest: u.digest }] as const)),
@@ -1479,25 +1506,10 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
         all(VersionRow),
       ).pipe(Effect.flatMap(withDismissals)),
 
-    // the analyses and the package's live dismissals in one round trip: every read of an upstream package's scores
-    // (the package, score, file and readme answers) waits on it. One row holding two arrays, so each analysis and
-    // each dismissal is sent once: a join would repeat every dismissal on every analysis row.
-    upstreamAnalyses: (name) =>
-      Effect.gen(function* () {
-        const row = yield* run(
-          "upstreamAnalyses",
-          sql`SELECT
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', u.version, 'digest', u.digest, 'analysis', u.analysis) ORDER BY u.scorer), '[]'::jsonb)
-                   FROM upstream_analysis u WHERE u.package = ${name} AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis)))) AS analyses,
-                (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.dismissed_at, e.id), '[]'::jsonb)
-                   FROM evidence_dismissals e WHERE e.package = ${name} AND e.restored_at IS NULL) AS dismissals,
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', o.version, 'outcome', o.outcome, 'detail', o.detail, 'digest', o.digest) ORDER BY o.scorer), '[]'::jsonb)
-                   FROM analysis_outcomes o WHERE o.package = ${name} AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL) AS unscorable`,
-          one(AnalysesRow),
-        );
-
-        return analysesOf(row?.analyses ?? [], row?.dismissals ?? [], row?.unscorable ?? []);
-      }),
+    // upstreamAnalysesOf for one package: each analysis a row of its own. One row holding every analysis as a jsonb_agg
+    // value was next's whole history (61 analyses, about 16 MB), which production's connection dropped, so the ~safe
+    // and full packuments of next answered 503 (2026-11-26)
+    upstreamAnalyses: (name) => Effect.map(api.upstreamAnalysesOf([name]), (got) => got.get(name) ?? { scores: new Map(), unscorable: new Map() }),
     // getPackage, listVersions and owners, or keptPackage and upstreamAnalyses, as one statement: a package page's
     // answer waited on four round trips in a row before (each about 75 ms from production's Workers to Neon). The
     // local columns are read only when the package row is there, the upstream ones only when it is not, and the kept
@@ -1753,8 +1765,8 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
         if (names.length === 0) return new Map<string, UpstreamAnalyses>();
         const wanted = [...new Set(names)];
 
-        // the analyses, the decided outcomes and the live dismissals in one statement, so from one snapshot, as
-        // upstreamAnalyses reads them for one package: the walk reads them once a level. Each is a row of its own, so a
+        // the analyses, the decided outcomes and the live dismissals in one statement, so from one snapshot: the walk
+        // reads them once a level, upstreamAnalyses for one package. Each is a row of its own, so a
         // row holds one analysis at most: every stored analysis of next as one jsonb_agg value was tens of MB, which the
         // connection dropped (production, 2026-11-25)
         const items = yield* run(
@@ -2190,6 +2202,47 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
     passkeysOf: (authUserId) =>
       run("passkeysOf", sql`SELECT id, "credentialID", "publicKey", counter, transports FROM passkey WHERE "userId" = ${authUserId} ORDER BY "createdAt", id`, all(PasskeyRow)),
     setPasskeyCounter: (input) => run("setPasskeyCounter", sql`UPDATE passkey SET counter = ${input.counter} WHERE id = ${input.id}`, none),
+    passkeyList: (authUserId) =>
+      run(
+        "passkeyList",
+        sql`SELECT p.id, p.name, p.aaguid, (extract(epoch FROM p."createdAt") * 1000)::bigint AS created_at, u.last_used_at
+            FROM passkey p LEFT JOIN passkey_uses u ON u.passkey_id = p.id
+            WHERE p."userId" = ${authUserId} ORDER BY p."createdAt", p.id`,
+        all(PasskeyListRow.transform((row) => ({ id: row.id, name: row.name, aaguid: row.aaguid, createdAt: row.created_at, lastUsedAt: row.last_used_at }))),
+      ),
+    notePasskeyUse: (input) =>
+      run(
+        "notePasskeyUse",
+        sql`INSERT INTO passkey_uses (passkey_id, last_used_at)
+            SELECT id, ${input.at} FROM passkey WHERE "credentialID" = ${input.credentialID} AND "userId" = ${input.authUserId}
+            ON CONFLICT (passkey_id) DO UPDATE SET last_used_at = GREATEST(passkey_uses.last_used_at, EXCLUDED.last_used_at)`,
+        none,
+      ).pipe(Effect.timeoutOption(Duration.millis(PASSKEY_USE_WAIT_MS)), Effect.asVoid),
+    removePasskey: (input) =>
+      guard.transaction(
+        "removePasskey",
+        sql.withTransaction(
+          Effect.gen(function* () {
+            // one account's removals queue behind each other, so two cannot each see the other's passkey and both go
+            yield* run("removePasskey: lock", sql`SELECT pg_advisory_xact_lock(hashtextextended(${`passkey:${input.authUserId}`}, 0)) IS NULL AS locked`, none);
+
+            const ways = yield* run(
+              "removePasskey: ways in",
+              sql`SELECT EXISTS (SELECT 1 FROM passkey WHERE id = ${input.id} AND "userId" = ${input.authUserId}) AS mine,
+                         (SELECT count(*) FROM passkey WHERE "userId" = ${input.authUserId}) AS passkeys,
+                         (SELECT count(*) FROM account WHERE "userId" = ${input.authUserId} AND "providerId" = ANY(${[...input.providers]})) AS linked`,
+              z.tuple([z.object({ mine: z.boolean(), passkeys: Int, linked: Int })]).transform(([row]) => row),
+            );
+
+            if (!ways.mine) return "missing" satisfies PasskeyRemoval;
+
+            if (ways.linked === 0 && ways.passkeys <= 1) return "last-way-in" satisfies PasskeyRemoval;
+            yield* run("removePasskey", sql`DELETE FROM passkey WHERE id = ${input.id} AND "userId" = ${input.authUserId}`, none);
+
+            return "removed" satisfies PasskeyRemoval;
+          }),
+        ),
+      ),
     issueConfirmation: (input) => {
       const id = newConfirmationId();
       const expiresAt = input.at + CONFIRMATION_MS;

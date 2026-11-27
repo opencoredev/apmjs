@@ -10,7 +10,7 @@ import { Auth, PasskeyAssertion, type ConfirmFactor } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
-import { Store, type StagedRecord, type User } from "./db.ts";
+import { Store, type SignInProvider, type StagedRecord, type User } from "./db.ts";
 import { refuse } from "./errors.ts";
 import { fail, json, parseOptionalBody } from "./http.ts";
 import { WORKER_MAX_UNPACKED_BYTES } from "./analysis.ts";
@@ -30,6 +30,7 @@ const ApproveBody = z.object({ ...ProofFields, confirmName: z.string().optional(
 const VerifyBody = z.object({ ...ProofFields, command: LiveAction });
 const DeviceTokenBody = z.object({ deviceCode: z.string().min(1) });
 const RevokeTokenBody = z.object({ id: z.string().min(8) });
+const RemovePasskeyBody = z.object({ ...ProofFields, id: z.string().min(1).max(64) });
 const ChallengeBody = z.object({ action: SessionAction });
 
 /** One factor made for one action: a code from the app, a recovery code, or the answer to the passkey challenge made for it. */
@@ -54,6 +55,8 @@ function confirmFactor(body: z.infer<typeof ConfirmBody>): { kind: "ok"; factor:
 }
 
 const now = Effect.flatMap(Clock, (c) => c.now);
+
+const SIGN_IN_PROVIDERS = ["github", "vercel"] as const satisfies readonly SignInProvider[];
 
 /** File contents the approval page shows, at most. */
 const MAX_FILE_TEXT = 512 * 1024;
@@ -259,6 +262,9 @@ export const accountRoute = (req: Request, url: URL) =>
       const { s, user } = yield* signedIn(req);
       const profile = yield* auth.profileOf(s.authUserId);
       const factors = yield* auth.factors(s.authUserId);
+      // the count the page shows is the length of the list it shows: the same rows, read once
+      const passkeys = yield* auth.passkeys(s.authUserId);
+      const iso = (ms: number | null) => (ms === null ? null : new Date(ms).toISOString());
 
       const tokens = user
         ? (yield* store.listTokens(user.name)).map((t) => ({
@@ -285,8 +291,9 @@ export const accountRoute = (req: Request, url: URL) =>
         email: profile?.email ?? "",
         image: profile?.image ?? null,
         linked: yield* auth.linked(s.authUserId),
-        security: { totp: factors.totp, passkeys: factors.passkeys },
-        canPublish: user !== null && (factors.totp || factors.passkeys > 0),
+        security: { totp: factors.totp, passkeys: passkeys.length },
+        passkeys: passkeys.map((p) => ({ id: p.id, name: p.name, provider: p.provider, createdAt: iso(p.createdAt), lastUsedAt: iso(p.lastUsedAt) })),
+        canPublish: user !== null && (factors.totp || passkeys.length > 0),
         tokens,
         pending,
       });
@@ -318,6 +325,31 @@ export const accountRoute = (req: Request, url: URL) =>
       yield* store.revokeToken(one.token_hash, yield* now);
 
       return json({ ok: true });
+    }
+
+    // Removing a passkey takes a fresh factor made to remove exactly that one (it may be the passkey itself), and never
+    // the account's last way in: an account with no linked provider this deploy signs in with keeps its last passkey.
+    if (rest === "account/passkeys/remove" && req.method === "POST") {
+      yield* requireSiteOrigin(req);
+      const who = yield* signedIn(req);
+      const body = yield* parseOptionalBody(req, RemovePasskeyBody);
+      yield* secondFactor({ session: who.s, body, action: { kind: "passkey-remove", id: body.id } });
+      const { providers } = yield* Auth;
+      const removal = yield* store.removePasskey({ authUserId: who.s.authUserId, id: body.id, providers: SIGN_IN_PROVIDERS.filter((p) => providers[p]) });
+
+      switch (removal) {
+        case "removed":
+          return json({ ok: true });
+        case "missing":
+          return fail(404, "No such passkey on this account.");
+        case "last-way-in":
+          return fail(409, "This passkey is the only way to sign in to this account. Link GitHub or add another passkey before you remove it.");
+        default: {
+          const _exhaustive: never = removal;
+
+          return _exhaustive;
+        }
+      }
     }
 
     // ---------- a second factor for one website action ----------

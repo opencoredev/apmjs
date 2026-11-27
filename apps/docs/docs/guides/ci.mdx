@@ -10,9 +10,9 @@ You can run apm's checks in CI today. Publishing from CI works too, but every ve
 | In CI you want to | Use | Status |
 | --- | --- | --- |
 | Fail the install on revoked or low-scoring versions (by default a low score only warns) | `apm add --strict` or `registry=https://registry.apmjs.dev/~safe/` | Works |
-| Install only versions that pass the cooldown and floor with npm or pnpm | `registry=https://registry.apmjs.dev/~safe/` | Works |
+| Install only versions that pass the cooldown and floor with npm or pnpm | `registry=https://registry.apmjs.dev/~safe/` | Works, but when no version of a package passes, the view lists none (Next.js today; see below) |
 | Run the Bun security scanner automatically on `bun install` | `@apm/bun-scanner` (not on a registry yet; strict mode cannot run from a local path) | Not published yet |
-| Fail the build on revoked versions already in the lockfile | `apm audit` | Works |
+| Fail the build on revoked versions already installed | `apm audit` | Works with a login token in `APM_TOKEN`. Without one, it passes only once apm has scored every installed version. It reads `node_modules`, so not yarn Plug'n'Play ([see below](#audit-in-ci)) |
 | Upload a version from CI | `apm publish` with a login token | Works; the version is staged and a person approves it |
 | Publish live from CI with no person | OIDC trusted publishing | Does not exist |
 | Attach build provenance | Sigstore provenance | Does not exist |
@@ -25,15 +25,69 @@ A score informs; it does not block, so by default a low or missing score only wa
 registry=https://registry.apmjs.dev/~safe/
 ```
 
-The view also hides versions apm has not fully analysed, so a large package can fail to install through it.
+The view also hides every version apm has not fully read, so it can withhold all of a very large package. Today that includes `next`: the view lists no version of it, and `npm install` or `pnpm install` fails with no matching version. If you accept that gap for such a package, keep the plain registry (`registry=https://registry.apmjs.dev/`) and run `apm add` without `--strict` (and with `APM_STRICT` unset): it warns that apm read only part of the package and installs it. `apm add --strict` refuses the same partial read, and `apm audit` reports it and exits non-zero, so a CI job that fails on audit fails on that package too. If you need full coverage, skip the package or pick a version that passes.
 
 For Bun, the [Bun scanner](/guides/bun-scanner) is not published on a registry yet (and strict mode refuses local `file:` dependencies, including itself), so use `bunfig.toml` pointed at `https://registry.apmjs.dev/~safe/` and run `apm audit --json` in CI until `@apm/bun-scanner` is published.
 
-After the install, audit what was installed. `apm audit` exits non-zero on a revoked or advised version, and also when anything could not be checked:
+The registry setting only reaches CI if the file that holds it is committed. Run `git check-ignore -v .npmrc` (or `bunfig.toml`, `.yarnrc.yml`): if it prints a rule that does not start with `!`, the file is ignored, and CI and your teammates install from npm without any warning. [Move an existing project to apm](/guides/migrate#2-commit-the-file) has the fix.
+
+## Audit in CI
+
+After the install, audit what was installed. `apm audit` exits non-zero on a revoked or advised version, and also when anything could not be checked, including a version apm has not scored yet:
 
 ```bash
 apm audit --json
 ```
+
+`apm audit` checks the packages in `node_modules`, not the lockfile. With yarn 2 and later on its default Plug'n'Play linker there is no `node_modules`, and the audit reports `"checked": 0` and passes. Set `nodeLinker: node-modules` in `.yarnrc.yml` for projects you audit.
+
+### Without a token
+
+A CI job with no apm token audits anonymously. apm sends the installed versions to the registry 200 at a time, and for each request the registry queues at most 8 versions that have no score yet. Every other unscored version comes back as not checked:
+
+```text
+unchecked semver@7.8.2  not checked: anonymous scan queues at most 8 unscored packages per request; sign in (apm login) to queue more
+```
+
+So an anonymous audit fails on a project with more than a handful of versions nobody has scored yet, which is common right after you move a real app to apm. Scores are shared: once a version has been scored, every later audit, yours or anyone's, uses that score. The anonymous audit still reports revoked, yanked and confirmed-malicious versions and versions on the OSSF malicious-packages list, because the registry checks those before it looks at the score. Upstream advisories come from a separate request; when it fails, the affected packages are listed under `unchecked` with `advisories could not be fetched from the upstream registry`.
+
+To fail the job on what was found and on every check that could not run, but not on versions that are only waiting for a score, read the JSON. This needs `jq`:
+
+```bash
+apm audit --json > audit.json || true
+jq '.unchecked' audit.json
+jq -e '
+  (.findings | type == "array") and (.findings | length == 0) and (.checked > 0) and
+  ([.unchecked[] | select(.reason | (startswith("not checked: anonymous scan queues") or startswith("not scored yet")) | not)] | length == 0)
+' audit.json
+```
+
+The last command passes only when nothing was found and the only unchecked entries are versions over the anonymous queue cap or still being analysed. It fails when the audit produced no result (for example `{"ok": false, "error": ...}` when the registry cannot be reached), found no packages in `node_modules`, or could not fetch advisories or read a package.
+
+### With a login token
+
+A request with a valid token has no cap on how many unscored versions it queues, and the registry accepts up to 2,000 packages per request (apm still sends 200 at a time). There is no separate CI token type yet; use the token `apm login` gives you:
+
+1. On your own machine, run `APM_REGISTRY=https://registry.apmjs.dev/ apm login`, open the link it prints, check the code and approve. Setting `APM_REGISTRY` keeps a project `.npmrc` that points at `~safe` from changing which registry the token is saved for. apm writes the token to your user `.npmrc`, on the `//registry.apmjs.dev/:_authToken=` line.
+2. Copy that token into a CI secret and expose it as `APM_TOKEN` to the audit step, with `APM_REGISTRY` pinned to the registry the token belongs to. In GitHub Actions:
+
+   ```yaml
+   - name: apm audit
+     env:
+       APM_TOKEN: ${{ secrets.APM_TOKEN }}
+       APM_REGISTRY: https://registry.apmjs.dev/
+     run: |
+       apm whoami
+       apm audit --json
+   ```
+
+   `apm whoami` stops the job with `not logged in` when the token no longer works. Without it, a revoked or expired token makes `apm audit` run as anonymous.
+
+apm sends `APM_TOKEN` only when the registry it talks to is the one the token is bound to: `APM_REGISTRY`, else `registry=` in your user `.npmrc`, else `https://registry.apmjs.dev/` (host, path and protocol must match). It also keeps `APM_TOKEN` out of the environment of the package manager, install scripts and binaries it runs. The example sets `APM_REGISTRY` for that reason: without it, a project `.npmrc` that points at the `~safe` view makes apm talk to `https://registry.apmjs.dev/~safe/`, hold the token back and print `APM_TOKEN is for https://registry.apmjs.dev/, so it is not sent to ...`.
+
+The token has the powers the warning under [Upload from CI](#upload-from-ci) describes, so treat it like a publish token.
+
+Signed in or not, a version queued for analysis needs time to get its score. `apm audit` keeps asking for 90 s (`APM_PENDING_WAIT_MS`), then lists what is still being analysed as `not scored yet`, and the audit is not a pass. That can take seconds, or several minutes when the analysis queue is busy. Run the job again later, or raise `APM_PENDING_WAIT_MS`.
 
 ## Upload from CI
 

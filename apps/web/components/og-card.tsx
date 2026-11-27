@@ -5,6 +5,7 @@ import { MARK_INK, MARK_PULLED, WORD } from "@/components/logo";
 import { toneOf, type Tone } from "@/components/score-badge";
 import { isNotAllRead, NOT_ALL_READ } from "@/lib/coverage";
 import type { PackageInfo } from "@/lib/registry";
+import { sharedDefault } from "@/lib/shown-version";
 
 export const OG_SIZE = { width: 1200, height: 630 };
 
@@ -57,11 +58,17 @@ export function siteCard() {
  */
 export type PackageCardInput = { readonly name: string; readonly version: string | null; readonly score: number | null; readonly grade: string | null };
 
-/** The card's input from the package answer; with no answer (the registry down), the name alone, unscored. */
+/**
+ * The card's input from the package answer: the version installs get by name, with that version's own score. With no
+ * answer (the registry down), the name alone, unscored.
+ */
 export function packageCardInput(input: { name: string; pkg: PackageInfo | null }): PackageCardInput {
   const { pkg } = input;
 
-  return { name: pkg?.name ?? input.name, version: pkg?.latest ?? null, score: pkg?.score?.score ?? null, grade: pkg?.score?.grade ?? null };
+  if (pkg === null) return { name: input.name, version: null, score: null, grade: null };
+  const share = sharedDefault(pkg);
+
+  return { name: pkg.name, version: share.version, score: share.score?.score ?? null, grade: share.score?.grade ?? null };
 }
 
 export function packageCard(input: PackageCardInput) {
