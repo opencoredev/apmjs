@@ -716,8 +716,11 @@ function trimSpaces(s: string): string {
  * cmd.exe runs before the one on the PATH. Anything else is read as fetching, as before.
  */
 export function netToolsInert(cmd: string, shipsNetTool = false): boolean {
-  if (shipsNetTool || !NET_TOOL_MENTION.test(cmd)) return false;
+  return !shipsNetTool && NET_TOOL_MENTION.test(cmd) && onlyInertShapes(cmd);
+}
 
+/** Whether `cmd` is a list of only the shapes netToolsInert clears, so it runs none of the package's code. */
+export function onlyInertShapes(cmd: string): boolean {
   return cmd
     .split(LIST_SEPARATOR)
     .map(trimSpaces)

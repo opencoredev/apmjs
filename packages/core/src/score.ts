@@ -10,7 +10,7 @@ import { boundedManifest, MANIFEST_LIMITS, measureManifest } from "./manifest.ts
 import { MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { charge, chargeText, inPhase, MAX_ANALYSIS_WORK, Meter, MeterExhausted, PHASE_NAMES, withMeter, type Phase } from "./meter.ts";
 import { isEstablishedName, typoConflicts, type NameHistory } from "./names.ts";
-import { commandWords, commandWordsWithin, expandHooks, gypCommands, isInlineDownload, otherScripts, withoutInertNetTools, type ExpandedHook, type HookKind, type ShellWords } from "./scripts.ts";
+import { commandWords, commandWordsWithin, expandHooks, gypCommands, isInlineDownload, onlyInertShapes, otherScripts, withoutInertNetTools, type ExpandedHook, type HookKind, type ShellWords } from "./scripts.ts";
 import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type Lang, type ExecutedCode, type FlowFinding, type Hidden, type Imports, type TextFinding } from "./source.ts";
 import { scanTextRules } from "./textrules.ts";
 import { keptBytes, MAX_KEPT_VIEW_BYTES, scanBinaryImports, scanBinaryText, type BinaryTextScan } from "./binary-text.ts";
@@ -1134,6 +1134,11 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
   // a git install also installs devDependencies before it runs prepare
   const gitInstalled = depNames(manifest, ["dependencies", "optionalDependencies", "peerDependencies", "devDependencies"]);
 
+  // a hook's own text is surely what npm runs from the package's root with its shell, and the root holds what the
+  // tarball does only when nothing of this package runs before it at install: every hook that runs on the installer's
+  // machine is itself one netToolsInert clears, so none writes a program cmd.exe would find first
+  const stableRoot = hooks.every((h) => h.kind === "publish" || h.commands.every((c) => c.from === `scripts.${h.hook}` && onlyInertShapes(c.text)));
+
   for (const h of hooks) {
     const own = h.commands[0]?.text ?? "";
 
@@ -1142,10 +1147,9 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
 
     for (const c of h.commands) {
       const label = `package.json ${c.from}: ${c.text.slice(0, 80)}`;
-      // only the hook's own text is surely what npm runs, from the package's root with its shell: a script it follows may
-      // be another package's (a workspace, a moved shell), and one inside another shell or decoded from a string runs
-      // elsewhere, so those are read as before
-      const root = c.from === `scripts.${h.hook}` ? { shipsNetTool } : null;
+      // only the hook's own text: a script it follows may be another package's (a workspace, a moved shell), and one
+      // inside another shell or decoded from a string runs elsewhere, so those are read as before
+      const root = stableRoot && c.from === `scripts.${h.hook}` ? { shipsNetTool } : null;
 
       if (h.kind !== "publish" && isInlineDownload(c.text, { viaEval: c.viaEval, localBins: h.kind === "git" ? gitInstalled : installed, hook: root ?? undefined })) {
         found.add("install-download", label);
@@ -1855,7 +1859,8 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
 
   // a hook whose commands apm stopped expanding runs commands apm did not read
   for (const h of hooks) if (h.cut !== null && h.kind !== "publish") add("incomplete", `scripts.${h.hook}: apm stopped reading the commands it runs at ${h.cut}`);
-  const hookEvidence = analyzeHooks(found, manifest, hooks, files.some((f) => /^(?:curl|wget)(?:\.[^/]*)?$/i.test(f.path)));
+  // a root file named like curl or wget, or a binding.gyp, whose build npm may run at install, keeps the reading
+  const hookEvidence = analyzeHooks(found, manifest, hooks, files.some((f) => /^(?:curl|wget)(?:\.[^/]*)?$/i.test(f.path) || f.path === "binding.gyp"));
 
   // what runs on the installing machine: install hooks, and the git hooks npm runs when it installs from git
   // every hook's commands before what only the shell reading adds to any of them (HookCommand.added)
