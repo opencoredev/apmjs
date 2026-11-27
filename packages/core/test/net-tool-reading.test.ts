@@ -83,6 +83,14 @@ describe("a curl or wget that fetches nothing adds no install-time signal", () =
     expect(evidence("sh -c 'curl --version'")).toBe(2);
   });
 
+  test("a script followed in a hook that may run npm in another folder keeps its reading", () => {
+    for (const postinstall of ["cd tools && npm run check", "npm --prefix tools run check", "npm run -w tools check"]) {
+      const r = scoreOf({ postinstall, check: "curl --version" });
+
+      expect(r.ids).toContain("install-download");
+    }
+  });
+
   test("the same call behind npm run -s", () => {
     const r = scoreOf({ postinstall: "npm run -s check", check: "curl --version" });
 
