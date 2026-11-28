@@ -43,10 +43,10 @@ apm audit --json
 
 ### Without a token
 
-A CI job with no apm token audits anonymously. apm sends the installed versions to the registry 200 at a time, and for each request the registry queues at most 8 versions that have no score yet. Every other unscored version comes back as not checked:
+A CI job with no apm token audits anonymously. apm sends the installed versions to the registry 200 at a time, and for each request the registry queues at most 8 versions that have no score yet. If a version still needs analysis when those slots run out, it comes back as not checked. A plain `apm audit` prints a line like this for a made-up `some-dep`:
 
 ```text
-unchecked semver@7.8.2  not checked: anonymous scan queues at most 8 unscored packages per request; sign in (apm login) to queue more
+unchecked some-dep@1.0.0  not checked: anonymous scan queues at most 8 unscored packages per request; sign in (apm login) to queue more
 ```
 
 So an anonymous audit fails on a project with more than a handful of versions nobody has scored yet, which is common right after you move a real app to apm. Scores are shared: once a version has been scored, every later audit, yours or anyone's, uses that score. The anonymous audit still reports revoked, yanked and confirmed-malicious versions and versions on the OSSF malicious-packages list, because the registry checks those before it looks at the score. Upstream advisories come from a separate request; when it fails, the affected packages are listed under `unchecked` with `advisories could not be fetched from the upstream registry`.

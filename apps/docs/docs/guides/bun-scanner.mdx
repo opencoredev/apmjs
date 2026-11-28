@@ -48,13 +48,14 @@ Run `bun install`. A cancelled install stops with the package, the version and t
 
 ## How a warning reaches you
 
-Bun treats a `warn` advisory differently in a terminal and elsewhere: in a terminal it shows the advisory and asks whether to continue, and anywhere else (CI, a script) it cancels the install. So the scanner hands Bun `warn` advisories only when Bun can ask. Elsewhere it prints the same text to stderr and lets the install continue:
+Bun treats a `warn` advisory differently in a terminal and elsewhere: in a terminal it shows the advisory and asks whether to continue, and anywhere else (CI, a script) it cancels the install. So the scanner hands Bun `warn` advisories only when Bun can ask. Elsewhere it prints the same text to stderr and lets the install continue. For a made-up `some-package`:
 
 ```text
-apm scanner: warning: left-pad@1.3.0: scores 30/100 (F), under the floor of 40
-    - Sends what it collected: index.js:12: fetch(…) (sends the whole environment in a request)
-    https://apmjs.dev/package/left-pad?v=1.3.0
+apm scanner: warning: some-package@1.3.0: scores 29/100 (F), under the floor of 40
+    - Collects the environment, secrets or machine details and uses the network in the same code: index.js:12: fetch(…) (sends the whole environment in a request)
+    - Runs a script at install time (preinstall, install or postinstall): package.json scripts.postinstall: node setup.js
   apm lets it install; APM_SCANNER_STRICT=1 refuses it.
+  https://apmjs.dev/package/some-package?v=1.3.0
 ```
 
 ## Which registry it asks
@@ -71,8 +72,8 @@ It never takes a registry from package data, so a tarball URL in a lockfile cann
 A version nobody has scored yet is queued for analysis. The scanner treats it as pending, never as clean: it asks again every few seconds for up to 60 s, printing which packages it is waiting for. A cold package can get its score in seconds, but when the analysis queue is busy it can take minutes. Once it has a score, the install goes ahead, with a warning if the score is under 40. Anything still pending after 60 s is a warning ("not scored yet"), and with `APM_SCANNER_STRICT=1` it cancels the install:
 
 ```text
-apm scanner: waiting for 1 package(s) the registry is still analysing (0s of 60s): left-pad@1.3.0
-error: left-pad@1.3.0 is still being analysed by https://registry.apmjs.dev/ (waited 60s). APM_SCANNER_STRICT=1 installs no version before it has a score; try again in a minute.
+apm scanner: waiting for 1 package(s) the registry is still analysing (0s of 60s): some-package@1.3.0
+error: some-package@1.3.0 is still being analysed by https://registry.apmjs.dev/ (waited 60s). APM_SCANNER_STRICT=1 installs no version before it has a score; try again in a minute.
 ```
 
 Set `APM_SCANNER_WAIT_MS` to wait longer or shorter.
