@@ -167,6 +167,7 @@ If a package is refused, apm says why and whether `--force` would help. A packag
 
 ## Next steps
 
+- Get apm's install verdict before you add a package: `apm explain <package>` or, without the CLI, `GET https://apmjs.dev/api/explain?package=<name>`. Neither needs an account. The endpoint applies `apm explain`'s default rules to apm's public registry, has no strict mode, and waits up to 3 seconds for a version still being scored, so it can answer `unknown` sooner.
 - See every signal and its evidence: `apm score <package>`, or the version page on `https://apmjs.dev`.
 - Move a whole project to apm, or back: [Move an existing project to apm](/guides/migrate).
 - Publish a package: [Publish a package](/guides/publishing).
