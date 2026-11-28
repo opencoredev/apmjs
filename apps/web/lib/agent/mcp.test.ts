@@ -88,7 +88,7 @@ describe("tools", () => {
     });
 
     expect(r.isError).toBe(false);
-    expect(r.text).toContain('1 of 2 for "pad":');
+    expect(r.text).toContain("1 of 2 for `pad`:");
     expect(r.text).toContain("- left-pad@1.3.0 score 75/100 (B), 1000 downloads/week: `String left pad`");
     expect(r.text).not.toContain("right-pad");
     expect(r.calls).toEqual(["search pad"]);
@@ -108,7 +108,7 @@ describe("tools", () => {
     const r = await call("check_package", { name: "nope" });
 
     expect(r.isError).toBe(true);
-    expect(r.text).toBe("No package named nope on apm or npm.");
+    expect(r.text).toBe("No package named `nope` on apm or npm.");
   });
 
   // npm names are case-sensitive: JSONStream (1.3.5) and jsonstream (1.0.3) are two packages

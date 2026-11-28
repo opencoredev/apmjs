@@ -116,7 +116,9 @@ const searchPackages: Tool<typeof SearchInput> = {
         `- ${oneLine(h.name)}@${oneLine(h.version)}${h.score ? ` score ${h.score.score}/100 (${isNotAllRead(h.score.grade) ? NOT_ALL_READ : oneLine(h.score.grade)})` : " (not scored yet)"}${h.weeklyDownloads !== null ? `, ${h.weeklyDownloads} downloads/week` : ""}${h.source === "local" ? ", published to apm" : ""}${h.description ? `: ${inlineCode(oneLine(h.description).slice(0, 160))}` : ""}`,
     );
 
-    const head = hits.length === 0 ? `Nothing matches "${query}".` : `${hits.length} of ${answer.total} for "${query}"${answer.upstreamFailed ? " (npm did not answer; apm packages only)" : ""}:`;
+    // the query is the caller's text, which may come from a page an attacker wrote: quoted as data
+    const asked = inlineCode(query);
+    const head = hits.length === 0 ? `Nothing matches ${asked}.` : `${hits.length} of ${answer.total} for ${asked}${answer.upstreamFailed ? " (npm did not answer; apm packages only)" : ""}:`;
 
     return text([head, ...lines, "", UNTRUSTED_NOTE].join("\n"), { query, total: answer.total, upstreamFailed: answer.upstreamFailed, hits });
   },
@@ -372,7 +374,7 @@ export async function handleMessage(message: Message, source: AgentSource): Prom
       if (!call.success) return rpcError(id, RPC.invalidParams, "tools/call needs a tool name.");
       const tool = TOOLS.find((t) => t.name === call.data.name);
 
-      if (!tool) return rpcError(id, RPC.invalidParams, `Unknown tool ${call.data.name}. Tools: ${TOOLS.map((t) => t.name).join(", ")}.`);
+      if (!tool) return rpcError(id, RPC.invalidParams, `Unknown tool ${inlineCode(call.data.name)}. Tools: ${TOOLS.map((t) => t.name).join(", ")}.`);
       const result = await tool.call(call.data.arguments, source);
 
       // bad arguments are a tool error the model can read and fix, not a protocol error
@@ -386,7 +388,7 @@ export async function handleMessage(message: Message, source: AgentSource): Prom
     case "prompts/list":
       return ok(id, { prompts: [] });
     default:
-      return rpcError(id, RPC.methodNotFound, `Method not found: ${method}`);
+      return rpcError(id, RPC.methodNotFound, `Method not found: ${inlineCode(method)}`);
   }
 }
 

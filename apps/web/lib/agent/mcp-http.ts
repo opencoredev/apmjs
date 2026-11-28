@@ -6,6 +6,7 @@ import { parseJson } from "./json";
 import { handleMessage, isKnownProtocolVersion, Message, RPC, rpcError, type JsonRpcResponse } from "./mcp";
 import { siteUrl } from "./site";
 import type { AgentSource } from "./source";
+import { inlineCode } from "./text";
 
 /** Read-only and unauthenticated, so any origin may call it: a browser-based MCP client included. */
 export const MCP_CORS = {
@@ -74,7 +75,7 @@ export type McpDeps = { source: AgentSource; take: () => Take | Promise<Take> };
 export async function mcpPost(request: Request, deps: McpDeps): Promise<Response> {
   const version = request.headers.get("mcp-protocol-version");
 
-  if (version !== null && !isKnownProtocolVersion(version)) return json_(rpcError(null, RPC.invalidRequest, `Unsupported MCP-Protocol-Version: ${version}`), 400);
+  if (version !== null && !isKnownProtocolVersion(version)) return json_(rpcError(null, RPC.invalidRequest, `Unsupported MCP-Protocol-Version: ${inlineCode(version)}`), 400);
   const allowed = await deps.take();
 
   if (!allowed.ok) return json_(rpcError(null, RPC.internal, "Too many requests. Wait a moment and try again."), 429, { "retry-after": String(allowed.retryAfterSeconds) });
